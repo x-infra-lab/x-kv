@@ -1,0 +1,98 @@
+syntax = "proto3";
+
+package metapb;
+
+option java_package = "io.github.xinfra.lab.xkv.proto";
+option java_outer_classname = "Metapb";
+option java_multiple_files = false;
+
+// Region splits the entire key space into ranges. Each range is owned by one
+// Region; each Region is replicated by a Raft group.
+message Region {
+    uint64 id = 1;
+
+    // Region key range is [start_key, end_key). end_key == "" means +Inf.
+    bytes start_key = 2;
+    bytes end_key = 3;
+
+    RegionEpoch region_epoch = 4;
+
+    // Peers of this region. The leader is identified at runtime via Raft, not
+    // pinned in metadata. PD only knows the static peer set.
+    repeated Peer peers = 5;
+
+    reserved 6 to 50;
+}
+
+// RegionEpoch tracks two independent counters:
+//   - conf_ver: bumps on every membership change (AddPeer / RemovePeer)
+//   - version: bumps on every range change (Split / Merge)
+//
+// Stale callers compare their cached epoch with the leader's current epoch and
+// retry on EpochNotMatch.
+message RegionEpoch {
+    uint64 conf_ver = 1;
+    uint64 version = 2;
+
+    reserved 3 to 20;
+}
+
+// PeerRole describes the role of a peer in its Raft group. The Voter/Learner
+// distinction matters during JointConsensus membership changes (we follow the
+// etcd-raft model with IncomingVoter / DemotingVoter).
+enum PeerRole {
+    Voter = 0;
+    Learner = 1;
+    IncomingVoter = 2;   // joint state: about to become Voter
+    DemotingVoter = 3;   // joint state: about to become Learner
+}
+
+message Peer {
+    uint64 id = 1;
+    uint64 store_id = 2;
+    PeerRole role = 3;
+    // Whether this peer is a witness peer (no actual data, vote-only).
+    // Reserved for future use; currently always false.
+    bool is_witness = 4;
+
+    reserved 5 to 30;
+}
+
+enum StoreState {
+    Up = 0;
+    Offline = 1;        // gracefully decommissioning
+    Tombstone = 2;      // removed, kept for historical references
+    Disconnected = 3;   // PD has not received a heartbeat recently
+    Down = 4;           // confirmed dead, peer eviction in progress
+}
+
+// Store is one physical KV node.
+message Store {
+    uint64 id = 1;
+    string address = 2;            // gRPC address: host:port
+    StoreState state = 3;
+    repeated StoreLabel labels = 4;
+    string version = 5;
+    string peer_address = 6;       // raft transport address (may equal address)
+    string status_address = 7;     // metrics / debug HTTP endpoint
+    string git_hash = 8;
+    int64 start_timestamp = 9;     // UNIX seconds; useful for restart detection
+
+    reserved 10 to 50;
+}
+
+// Labels are arbitrary key/value pairs used by placement rules and the
+// scheduler (zone, rack, host, disk-type, ...).
+message StoreLabel {
+    string key = 1;
+    string value = 2;
+}
+
+// Cluster is the per-cluster metadata bag. Bumping max_peer_count or
+// max_region_size requires a PD admin RPC.
+message Cluster {
+    uint64 id = 1;
+    uint32 max_peer_count = 2;
+
+    reserved 3 to 30;
+}

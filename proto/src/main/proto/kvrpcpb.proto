@@ -1,0 +1,682 @@
+syntax = "proto3";
+
+package kvrpcpb;
+
+import "metapb.proto";
+import "errorpb.proto";
+
+option java_package = "io.github.xinfra.lab.xkv.proto";
+option java_outer_classname = "Kvrpcpb";
+option java_multiple_files = false;
+
+// =========================================================================
+// Per-RPC context. Every request carries one. This is the channel for the
+// caller to communicate its routing assumptions, isolation level, deadline,
+// and resource policy to the server.
+//
+// Lessons learned from the v1 rewrite:
+//   - terms must be passed so the server can detect StaleCommand cleanly
+//   - replica_read enables follower / learner reads
+//   - max_execution_duration_ms is the only honest deadline mechanism
+//   - resource_group_tag enables per-tenant rate-limit / isolation
+// =========================================================================
+message Context {
+    uint64 region_id = 1;
+    metapb.RegionEpoch region_epoch = 2;
+    metapb.Peer peer = 3;
+    uint64 term = 5;
+
+    // 0 = normal; high value = lower priority. Used by store-level scheduler.
+    CommandPri priority = 6;
+
+    IsolationLevel isolation_level = 7;
+    bool not_fill_cache = 8;
+    bool sync_log = 9;
+    bool handle_time = 10;
+    bool scan_detail = 11;
+
+    ReplicaReadType replica_read = 12;
+    repeated uint64 resolved_locks = 13;
+    uint64 max_execution_duration_ms = 14;
+
+    // Used by client-go style stale-read coordination.
+    uint64 applied_index = 15;
+    bytes resource_group_tag = 16;
+
+    // Stale-read snapshot timestamp (replica_read == MIXED implies follower
+    // serves reads at this ts if its applied state is fresh enough).
+    uint64 stale_read_safe_ts = 17;
+
+    // Cluster identifier; mismatched cluster_id ⇒ client routed to wrong PD.
+    uint64 cluster_id = 18;
+
+    // Background traffic should set this so foreground workloads keep priority.
+    bool background = 19;
+
+    string request_source = 20;
+
+    // Set by the SQL layer for billing / observability; opaque to KV.
+    bytes resource_control_context = 21;
+
+    reserved 22 to 80;
+}
+
+enum CommandPri {
+    Normal = 0;
+    Low = 1;
+    High = 2;
+}
+
+enum IsolationLevel {
+    SI = 0;          // snapshot isolation (default)
+    RC = 1;          // read-committed (skips locks during read)
+    RC_CHECK_TS = 2; // RC with TS validation; SQL layer use
+}
+
+enum ReplicaReadType {
+    LEADER = 0;
+    FOLLOWER = 1;
+    MIXED = 2;            // any peer that can serve a stale read
+    PREFER_LEADER = 3;
+}
+
+// =========================================================================
+// Standard error envelope. Region errors live in errorpb.Error and are
+// returned in a separate field; KeyError is for transactional / per-key
+// failures (locks, write conflicts, deadlocks, ...).
+// =========================================================================
+message KeyError {
+    LockInfo locked = 1;
+    string retryable = 2;     // legacy: human string
+    string abort = 3;         // legacy: human string
+    WriteConflict conflict = 4;
+    AlreadyExist already_exist = 5;
+    Deadlock deadlock = 6;
+    CommitTsExpired commit_ts_expired = 7;
+    TxnNotFound txn_not_found = 8;
+    CommitTsTooLarge commit_ts_too_large = 9;
+    AssertionFailed assertion_failed = 10;
+    PrimaryMismatch primary_mismatch = 11;
+
+    reserved 12 to 40;
+}
+
+message LockInfo {
+    bytes primary_lock = 1;
+    uint64 lock_version = 2;
+    bytes key = 3;
+    uint64 lock_ttl = 4;
+    Op lock_type = 5;
+    uint64 txn_size = 6;
+    uint64 min_commit_ts = 7;
+    bool use_async_commit = 8;
+    repeated bytes secondaries = 9;
+
+    // for_update_ts > 0 ⇒ pessimistic lock acquired by SELECT ... FOR UPDATE.
+    uint64 lock_for_update_ts = 10;
+
+    reserved 11 to 30;
+}
+
+message WriteConflict {
+    uint64 start_ts = 1;
+    uint64 conflict_ts = 2;
+    uint64 conflict_commit_ts = 3;
+    bytes key = 4;
+    bytes primary = 5;
+    Reason reason = 6;
+
+    enum Reason {
+        Unknown = 0;
+        Optimistic = 1;
+        PessimisticRetry = 2;
+        SelfRolledBack = 3;
+        RcCheckTs = 4;
+        LazyUniquenessCheck = 5;
+    }
+}
+
+message AlreadyExist { bytes key = 1; }
+
+// Deadlock: the pessimistic-lock waiter graph contains a cycle. The deadlock
+// detector returns the wait chain so the SQL layer can pick which txn to abort.
+message Deadlock {
+    uint64 lock_ts = 1;
+    bytes lock_key = 2;
+    uint64 deadlock_key_hash = 3;
+    repeated WaitForEntry wait_chain = 4;
+}
+
+message WaitForEntry {
+    uint64 txn = 1;
+    uint64 wait_for_txn = 2;
+    uint64 key_hash = 3;
+    bytes key = 4;
+    bytes resource_group_tag = 5;
+}
+
+message CommitTsExpired {
+    uint64 start_ts = 1;
+    bytes key = 2;
+    uint64 attempted_commit_ts = 3;
+    uint64 min_commit_ts = 4;
+}
+
+message TxnNotFound {
+    uint64 start_ts = 1;
+    bytes primary_key = 2;
+}
+
+message CommitTsTooLarge {
+    uint64 commit_ts = 1;
+}
+
+message AssertionFailed {
+    uint64 start_ts = 1;
+    bytes key = 2;
+    Assertion assertion = 3;
+    uint64 existing_start_ts = 4;
+    uint64 existing_commit_ts = 5;
+}
+
+enum Assertion {
+    None = 0;
+    Exist = 1;
+    NotExist = 2;
+}
+
+enum AssertionLevel {
+    Off = 0;
+    Fast = 1;
+    Strict = 2;
+}
+
+// PrimaryMismatch: the key that the caller treats as primary actually carries
+// a lock claiming a different primary.
+message PrimaryMismatch {
+    LockInfo lock_info = 1;
+}
+
+// =========================================================================
+// Mutation operations (used by Prewrite / PessimisticLock).
+// =========================================================================
+enum Op {
+    Put = 0;
+    Del = 1;
+    Lock = 2;          // optimistic LOCK marker (no value)
+    Rollback = 3;
+    Insert = 4;        // PUT but assert NotExist
+    PessimisticLock = 5;
+    CheckNotExists = 6;
+}
+
+message Mutation {
+    Op op = 1;
+    bytes key = 2;
+    bytes value = 3;
+    Assertion assertion = 4;
+}
+
+// =========================================================================
+// Transactional RPCs (Percolator-style 2PC + async commit + 1PC).
+// =========================================================================
+
+// --- Snapshot Read ---
+message GetRequest {
+    Context context = 1;
+    bytes key = 2;
+    uint64 version = 3;       // start_ts
+}
+message GetResponse {
+    errorpb.Error region_error = 1;
+    KeyError error = 2;
+    bytes value = 3;
+    bool not_found = 4;
+    int64 exec_details_ms = 5;
+}
+
+message BatchGetRequest {
+    Context context = 1;
+    repeated bytes keys = 2;
+    uint64 version = 3;
+}
+message BatchGetResponse {
+    errorpb.Error region_error = 1;
+    repeated KvPair pairs = 2;
+}
+
+message ScanRequest {
+    Context context = 1;
+    bytes start_key = 2;
+    uint32 limit = 3;
+    uint64 version = 4;
+    bytes end_key = 5;
+    bool key_only = 6;
+    bool reverse = 7;
+    SamplingMethod sample_step = 8;
+}
+message ScanResponse {
+    errorpb.Error region_error = 1;
+    repeated KvPair pairs = 2;
+    bytes resume_key = 3;
+}
+enum SamplingMethod {
+    NoSample = 0;
+    EveryNth = 1;
+}
+
+message KvPair {
+    KeyError error = 1;
+    bytes key = 2;
+    bytes value = 3;
+}
+
+// --- Prewrite (Phase 1 of 2PC, also entry point for 1PC and async commit) ---
+message PrewriteRequest {
+    Context context = 1;
+    repeated Mutation mutations = 2;
+
+    // First key of the txn. The lock on this key is the source of truth for
+    // CheckTxnStatus / LockResolver.
+    bytes primary_lock = 3;
+
+    uint64 start_version = 4;
+    uint64 lock_ttl = 5;
+
+    // Number of mutations in the txn (across all regions). Used to size the
+    // resolver work; not per-region.
+    uint64 txn_size = 6;
+
+    // Pessimistic mutations: parallel to mutations[]; non-zero entry means
+    // the corresponding mutation must already hold a pessimistic lock with
+    // for_update_ts == this value.
+    repeated uint64 is_pessimistic_lock = 7;
+
+    // Pessimistic-only: max for_update_ts seen by the txn. Server uses this
+    // as the conflict-check ts.
+    uint64 for_update_ts = 8;
+
+    // === Async commit / 1PC ===
+    bool use_async_commit = 9;
+    repeated bytes secondaries = 10;
+    bool try_one_pc = 11;
+    uint64 max_commit_ts = 12;
+
+    // === Assertion ===
+    AssertionLevel assertion_level = 13;
+
+    reserved 14 to 50;
+}
+message PrewriteResponse {
+    errorpb.Error region_error = 1;
+    repeated KeyError errors = 2;
+
+    // For async commit: server returns its computed min_commit_ts so the
+    // client can derive a final commit_ts = max(min_commit_ts of all keys).
+    uint64 min_commit_ts = 3;
+
+    // 1PC: if the server committed in a single phase, returns the commit_ts
+    // here; client must NOT issue a Commit RPC.
+    uint64 one_pc_commit_ts = 4;
+
+    int64 exec_details_ms = 5;
+}
+
+// --- Pessimistic Lock ---
+message PessimisticLockRequest {
+    Context context = 1;
+    repeated Mutation mutations = 2;
+    bytes primary_lock = 3;
+    uint64 start_version = 4;
+    uint64 for_update_ts = 5;
+    uint64 lock_ttl = 6;
+    bool is_first_lock = 7;
+    int64 wait_timeout = 8;        // -1 = no wait (fail fast); 0 = wait forever
+
+    // If true, server returns the existing values along with the lock; saves
+    // one round-trip for SELECT ... FOR UPDATE.
+    bool return_values = 9;
+
+    // Lock resolution hint
+    uint64 min_commit_ts = 10;
+
+    bool check_existence = 11;
+    bool lock_only_if_exists = 12;
+
+    reserved 13 to 30;
+}
+message PessimisticLockResponse {
+    errorpb.Error region_error = 1;
+    repeated KeyError errors = 2;
+    repeated bytes values = 3;
+    repeated bool not_founds = 4;
+    int64 exec_details_ms = 5;
+}
+
+message PessimisticRollbackRequest {
+    Context context = 1;
+    uint64 start_version = 2;
+    uint64 for_update_ts = 3;
+    repeated bytes keys = 4;
+}
+message PessimisticRollbackResponse {
+    errorpb.Error region_error = 1;
+    repeated KeyError errors = 2;
+}
+
+// --- Commit ---
+message CommitRequest {
+    Context context = 1;
+    uint64 start_version = 2;
+    repeated bytes keys = 3;
+    uint64 commit_version = 4;
+}
+message CommitResponse {
+    errorpb.Error region_error = 1;
+    KeyError error = 2;
+    uint64 commit_version = 3;
+}
+
+// --- Rollback / Cleanup ---
+message BatchRollbackRequest {
+    Context context = 1;
+    uint64 start_version = 2;
+    repeated bytes keys = 3;
+}
+message BatchRollbackResponse {
+    errorpb.Error region_error = 1;
+    KeyError error = 2;
+}
+
+message CleanupRequest {
+    Context context = 1;
+    bytes key = 2;
+    uint64 start_version = 3;
+    // current_ts is the caller's clock; server uses it to decide TTL expiry.
+    uint64 current_ts = 4;
+}
+message CleanupResponse {
+    errorpb.Error region_error = 1;
+    KeyError error = 2;
+    uint64 commit_version = 3;
+}
+
+// --- Lock resolver helpers ---
+message CheckTxnStatusRequest {
+    Context context = 1;
+    bytes primary_key = 2;
+    uint64 lock_ts = 3;          // the txn's start_ts
+    uint64 caller_start_ts = 4;
+    uint64 current_ts = 5;       // PD-derived, NOT wall clock
+
+    // Aggressive: if the lock does not exist, write a Rollback record so the
+    // caller can immediately treat the txn as aborted. Used by readers that
+    // hit a phantom lock (e.g. resolver after CheckTxnStatus race).
+    bool rollback_if_not_exist = 6;
+
+    bool resolving_pessimistic_lock = 7;
+    bool verify_is_primary = 8;
+
+    reserved 9 to 30;
+}
+message CheckTxnStatusResponse {
+    errorpb.Error region_error = 1;
+    KeyError error = 2;
+    uint64 lock_ttl = 3;
+    uint64 commit_version = 4;
+    Action action = 5;
+    LockInfo lock_info = 6;
+}
+enum Action {
+    NoAction = 0;
+    TtlExpireRollback = 1;
+    LockNotExistRollback = 2;
+    MinCommitTsPushed = 3;
+    TtlExpirePessimisticRollback = 4;
+    LockNotExistDoNothing = 5;
+}
+
+message CheckSecondaryLocksRequest {
+    Context context = 1;
+    repeated bytes keys = 2;
+    uint64 start_version = 3;
+}
+message CheckSecondaryLocksResponse {
+    errorpb.Error region_error = 1;
+    KeyError error = 2;
+    repeated LockInfo locks = 3;
+    uint64 commit_ts = 4;
+}
+
+message ResolveLockRequest {
+    Context context = 1;
+    uint64 start_version = 2;
+    // commit_version > 0 ⇒ resolve as commit; == 0 ⇒ rollback.
+    uint64 commit_version = 3;
+    repeated TxnInfo txn_infos = 4;   // batched; each entry handles one txn
+    repeated bytes keys = 5;          // optional explicit subset
+}
+message ResolveLockResponse {
+    errorpb.Error region_error = 1;
+    KeyError error = 2;
+}
+message TxnInfo {
+    uint64 txn = 1;
+    uint64 status = 2;
+}
+
+message ScanLockRequest {
+    Context context = 1;
+    uint64 max_version = 2;
+    bytes start_key = 3;
+    bytes end_key = 4;
+    uint32 limit = 5;
+}
+message ScanLockResponse {
+    errorpb.Error region_error = 1;
+    KeyError error = 2;
+    repeated LockInfo locks = 3;
+}
+
+// --- TxnHeartBeat: extend lock TTL for long-running txns ---
+message TxnHeartBeatRequest {
+    Context context = 1;
+    bytes primary_lock = 2;
+    uint64 start_version = 3;
+    uint64 advise_lock_ttl = 4;
+}
+message TxnHeartBeatResponse {
+    errorpb.Error region_error = 1;
+    KeyError error = 2;
+    uint64 lock_ttl = 3;
+}
+
+// --- GC ---
+message GCRequest {
+    Context context = 1;
+    uint64 safe_point = 2;
+}
+message GCResponse {
+    errorpb.Error region_error = 1;
+    KeyError error = 2;
+}
+
+message DeleteRangeRequest {
+    Context context = 1;
+    bytes start_key = 2;
+    bytes end_key = 3;
+    bool notify_only = 4;
+}
+message DeleteRangeResponse {
+    errorpb.Error region_error = 1;
+    string error = 2;
+}
+
+// =========================================================================
+// Raw KV (no MVCC, no transactions).
+// =========================================================================
+message RawGetRequest {
+    Context context = 1;
+    bytes key = 2;
+    string cf = 3;       // empty ⇒ default
+}
+message RawGetResponse {
+    errorpb.Error region_error = 1;
+    string error = 2;
+    bytes value = 3;
+    bool not_found = 4;
+}
+
+message RawBatchGetRequest {
+    Context context = 1;
+    repeated bytes keys = 2;
+    string cf = 3;
+}
+message RawBatchGetResponse {
+    errorpb.Error region_error = 1;
+    repeated KvPair pairs = 2;
+}
+
+message RawPutRequest {
+    Context context = 1;
+    bytes key = 2;
+    bytes value = 3;
+    string cf = 4;
+    uint64 ttl = 5;
+    bool for_cas = 6;
+}
+message RawPutResponse {
+    errorpb.Error region_error = 1;
+    string error = 2;
+}
+
+message RawBatchPutRequest {
+    Context context = 1;
+    repeated KvPair pairs = 2;
+    string cf = 3;
+    repeated uint64 ttls = 4;
+    bool for_cas = 5;
+}
+message RawBatchPutResponse {
+    errorpb.Error region_error = 1;
+    string error = 2;
+}
+
+message RawDeleteRequest {
+    Context context = 1;
+    bytes key = 2;
+    string cf = 3;
+    bool for_cas = 4;
+}
+message RawDeleteResponse {
+    errorpb.Error region_error = 1;
+    string error = 2;
+}
+
+message RawBatchDeleteRequest {
+    Context context = 1;
+    repeated bytes keys = 2;
+    string cf = 3;
+}
+message RawBatchDeleteResponse {
+    errorpb.Error region_error = 1;
+    string error = 2;
+}
+
+message RawDeleteRangeRequest {
+    Context context = 1;
+    bytes start_key = 2;
+    bytes end_key = 3;
+    string cf = 4;
+}
+message RawDeleteRangeResponse {
+    errorpb.Error region_error = 1;
+    string error = 2;
+}
+
+message RawScanRequest {
+    Context context = 1;
+    bytes start_key = 2;
+    uint32 limit = 3;
+    bool key_only = 4;
+    string cf = 5;
+    bool reverse = 6;
+    bytes end_key = 7;
+}
+message RawScanResponse {
+    errorpb.Error region_error = 1;
+    repeated KvPair kvs = 2;
+}
+
+// Atomic compare-and-swap. previous_value of len 0 + previous_not_exist=true
+// ⇒ insert-only.
+message RawCASRequest {
+    Context context = 1;
+    bytes key = 2;
+    bytes value = 3;
+    bytes previous_value = 4;
+    bool previous_not_exist = 5;
+    string cf = 6;
+    uint64 ttl = 7;
+}
+message RawCASResponse {
+    errorpb.Error region_error = 1;
+    string error = 2;
+    bool succeed = 3;
+    bytes previous_value = 4;
+    bool previous_not_exist = 5;
+}
+
+// =========================================================================
+// Mvcc inspection (debug only).
+// =========================================================================
+message MvccGetByKeyRequest {
+    Context context = 1;
+    bytes key = 2;
+}
+message MvccGetByKeyResponse {
+    errorpb.Error region_error = 1;
+    string error = 2;
+    MvccInfo info = 3;
+}
+
+message MvccGetByStartTsRequest {
+    Context context = 1;
+    uint64 start_ts = 2;
+}
+message MvccGetByStartTsResponse {
+    errorpb.Error region_error = 1;
+    string error = 2;
+    bytes key = 3;
+    MvccInfo info = 4;
+}
+
+message MvccInfo {
+    LockInfo lock = 1;
+    repeated MvccWrite writes = 2;
+    repeated MvccValue values = 3;
+}
+message MvccWrite {
+    Op type = 1;
+    uint64 start_ts = 2;
+    uint64 commit_ts = 3;
+    bytes short_value = 4;
+    bool has_overlapped_rollback = 5;
+}
+message MvccValue {
+    uint64 start_ts = 1;
+    bytes value = 2;
+}
+
+// =========================================================================
+// Split (manual, by client / SQL).
+// =========================================================================
+message SplitRegionRequest {
+    Context context = 1;
+    repeated bytes split_keys = 2;
+    bool is_raw_kv = 3;
+}
+message SplitRegionResponse {
+    errorpb.Error region_error = 1;
+    repeated metapb.Region regions = 2;
+}

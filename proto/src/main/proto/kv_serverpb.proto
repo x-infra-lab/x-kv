@@ -1,0 +1,142 @@
+syntax = "proto3";
+
+package kv_serverpb;
+
+import "metapb.proto";
+
+option java_package = "io.github.xinfra.lab.xkv.proto";
+option java_outer_classname = "KvServerpb";
+option java_multiple_files = false;
+
+// ===========================================================================
+// Wire envelope between KV stores. Carries the underlying x-raft-lib Message
+// plus enough metadata to route to the correct region without parsing the
+// raft payload.
+// ===========================================================================
+
+service KvRaft {
+    rpc Raft(stream RaftMessage) returns (Done);
+
+    // Snapshot streaming. Snapshots are large (SST + checkpoints); they go on
+    // a dedicated bidi stream so they cannot starve normal raft traffic.
+    rpc SendSnapshot(stream SnapshotChunk) returns (Done);
+}
+
+message RaftMessage {
+    metapb.RegionEpoch region_epoch = 1;
+    metapb.Peer from_peer = 2;
+    metapb.Peer to_peer = 3;
+    bytes message = 4;        // serialized eraftpb.Message (x-raft-lib)
+    uint64 region_id = 5;
+    metapb.Region start_key = 6;     // helps the receiver create the region
+    metapb.Region end_key = 7;       // on first contact (without a PD round-trip)
+    bool merge_target = 8;
+    bool tombstone = 9;
+    bool extra_msg = 10;
+
+    reserved 11 to 30;
+}
+
+message Done {}
+
+// ===========================================================================
+// Snapshot wire format.
+//
+// Phase 1 invariant: every chunk in a snapshot stream comes from a SINGLE
+// RocksDB Snapshot handle, so the three CFs (default / lock / write) all
+// reflect the same instant. The receiver applies the chunks atomically:
+// stage to a temp dir, then atomically swap the CF range using RocksDB's
+// IngestExternalFile.
+// ===========================================================================
+message SnapshotChunk {
+    SnapshotMeta meta = 1;
+    bytes data = 2;          // SST bytes for `cf` (continuation chunks)
+    string cf = 3;           // "default" / "lock" / "write"
+    uint64 chunk_index = 4;
+    bool eof = 5;            // last chunk for this CF
+    uint64 crc32c = 6;
+}
+
+message SnapshotMeta {
+    uint64 region_id = 1;
+    metapb.RegionEpoch region_epoch = 2;
+    uint64 raft_term = 3;
+    uint64 raft_index = 4;
+    bytes start_key = 5;
+    bytes end_key = 6;
+    repeated string cf_names = 7;
+    uint64 total_size = 8;
+    uint64 generated_at_ms = 9;
+}
+
+// ===========================================================================
+// ADMIN_SPLIT proposal payload. PD has already allocated region IDs and peer
+// IDs and computed the resulting region descriptors; apply just persists
+// them atomically and updates the parent's range. Children inherit the
+// parent's peer set (each new region_id with its own peer_ids).
+// ===========================================================================
+message SplitRegionProposal {
+    // Updated parent — same region_id, shrunken range, bumped epoch.version.
+    metapb.Region updated_parent = 1;
+    // Brand-new child regions, in ascending start_key order.
+    repeated metapb.Region children = 2;
+
+    reserved 3 to 30;
+}
+
+// ===========================================================================
+// ADMIN_COMMIT_MERGE proposal — applied on the TARGET region's raft. The
+// target absorbs the source's range; the source region descriptor is
+// removed from the local engine and the source peer is destroyed on this
+// store via the merge observer.
+//
+// Phase-7 minimum-viable shape: skips the two-sided PrepareMerge / commit
+// ack / RollbackMerge dance TiKV uses to coordinate concurrent writes on
+// the source. Single-thread tests can use this shape directly; production
+// integration with the two-sided protocol is a follow-up.
+// ===========================================================================
+message MergeRegionProposal {
+    // Target with absorbed range + bumped epoch.version.
+    metapb.Region merged_target = 1;
+    // Source region — used by the observer to destroy the source peer.
+    metapb.Region source_region = 2;
+
+    reserved 3 to 30;
+}
+
+// ===========================================================================
+// ADMIN_PREPARE_MERGE — applied on the SOURCE region's raft. Quiesces the
+// source: subsequent business proposals (MVCC / raw KV writes) are rejected
+// at apply time with a "region merging" error. Records the target the
+// source is being merged into so a CommitMerge that lands later can be
+// validated. ADMIN_ROLLBACK_MERGE undoes this if the commit fails.
+// ===========================================================================
+message PrepareMergeProposal {
+    // The TARGET region descriptor at decide time. Used to validate the
+    // subsequent CommitMerge / RollbackMerge applies to the same target.
+    metapb.Region target = 1;
+
+    reserved 2 to 30;
+}
+
+message RollbackMergeProposal {
+    // The TARGET region the source was trying to merge into — for
+    // symmetry with PrepareMerge; not strictly required since the source
+    // already has only one in-flight merge attempt at a time.
+    uint64 target_region_id = 1;
+
+    reserved 2 to 30;
+}
+
+// ===========================================================================
+// Context payload attached to a Raft ConfChangeV2's `context` field. The raft
+// library only carries the node_id + change_type per ConfChangeSingle; we need
+// the full {@code metapb.Peer} so the apply layer can update the region
+// descriptor's peer list AND know which store hosts the (added | removed) peer.
+// ===========================================================================
+message ConfChangeContext {
+    // One entry per parent ConfChangeV2.changes, in the same order.
+    repeated metapb.Peer peers = 1;
+
+    reserved 2 to 30;
+}

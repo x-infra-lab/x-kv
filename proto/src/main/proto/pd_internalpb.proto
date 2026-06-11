@@ -1,0 +1,98 @@
+syntax = "proto3";
+
+package pd_internalpb;
+
+import "metapb.proto";
+
+option java_package = "io.github.xinfra.lab.xkv.proto";
+option java_outer_classname = "PdInternalpb";
+option java_multiple_files = false;
+
+// ===========================================================================
+// PD internal raft transport — carries x-raft-lib messages between PD nodes.
+// Separate from the KV raft service so the two groups live on different ports.
+// ===========================================================================
+service PDRaft {
+    rpc Raft(stream PdRaftMessage) returns (PdRaftDone);
+}
+
+message PdRaftMessage {
+    bytes message = 1;    // serialized eraftpb.Message (x-raft-lib)
+
+    reserved 2 to 30;
+}
+
+message PdRaftDone {}
+
+// ===========================================================================
+// PD command — the raft entry payload for the PD state machine. Each mutating
+// PD RPC serializes its intent into one of these commands; the leader proposes
+// it through raft; all nodes apply it deterministically.
+//
+// Read-only operations (getRegion, getStore, scanRegions, getLeader) do NOT
+// go through raft — they read the local state directly on the leader.
+//
+// Leader identity (updateLeader) is volatile routing state and does NOT go
+// through raft either — it's stored in-memory on every PD node that receives
+// a region heartbeat. This matches TiKV PD behavior.
+// ===========================================================================
+message PdCommand {
+    CommandType type = 1;
+
+    // Exactly one of the payloads below is set, depending on `type`.
+    metapb.Store store = 2;
+    metapb.Region region = 3;
+    BootstrapPayload bootstrap = 4;
+    AllocIdPayload alloc_id = 5;
+    SafePointPayload safe_point = 6;
+    ServiceSafePointPayload service_safe_point = 7;
+
+    reserved 8 to 30;
+}
+
+enum CommandType {
+    CMD_UNKNOWN = 0;
+    CMD_BOOTSTRAP = 1;
+    CMD_PUT_STORE = 2;
+    CMD_UPDATE_REGION = 3;
+    CMD_ALLOC_ID = 4;
+    CMD_UPDATE_GC_SAFE_POINT = 5;
+    CMD_UPDATE_SERVICE_SAFE_POINT = 6;
+
+    reserved 7 to 30;
+}
+
+message BootstrapPayload {
+    metapb.Store store = 1;
+    metapb.Region region = 2;
+}
+
+message AllocIdPayload {
+    uint32 count = 1;
+    uint64 base_id = 2;    // set by the apply path; empty on propose
+}
+
+message SafePointPayload {
+    uint64 safe_point = 1;
+}
+
+message ServiceSafePointPayload {
+    string service_id = 1;
+    int64 ttl = 2;
+    uint64 safe_point = 3;
+}
+
+// ===========================================================================
+// Snapshot payload — the full serialized PD state for raft snapshot install.
+// PD state is small (typically <1MB), so a single message suffices.
+// ===========================================================================
+message PdSnapshot {
+    bool bootstrapped = 1;
+    metapb.Cluster cluster = 2;
+    repeated metapb.Store stores = 3;
+    repeated metapb.Region regions = 4;
+    uint64 id_allocator_next = 5;
+    uint64 gc_safe_point = 6;
+
+    reserved 7 to 30;
+}

@@ -1,0 +1,493 @@
+syntax = "proto3";
+
+package pdpb;
+
+import "metapb.proto";
+import "kvrpcpb.proto";
+
+option java_package = "io.github.xinfra.lab.xkv.proto";
+option java_outer_classname = "Pdpb";
+option java_multiple_files = false;
+
+// ===========================================================================
+// PD: cluster metadata + scheduler + TSO oracle.
+//
+// Design changes vs the v1 schema:
+//   - GetTimestamp is a bidi stream so a single TCP connection can serve
+//     hundreds of thousands of TSO/sec via batching.
+//   - Service safe-points are first-class (BR / CDC / long txn protection).
+//   - Bucket / scatter / placement-rule RPCs reserve protocol space even
+//     though early phases stub them out.
+// ===========================================================================
+service PD {
+    rpc GetMembers(GetMembersRequest) returns (GetMembersResponse);
+    rpc GetClusterInfo(GetClusterInfoRequest) returns (GetClusterInfoResponse);
+    rpc Bootstrap(BootstrapRequest) returns (BootstrapResponse);
+    rpc IsBootstrapped(IsBootstrappedRequest) returns (IsBootstrappedResponse);
+
+    rpc AllocID(AllocIDRequest) returns (AllocIDResponse);
+
+    // TSO. Bidi stream so the client can batch hundreds of GetTimestamp asks
+    // into a single network round-trip.
+    rpc GetTimestamp(stream TsoRequest) returns (stream TsoResponse);
+
+    rpc PutStore(PutStoreRequest) returns (PutStoreResponse);
+    rpc GetStore(GetStoreRequest) returns (GetStoreResponse);
+    rpc GetAllStores(GetAllStoresRequest) returns (GetAllStoresResponse);
+
+    rpc StoreHeartbeat(StoreHeartbeatRequest) returns (StoreHeartbeatResponse);
+    rpc RegionHeartbeat(stream RegionHeartbeatRequest) returns (stream RegionHeartbeatResponse);
+
+    rpc GetRegion(GetRegionRequest) returns (GetRegionResponse);
+    rpc GetRegionByID(GetRegionByIDRequest) returns (GetRegionResponse);
+    rpc ScanRegions(ScanRegionsRequest) returns (ScanRegionsResponse);
+
+    rpc AskSplit(AskSplitRequest) returns (AskSplitResponse);
+    rpc AskBatchSplit(AskBatchSplitRequest) returns (AskBatchSplitResponse);
+    rpc ReportSplit(ReportSplitRequest) returns (ReportSplitResponse);
+    rpc ReportBatchSplit(ReportBatchSplitRequest) returns (ReportBatchSplitResponse);
+
+    rpc SplitRegions(SplitRegionsRequest) returns (SplitRegionsResponse);
+    rpc ScatterRegion(ScatterRegionRequest) returns (ScatterRegionResponse);
+
+    // GC safe-point management.
+    rpc GetGCSafePoint(GetGCSafePointRequest) returns (GetGCSafePointResponse);
+    rpc UpdateGCSafePoint(UpdateGCSafePointRequest) returns (UpdateGCSafePointResponse);
+    rpc UpdateServiceGCSafePoint(UpdateServiceGCSafePointRequest) returns (UpdateServiceGCSafePointResponse);
+    rpc GetAllServiceGCSafePoints(GetAllServiceGCSafePointsRequest) returns (GetAllServiceGCSafePointsResponse);
+
+    rpc GetOperator(GetOperatorRequest) returns (GetOperatorResponse);
+
+    // ----- Distributed deadlock detection -----
+    //
+    // KV nodes report a single wait-for edge (waiter_txn → holder_txn on a
+    // pessimistic-lock conflict). PD merges edges into a global wait-for
+    // graph and runs cycle detection per insertion. When a cycle is found
+    // the response carries the wait_chain back to the caller, which
+    // translates it into KeyError.Deadlock so the SQL layer can pick a
+    // victim. Unary RPC keeps the protocol simple — production loads need
+    // a bidi stream for higher throughput, but the semantics are identical.
+    rpc DetectDeadlock(DetectDeadlockRequest) returns (DetectDeadlockResponse);
+    rpc CleanupWaitFor(CleanupWaitForRequest) returns (CleanupWaitForResponse);
+}
+
+// ---- Common envelope ----
+//
+// Every PD response carries ResponseHeader. ResponseHeader.error == nil ⇒
+// success. Error is shaped like errorpb.Error for parity with KV-side flows.
+message RequestHeader {
+    uint64 cluster_id = 1;
+    string sender_id = 2;
+}
+
+message ResponseHeader {
+    uint64 cluster_id = 1;
+    Error error = 2;
+}
+
+message Error {
+    ErrorType type = 1;
+    string message = 2;
+
+    enum ErrorType {
+        OK = 0;
+        UNKNOWN = 1;
+        NOT_BOOTSTRAPPED = 2;
+        STORE_TOMBSTONE = 3;
+        ALREADY_BOOTSTRAPPED = 4;
+        INCOMPATIBLE_VERSION = 5;
+        REGION_NOT_FOUND = 6;
+        DATA_COMPACTED = 7;
+        SERVICE_BUSY = 8;
+        UNAUTHORIZED = 9;
+        NOT_LEADER = 10;
+        ETCD_TXN_CONFLICT = 11;
+        UNSAFE_RECOVERY_REQUIRED = 12;
+    }
+}
+
+// ---- Cluster bootstrap / membership ----
+message GetMembersRequest { RequestHeader header = 1; }
+message GetMembersResponse {
+    ResponseHeader header = 1;
+    repeated Member members = 2;
+    Member leader = 3;
+    Member etcd_leader = 4;
+}
+message Member {
+    string name = 1;
+    uint64 member_id = 2;
+    repeated string peer_urls = 3;
+    repeated string client_urls = 4;
+    int32 leader_priority = 5;
+    string deploy_path = 6;
+    string binary_version = 7;
+    string git_hash = 8;
+}
+
+message GetClusterInfoRequest { RequestHeader header = 1; }
+message GetClusterInfoResponse {
+    ResponseHeader header = 1;
+    metapb.Cluster cluster = 2;
+}
+
+message BootstrapRequest {
+    RequestHeader header = 1;
+    metapb.Store store = 2;
+    metapb.Region region = 3;
+}
+message BootstrapResponse {
+    ResponseHeader header = 1;
+}
+
+message IsBootstrappedRequest { RequestHeader header = 1; }
+message IsBootstrappedResponse {
+    ResponseHeader header = 1;
+    bool bootstrapped = 2;
+}
+
+// ---- ID allocator ----
+message AllocIDRequest {
+    RequestHeader header = 1;
+    uint32 count = 2;       // alloc N consecutive ids (region/peer/store)
+}
+message AllocIDResponse {
+    ResponseHeader header = 1;
+    uint64 id = 2;          // first id; ids in [id, id+count) are owned
+    uint32 count = 3;
+}
+
+// ---- TSO ----
+//
+// One stream per client; multiple in-flight TsoRequest entries are batched
+// at the server side into a single Raft-replicated physical_bound advance.
+message TsoRequest {
+    RequestHeader header = 1;
+    uint32 count = 2;
+    string dc_location = 3;
+}
+message TsoResponse {
+    ResponseHeader header = 1;
+    uint32 count = 2;
+    Timestamp timestamp = 3;
+}
+message Timestamp {
+    int64 physical = 1;
+    int64 logical = 2;
+    uint32 suffix_bits = 3;   // for local-TSO routing across DCs; v1 = 0
+}
+
+// ---- Store ----
+message PutStoreRequest {
+    RequestHeader header = 1;
+    metapb.Store store = 2;
+}
+message PutStoreResponse {
+    ResponseHeader header = 1;
+    ReplicationStatus replication_status = 2;
+}
+message ReplicationStatus {
+    Mode mode = 1;
+    string state_id = 2;
+    enum Mode {
+        MAJORITY = 0;
+        DR_AUTO_SYNC = 1;
+    }
+}
+
+message GetStoreRequest { RequestHeader header = 1; uint64 store_id = 2; }
+message GetStoreResponse {
+    ResponseHeader header = 1;
+    metapb.Store store = 2;
+    StoreStats stats = 3;
+}
+
+message GetAllStoresRequest { RequestHeader header = 1; bool exclude_tombstone_stores = 2; }
+message GetAllStoresResponse {
+    ResponseHeader header = 1;
+    repeated metapb.Store stores = 2;
+}
+
+message StoreStats {
+    uint64 store_id = 1;
+    uint64 capacity = 2;
+    uint64 available = 3;
+    uint64 used_size = 4;
+    uint32 region_count = 5;
+    uint64 sending_snap_count = 6;
+    uint64 receiving_snap_count = 7;
+    uint64 start_time = 8;
+    uint64 applying_snap_count = 9;
+    bool is_busy = 10;
+    uint64 keys_written = 11;
+    uint64 bytes_written = 12;
+    uint64 keys_read = 13;
+    uint64 bytes_read = 14;
+    repeated RecordPair op_latencies = 15;
+    uint32 slow_score = 16;
+    map<string, uint64> peer_stats = 17;
+
+    reserved 18 to 50;
+}
+message RecordPair { string key = 1; uint64 value = 2; }
+
+// ---- Heartbeats ----
+message StoreHeartbeatRequest {
+    RequestHeader header = 1;
+    StoreStats stats = 2;
+}
+message StoreHeartbeatResponse {
+    ResponseHeader header = 1;
+    ReplicationStatus replication_status = 2;
+    string cluster_version = 3;
+    uint64 require_detailed_report_until = 4;
+}
+
+message RegionHeartbeatRequest {
+    RequestHeader header = 1;
+    metapb.Region region = 2;
+    metapb.Peer leader = 3;
+    repeated PeerStats down_peers = 4;
+    repeated metapb.Peer pending_peers = 5;
+    uint64 bytes_written = 6;
+    uint64 keys_written = 7;
+    uint64 approximate_size = 8;
+    uint64 approximate_keys = 9;
+    uint64 bytes_read = 10;
+    uint64 keys_read = 11;
+    RegionInterval interval = 12;
+    uint64 term = 13;
+    repeated metapb.PeerRole replication_status_peer_roles = 14;
+
+    reserved 15 to 30;
+}
+message PeerStats {
+    metapb.Peer peer = 1;
+    uint64 down_seconds = 2;
+}
+message RegionInterval {
+    uint64 start_timestamp = 1;
+    uint64 end_timestamp = 2;
+}
+
+// RegionHeartbeatResponse is the operator channel — PD pushes operators down
+// as part of the normal stream so the leader applies them on next heartbeat.
+message RegionHeartbeatResponse {
+    ResponseHeader header = 1;
+    metapb.Peer change_peer = 2;
+    metapb.Peer transfer_leader = 3;
+    uint64 region_id = 4;
+    metapb.RegionEpoch region_epoch = 5;
+
+    SplitRegion split_region = 6;
+    Merge merge = 7;
+
+    repeated ChangePeer change_peer_v2 = 8;
+
+    reserved 9 to 30;
+}
+message ChangePeer { metapb.Peer peer = 1; ConfChangeType change_type = 2; }
+enum ConfChangeType {
+    AddNode = 0;
+    RemoveNode = 1;
+    AddLearnerNode = 2;
+}
+message SplitRegion {
+    Policy policy = 1;
+    repeated bytes keys = 2;     // explicit split points (Policy = USER_KEY)
+    enum Policy {
+        SCAN = 0;
+        APPROXIMATE = 1;
+        USER_KEY = 2;
+    }
+}
+message Merge { metapb.Region target = 1; }
+
+// ---- Region lookup / scan ----
+message GetRegionRequest {
+    RequestHeader header = 1;
+    bytes region_key = 2;
+}
+message GetRegionResponse {
+    ResponseHeader header = 1;
+    metapb.Region region = 2;
+    metapb.Peer leader = 3;
+    repeated metapb.Peer down_peers = 4;
+    repeated metapb.Peer pending_peers = 5;
+}
+
+message GetRegionByIDRequest {
+    RequestHeader header = 1;
+    uint64 region_id = 2;
+}
+
+message ScanRegionsRequest {
+    RequestHeader header = 1;
+    bytes start_key = 2;
+    bytes end_key = 3;
+    int32 limit = 4;
+}
+message ScanRegionsResponse {
+    ResponseHeader header = 1;
+    repeated metapb.Region regions = 2;
+    repeated metapb.Peer leaders = 3;
+}
+
+// ---- Split ----
+message AskSplitRequest { RequestHeader header = 1; metapb.Region region = 2; }
+message AskSplitResponse { ResponseHeader header = 1; uint64 new_region_id = 2; repeated uint64 new_peer_ids = 3; }
+
+message AskBatchSplitRequest {
+    RequestHeader header = 1;
+    metapb.Region region = 2;
+    uint32 split_count = 3;
+}
+message AskBatchSplitResponse {
+    ResponseHeader header = 1;
+    repeated SplitID ids = 2;
+}
+message SplitID { uint64 new_region_id = 1; repeated uint64 new_peer_ids = 2; }
+
+message ReportSplitRequest {
+    RequestHeader header = 1;
+    metapb.Region left = 2;
+    metapb.Region right = 3;
+}
+message ReportSplitResponse { ResponseHeader header = 1; }
+
+message ReportBatchSplitRequest {
+    RequestHeader header = 1;
+    repeated metapb.Region regions = 2;
+}
+message ReportBatchSplitResponse { ResponseHeader header = 1; }
+
+message SplitRegionsRequest {
+    RequestHeader header = 1;
+    repeated bytes split_keys = 2;
+    int64 retry_limit = 3;
+}
+message SplitRegionsResponse {
+    ResponseHeader header = 1;
+    uint32 finished_percentage = 2;
+    repeated uint64 regions_id = 3;
+}
+
+message ScatterRegionRequest {
+    RequestHeader header = 1;
+    uint64 region_id = 2;
+    metapb.Region region = 3;
+    metapb.Peer leader = 4;
+    string group = 5;
+    uint64 retry_limit = 6;
+}
+message ScatterRegionResponse {
+    ResponseHeader header = 1;
+    uint64 finished_percentage = 2;
+}
+
+// ---- GC safe-point ----
+message GetGCSafePointRequest { RequestHeader header = 1; }
+message GetGCSafePointResponse {
+    ResponseHeader header = 1;
+    uint64 safe_point = 2;
+}
+
+message UpdateGCSafePointRequest {
+    RequestHeader header = 1;
+    uint64 safe_point = 2;
+}
+message UpdateGCSafePointResponse {
+    ResponseHeader header = 1;
+    uint64 new_safe_point = 2;
+}
+
+// ServiceGCSafePoint: BR / CDC / long-running SQL register a safe-point lower
+// bound here so the global safe-point cannot advance past their needs.
+//
+// PD computes effective_safe_point = min(now - lifetime,
+//                                       min over active services).
+message UpdateServiceGCSafePointRequest {
+    RequestHeader header = 1;
+    bytes service_id = 2;
+    int64 ttl = 3;            // seconds; 0 = unregister
+    uint64 safe_point = 4;
+}
+message UpdateServiceGCSafePointResponse {
+    ResponseHeader header = 1;
+    string service_id = 2;
+    int64 ttl = 3;
+    uint64 min_safe_point = 4;     // current global min — the actual GC bound
+}
+
+message GetAllServiceGCSafePointsRequest { RequestHeader header = 1; }
+message GetAllServiceGCSafePointsResponse {
+    ResponseHeader header = 1;
+    repeated ServiceSafePoint safe_points = 2;
+}
+message ServiceSafePoint {
+    string service_id = 1;
+    int64 expired_at = 2;
+    uint64 safe_point = 3;
+}
+
+// ---- Operator inspection ----
+message GetOperatorRequest { RequestHeader header = 1; uint64 region_id = 2; }
+message GetOperatorResponse {
+    ResponseHeader header = 1;
+    uint64 region_id = 2;
+    bytes desc = 3;
+    OperatorStatus status = 4;
+    bytes kind = 5;
+}
+enum OperatorStatus {
+    SUCCESS = 0;
+    TIMEOUT = 1;
+    CANCEL = 2;
+    REPLACE = 3;
+    NOT_FOUND = 4;
+    RUNNING = 5;
+}
+
+// ---- Deadlock detection ----
+//
+// Each pessimistic-lock conflict creates exactly one wait-for edge that the
+// KV node ships to PD. The detector inserts the edge and DFS-walks from the
+// waiter — if it reaches itself, the response carries the wait chain. The
+// edge is NOT inserted on cycle (caller will retry, edge stays observable
+// to the re-query) so the graph doesn't pollute itself with self-cycles.
+message DetectDeadlockRequest {
+    RequestHeader header = 1;
+    kvrpcpb.WaitForEntry entry = 2;
+}
+message DetectDeadlockResponse {
+    ResponseHeader header = 1;
+    // Empty ⇒ no cycle; non-empty ⇒ the cycle, in waiter-first order.
+    repeated kvrpcpb.WaitForEntry wait_chain = 2;
+    // Hash of the lock key that closes the cycle — helpful for KV-side
+    // error envelope (KeyError.Deadlock.deadlock_key_hash).
+    uint64 deadlock_key_hash = 3;
+
+    reserved 4 to 30;
+}
+
+// CleanupWaitFor: explicit edge removal. The detector also has a TTL-based
+// cleanup; this RPC lets the KV side eagerly drop edges as soon as the
+// blocking condition resolves (pessimistic lock acquired, txn committed,
+// txn rolled back), keeping graph size small and detection fast.
+message CleanupWaitForRequest {
+    RequestHeader header = 1;
+    uint64 txn = 2;
+    CleanupMode mode = 3;
+
+    enum CleanupMode {
+        // Remove every edge whose holder == txn — the txn released its
+        // locks (commit / rollback / pessimistic-rollback).
+        REMOVE_HOLDER = 0;
+        // Remove every edge whose waiter == txn — the txn finally got
+        // its lock, or aborted while waiting.
+        REMOVE_WAITER = 1;
+    }
+}
+message CleanupWaitForResponse {
+    ResponseHeader header = 1;
+}

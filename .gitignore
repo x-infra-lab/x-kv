@@ -1,0 +1,49 @@
+# Build output
+target/
+*.class
+*.jar
+*.war
+*.ear
+
+# IDE — IntelliJ
+.idea/
+*.iml
+out/
+
+# IDE — Eclipse
+.classpath
+.project
+.settings/
+
+# IDE — VS Code
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Maven
+dependency-reduced-pom.xml
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+release.properties
+
+# Logs
+*.log
+hs_err_pid*
+replay_pid*
+
+# Secrets / credentials
+*.pem
+*.key
+*.p12
+*.jks
+*.env
+*.env.local
+
+# RocksDB data (local dev)
+data/
+
+# Stray generated source (accidental mvn run at root)
+/io/

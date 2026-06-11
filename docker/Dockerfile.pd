@@ -1,0 +1,32 @@
+# Multi-stage build for x-kv Placement Driver (PD)
+FROM maven:3-eclipse-temurin-17 AS build
+WORKDIR /src
+COPY pom.xml .
+COPY proto/pom.xml proto/
+COPY common/pom.xml common/
+COPY pd/pom.xml pd/
+COPY kv/pom.xml kv/
+COPY client/pom.xml client/
+COPY tests/pom.xml tests/
+# Download dependencies first (layer cache)
+RUN mvn dependency:go-offline -pl pd -am -q 2>/dev/null || true
+COPY . .
+RUN mvn package -pl pd -am -DskipTests -q
+
+FROM eclipse-temurin:17-jre
+LABEL maintainer="x-infra-lab"
+LABEL description="x-kv Placement Driver (PD)"
+
+RUN groupadd -r xkv && useradd -r -g xkv xkv
+RUN mkdir -p /data/x-pd /etc/x-pd && chown -R xkv:xkv /data/x-pd /etc/x-pd
+
+COPY --from=build /src/pd/target/x-pd-server.jar /opt/x-pd/x-pd-server.jar
+COPY pd/src/main/resources/x-pd-server-default.yaml /etc/x-pd/config.yaml
+
+USER xkv
+WORKDIR /opt/x-pd
+
+EXPOSE 2379 2380 9190
+
+ENTRYPOINT ["java", "-jar", "x-pd-server.jar"]
+CMD ["--config", "/etc/x-pd/config.yaml"]

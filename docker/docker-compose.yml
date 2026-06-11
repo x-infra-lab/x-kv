@@ -1,0 +1,215 @@
+version: "3.9"
+
+services:
+  # ============================================================
+  # PD cluster — 3-node raft group for HA
+  # ============================================================
+  pd1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.pd
+    container_name: x-pd-1
+    command:
+      - "--node-id"
+      - "1"
+      - "--cluster-id"
+      - "1"
+      - "--client-address"
+      - "0.0.0.0:2379"
+      - "--raft-address"
+      - "0.0.0.0:2380"
+      - "--data-dir"
+      - "/data/x-pd"
+      - "--metrics-port"
+      - "9190"
+      - "--peer"
+      - "1=pd1:2380,pd1:2379;2=pd2:2380,pd2:2379;3=pd3:2380,pd3:2379"
+    ports:
+      - "2379:2379"
+      - "2380:2380"
+      - "9190:9190"
+    volumes:
+      - pd1-data:/data/x-pd
+    networks:
+      - xkv-net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:9190/readyz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+
+  pd2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.pd
+    container_name: x-pd-2
+    command:
+      - "--node-id"
+      - "2"
+      - "--cluster-id"
+      - "1"
+      - "--client-address"
+      - "0.0.0.0:2379"
+      - "--raft-address"
+      - "0.0.0.0:2380"
+      - "--data-dir"
+      - "/data/x-pd"
+      - "--metrics-port"
+      - "9190"
+      - "--peer"
+      - "1=pd1:2380,pd1:2379;2=pd2:2380,pd2:2379;3=pd3:2380,pd3:2379"
+    ports:
+      - "2381:2379"
+      - "2382:2380"
+      - "9290:9190"
+    volumes:
+      - pd2-data:/data/x-pd
+    networks:
+      - xkv-net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:9190/readyz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+
+  pd3:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.pd
+    container_name: x-pd-3
+    command:
+      - "--node-id"
+      - "3"
+      - "--cluster-id"
+      - "1"
+      - "--client-address"
+      - "0.0.0.0:2379"
+      - "--raft-address"
+      - "0.0.0.0:2380"
+      - "--data-dir"
+      - "/data/x-pd"
+      - "--metrics-port"
+      - "9190"
+      - "--peer"
+      - "1=pd1:2380,pd1:2379;2=pd2:2380,pd2:2379;3=pd3:2380,pd3:2379"
+    ports:
+      - "2383:2379"
+      - "2384:2380"
+      - "9390:9190"
+    volumes:
+      - pd3-data:/data/x-pd
+    networks:
+      - xkv-net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:9190/readyz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+
+  # ============================================================
+  # KV stores — 3 nodes, each connecting to all PD endpoints
+  # ============================================================
+  kv1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.kv
+    container_name: x-kv-1
+    command:
+      - "--store-id"
+      - "1"
+      - "--pd"
+      - "pd1:2379,pd2:2379,pd3:2379"
+      - "--client-address"
+      - "0.0.0.0:20160"
+      - "--raft-address"
+      - "0.0.0.0:20170"
+      - "--data-dir"
+      - "/data/x-kv"
+      - "--metrics-port"
+      - "9191"
+    ports:
+      - "20160:20160"
+      - "20170:20170"
+      - "9191:9191"
+    volumes:
+      - kv1-data:/data/x-kv
+    depends_on:
+      pd1:
+        condition: service_healthy
+    networks:
+      - xkv-net
+
+  kv2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.kv
+    container_name: x-kv-2
+    command:
+      - "--store-id"
+      - "2"
+      - "--pd"
+      - "pd1:2379,pd2:2379,pd3:2379"
+      - "--client-address"
+      - "0.0.0.0:20160"
+      - "--raft-address"
+      - "0.0.0.0:20170"
+      - "--data-dir"
+      - "/data/x-kv"
+      - "--metrics-port"
+      - "9192"
+    ports:
+      - "20161:20160"
+      - "20171:20170"
+      - "9192:9192"
+    volumes:
+      - kv2-data:/data/x-kv
+    depends_on:
+      pd1:
+        condition: service_healthy
+    networks:
+      - xkv-net
+
+  kv3:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.kv
+    container_name: x-kv-3
+    command:
+      - "--store-id"
+      - "3"
+      - "--pd"
+      - "pd1:2379,pd2:2379,pd3:2379"
+      - "--client-address"
+      - "0.0.0.0:20160"
+      - "--raft-address"
+      - "0.0.0.0:20170"
+      - "--data-dir"
+      - "/data/x-kv"
+      - "--metrics-port"
+      - "9193"
+    ports:
+      - "20162:20160"
+      - "20172:20170"
+      - "9193:9193"
+    volumes:
+      - kv3-data:/data/x-kv
+    depends_on:
+      pd1:
+        condition: service_healthy
+    networks:
+      - xkv-net
+
+volumes:
+  pd1-data:
+  pd2-data:
+  pd3-data:
+  kv1-data:
+  kv2-data:
+  kv3-data:
+
+networks:
+  xkv-net:
+    driver: bridge

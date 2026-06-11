@@ -1,0 +1,69 @@
+# x-kv Placement Driver (PD) configuration
+# Override with CLI args (--key value), env vars (X_PD_KEY), or this file (--config path).
+# Priority: CLI args > env vars > YAML file > defaults below.
+
+# Node identity
+node-id: 1
+cluster-id: 1
+
+# gRPC addresses
+client-address: "0.0.0.0:2379"
+raft-address: "0.0.0.0:2380"
+
+# Data directory for PD raft state
+data-dir: "/data/x-pd"
+
+# Prometheus metrics HTTP port (0 = disabled)
+metrics-port: 9190
+
+# Max concurrent gRPC requests (0 = unlimited)
+max-concurrent-requests: 5000
+
+# Slow-log threshold (requests exceeding this duration are logged as warnings)
+slow-log-threshold-ms: 1000
+
+# Multi-PD raft cluster peers (omit for single-node dev mode)
+# peers:
+#   - id: 1
+#     raft-address: "pd1:2380"
+#     client-address: "pd1:2379"
+#   - id: 2
+#     raft-address: "pd2:2380"
+#     client-address: "pd2:2379"
+#   - id: 3
+#     raft-address: "pd3:2380"
+#     client-address: "pd3:2379"
+
+# TSO (Timestamp Oracle) tuning
+tso:
+  saved-interval-ms: 50
+  update-interval-ms: 10
+
+# Scheduler tuning
+scheduler:
+  heartbeat-interval-ms: 10000
+  store-state-timeout-ms: 30000
+  max-operators-per-store: 5
+  region-schedule-limit: 32
+  leader-schedule-limit: 4
+  hot-region-schedule-limit: 4
+
+# GC safe-point management
+safe-point:
+  default-gc-lifetime-ms: 600000    # 10 minutes
+  advance-interval-ms: 60000
+  service-safe-point-ttl-ms: 300000 # 5 minutes
+
+# Security (optional)
+# security:
+#   auth-token: "your-secret-token"
+#   client-tls:
+#     cert-chain: /etc/x-pd/tls/server.crt
+#     private-key: /etc/x-pd/tls/server.key
+#     trust-certs: /etc/x-pd/tls/ca.crt
+#     mtls: false
+#   raft-tls:
+#     cert-chain: /etc/x-pd/tls/raft.crt
+#     private-key: /etc/x-pd/tls/raft.key
+#     trust-certs: /etc/x-pd/tls/ca.crt
+#     mtls: false

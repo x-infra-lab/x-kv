@@ -1,0 +1,32 @@
+# Multi-stage build for x-kv KV store
+FROM maven:3-eclipse-temurin-17 AS build
+WORKDIR /src
+COPY pom.xml .
+COPY proto/pom.xml proto/
+COPY common/pom.xml common/
+COPY pd/pom.xml pd/
+COPY kv/pom.xml kv/
+COPY client/pom.xml client/
+COPY tests/pom.xml tests/
+# Download dependencies first (layer cache)
+RUN mvn dependency:go-offline -pl kv -am -q 2>/dev/null || true
+COPY . .
+RUN mvn package -pl kv -am -DskipTests -q
+
+FROM eclipse-temurin:17-jre
+LABEL maintainer="x-infra-lab"
+LABEL description="x-kv distributed KV store node"
+
+RUN groupadd -r xkv && useradd -r -g xkv xkv
+RUN mkdir -p /data/x-kv /etc/x-kv && chown -R xkv:xkv /data/x-kv /etc/x-kv
+
+COPY --from=build /src/kv/target/x-kv-server.jar /opt/x-kv/x-kv-server.jar
+COPY kv/src/main/resources/x-kv-server-default.yaml /etc/x-kv/config.yaml
+
+USER xkv
+WORKDIR /opt/x-kv
+
+EXPOSE 20160 20170 9191
+
+ENTRYPOINT ["java", "-jar", "x-kv-server.jar"]
+CMD ["--config", "/etc/x-kv/config.yaml"]
