@@ -1,0 +1,139 @@
+syntax = "proto3";
+
+package errorpb;
+
+import "metapb.proto";
+
+option java_package = "io.github.xinfra.lab.xkv.proto";
+option java_outer_classname = "Errorpb";
+option java_multiple_files = false;
+
+// Error is the standard region-level error envelope. Every KV / Coprocessor
+// response carries an optional Error; clients route the response by inspecting
+// which oneof field is set and pick a matching backoff strategy.
+message Error {
+    // Human-readable message — for logging only; never used for control flow.
+    string message = 1;
+
+    NotLeader not_leader = 2;
+    RegionNotFound region_not_found = 3;
+    KeyNotInRegion key_not_in_region = 4;
+    EpochNotMatch epoch_not_match = 5;
+    ServerIsBusy server_is_busy = 6;
+    StaleCommand stale_command = 7;
+    StoreNotMatch store_not_match = 8;
+    RaftEntryTooLarge raft_entry_too_large = 9;
+    MaxTimestampNotSynced max_timestamp_not_synced = 10;
+    ReadIndexNotReady read_index_not_ready = 11;
+    DataIsNotReady data_is_not_ready = 12;
+    RegionNotInitialized region_not_initialized = 13;
+    DiskFull disk_full = 14;
+    RecoveryInProgress recovery_in_progress = 15;
+    MismatchPeerId mismatch_peer_id = 16;
+    FlashbackInProgress flashback_in_progress = 17;
+    FlashbackNotPrepared flashback_not_prepared = 18;
+    BucketVersionNotMatch bucket_version_not_match = 19;
+
+    reserved 20 to 80;
+}
+
+// NotLeader: the addressed peer is not the leader. leader (if known) lets the
+// caller skip an extra PD round-trip.
+message NotLeader {
+    uint64 region_id = 1;
+    metapb.Peer leader = 2;
+}
+
+message RegionNotFound {
+    uint64 region_id = 1;
+}
+
+message KeyNotInRegion {
+    bytes key = 1;
+    uint64 region_id = 2;
+    bytes start_key = 3;
+    bytes end_key = 4;
+}
+
+// EpochNotMatch fires when the caller's cached RegionEpoch is stale: either
+// conf_ver (membership) or version (split/merge) has advanced. Clients must
+// invalidate the cached region and re-route.
+message EpochNotMatch {
+    repeated metapb.Region current_regions = 1;
+}
+
+message ServerIsBusy {
+    string reason = 1;
+    uint64 backoff_ms = 2;
+    uint32 estimated_wait_ms = 3;
+}
+
+message StaleCommand {
+    // The proposed entry was overridden by a later term. The client should
+    // refresh its leader cache (term moved on) and retry.
+}
+
+message StoreNotMatch {
+    uint64 request_store_id = 1;
+    uint64 actual_store_id = 2;
+}
+
+message RaftEntryTooLarge {
+    uint64 region_id = 1;
+    uint64 entry_size = 2;
+}
+
+// MaxTimestampNotSynced: leader cannot serve linearizable reads / async-commit
+// prewrites until it has refreshed its max_ts from PD. Block briefly and retry.
+message MaxTimestampNotSynced {}
+
+message ReadIndexNotReady {
+    string reason = 1;
+    uint64 region_id = 2;
+}
+
+// DataIsNotReady: stale-read targeting a follower whose applied index lags
+// the requested safe_ts. Caller should fall back to leader read.
+message DataIsNotReady {
+    uint64 region_id = 1;
+    uint64 peer_id = 2;
+    uint64 safe_ts = 3;
+}
+
+message RegionNotInitialized {
+    uint64 region_id = 1;
+}
+
+message DiskFull {
+    repeated uint64 store_id = 1;
+    string reason = 2;
+}
+
+// RecoveryInProgress: a peer is rebuilding state from a snapshot or unsafe
+// recovery is running. Reads/writes are temporarily refused.
+message RecoveryInProgress {
+    uint64 region_id = 1;
+}
+
+message MismatchPeerId {
+    uint64 request_peer_id = 1;
+    uint64 store_peer_id = 2;
+}
+
+// Flashback: a region is being rolled back to a historical snapshot. All
+// non-flashback writes are refused for the duration.
+message FlashbackInProgress {
+    uint64 region_id = 1;
+    uint64 flashback_start_ts = 2;
+}
+
+message FlashbackNotPrepared {
+    uint64 region_id = 1;
+}
+
+// BucketVersionNotMatch: the client's bucket map is stale (used for
+// fine-grained load-balancing within a region).
+message BucketVersionNotMatch {
+    uint64 version = 1;
+    bytes keys = 2;
+}

@@ -1,0 +1,63 @@
+# x-kv Client SDK configuration
+# Override with CLI args (--key value), env vars (X_KV_CLIENT_KEY), or this file.
+# Priority: CLI args > env vars > YAML file > defaults below.
+
+# PD endpoints (comma-separated or YAML list)
+pd-endpoints:
+  - "127.0.0.1:2379"
+
+# gRPC deadline per request
+grpc-timeout-ms: 10000
+
+# Backoff tuning (per-error-class exponential backoff)
+backoff:
+  region-miss-base-ms: 2
+  region-miss-cap-ms: 1000
+  txn-lock-base-ms: 100
+  txn-lock-cap-ms: 3000
+  server-busy-base-ms: 500
+  server-busy-cap-ms: 5000
+  network-base-ms: 500
+  network-cap-ms: 20000
+  not-leader-base-ms: 5
+  not-leader-cap-ms: 1000
+  max-overall-elapsed-ms: 40000
+
+# TSO batcher
+tso:
+  batch-wait-micros: 50
+  max-batch-size: 4096
+  stream-reconnect-backoff-ms: 200
+
+# Region cache
+region-cache:
+  max-entries: 50000
+  entry-ttl-ms: 600000
+  negative-ttl-ms: 5000
+
+# Transaction defaults
+txn:
+  default-lock-ttl-ms: 20000
+  lock-heartbeat-interval-ms: 5000
+  prewrite-batch-size: 1024
+  commit-batch-size: 1024
+  batch-get-concurrency: 32
+  resolver-cache-size: 10000
+  resolver-cache-ttl-ms: 300000
+  enable-async-commit: true
+  enable-one-pc: true
+  pessimistic-wait-timeout-ms: 3000
+
+# Connection pool
+conn:
+  max-store-connections: 4
+  idle-connection-ttl-sec: 600
+
+# Security (optional)
+# auth-token: "your-secret-token"
+# conn:
+#   tls:
+#     cert-chain: /etc/x-kv/tls/client.crt
+#     private-key: /etc/x-kv/tls/client.key
+#     trust-certs: /etc/x-kv/tls/ca.crt
+#     mtls: false

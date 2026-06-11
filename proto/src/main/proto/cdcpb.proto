@@ -1,0 +1,110 @@
+syntax = "proto3";
+
+package cdcpb;
+
+import "errorpb.proto";
+import "kvrpcpb.proto";
+
+option java_package = "io.github.xinfra.lab.xkv.proto";
+option java_outer_classname = "Cdcpb";
+option java_multiple_files = false;
+
+// CDC: stream MVCC changes to downstream consumers (BR / TiCDC-equivalent).
+// Phase 7 implements the server side; protocol shape is fixed up-front so
+// Phase 5 client work can stub the channel.
+
+service ChangeData {
+    rpc EventFeed(stream ChangeDataRequest) returns (stream ChangeDataEvent);
+
+    // Resolved-ts heartbeat — separate stream so a region with no writes
+    // still ticks safe-ts forward for the consumer.
+    rpc ResolvedTs(stream ResolvedTsRequest) returns (stream ResolvedTsEvent);
+}
+
+message ChangeDataRequest {
+    Header header = 1;
+    uint64 region_id = 2;
+    kvrpcpb.Context context = 3;
+    bytes start_key = 4;
+    bytes end_key = 5;
+    uint64 checkpoint_ts = 6;
+    string request_id = 7;
+
+    Register register = 100;
+    Deregister deregister = 101;
+}
+
+message Header {
+    uint64 cluster_id = 1;
+    string ticdc_version = 2;
+}
+
+message Register {
+    bytes filter_loop = 1;
+}
+
+message Deregister {}
+
+message ChangeDataEvent {
+    repeated Event events = 1;
+    ResolvedTs resolved_ts = 2;
+    uint64 request_id = 3;
+}
+
+message Event {
+    uint64 region_id = 1;
+    string request_id = 2;
+    uint64 index = 3;
+
+    Entries entries = 100;
+    Admin admin = 101;
+    errorpb.Error error = 102;
+    uint64 resolved_ts = 103;
+    LongTxn long_txn = 104;
+}
+
+message Entries {
+    repeated Row entries = 1;
+}
+
+message Row {
+    OpType type = 1;
+    bytes key = 2;
+    bytes value = 3;
+    bytes old_value = 4;
+    uint64 start_ts = 5;
+    uint64 commit_ts = 6;
+    enum OpType {
+        UNKNOWN = 0;
+        PUT = 1;
+        DELETE = 2;
+        ROLLBACK = 3;
+    }
+}
+
+message Admin {
+    string admin_request = 1;
+    string admin_response = 2;
+}
+
+message LongTxn {
+    uint64 txn_start_ts = 1;
+    bytes primary = 2;
+    uint64 min_commit_ts = 3;
+}
+
+message ResolvedTs {
+    repeated uint64 regions = 1;
+    uint64 ts = 2;
+    string request_id = 3;
+}
+
+message ResolvedTsRequest {
+    Header header = 1;
+    uint64 region_id = 2;
+}
+
+message ResolvedTsEvent {
+    repeated uint64 regions = 1;
+    uint64 ts = 2;
+}

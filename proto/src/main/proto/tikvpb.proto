@@ -1,0 +1,154 @@
+syntax = "proto3";
+
+package tikvpb;
+
+import "kvrpcpb.proto";
+import "coprocessor.proto";
+
+option java_package = "io.github.xinfra.lab.xkv.proto";
+option java_outer_classname = "Tikvpb";
+option java_multiple_files = false;
+
+// Tikv: the only KV-server gRPC service. Mirrors the Go client-go surface so
+// porting / interop stays cheap.
+//
+// Design note: every request type carries kvrpcpb.Context (cluster_id, region
+// epoch, term, deadline, ...). RPCs that fail for region-level reasons return
+// an errorpb.Error in `region_error` rather than throwing gRPC status — this
+// lets the client's RegionRequestSender route the failure through one common
+// retry/backoff path.
+service Tikv {
+    // ---- Transactional KV ----
+    rpc KvGet(kvrpcpb.GetRequest) returns (kvrpcpb.GetResponse);
+    rpc KvScan(kvrpcpb.ScanRequest) returns (kvrpcpb.ScanResponse);
+    rpc KvBatchGet(kvrpcpb.BatchGetRequest) returns (kvrpcpb.BatchGetResponse);
+
+    rpc KvPrewrite(kvrpcpb.PrewriteRequest) returns (kvrpcpb.PrewriteResponse);
+    rpc KvPessimisticLock(kvrpcpb.PessimisticLockRequest) returns (kvrpcpb.PessimisticLockResponse);
+    rpc KvPessimisticRollback(kvrpcpb.PessimisticRollbackRequest) returns (kvrpcpb.PessimisticRollbackResponse);
+    rpc KvCommit(kvrpcpb.CommitRequest) returns (kvrpcpb.CommitResponse);
+    rpc KvCleanup(kvrpcpb.CleanupRequest) returns (kvrpcpb.CleanupResponse);
+    rpc KvBatchRollback(kvrpcpb.BatchRollbackRequest) returns (kvrpcpb.BatchRollbackResponse);
+    rpc KvCheckTxnStatus(kvrpcpb.CheckTxnStatusRequest) returns (kvrpcpb.CheckTxnStatusResponse);
+    rpc KvCheckSecondaryLocks(kvrpcpb.CheckSecondaryLocksRequest) returns (kvrpcpb.CheckSecondaryLocksResponse);
+    rpc KvScanLock(kvrpcpb.ScanLockRequest) returns (kvrpcpb.ScanLockResponse);
+    rpc KvResolveLock(kvrpcpb.ResolveLockRequest) returns (kvrpcpb.ResolveLockResponse);
+    rpc KvTxnHeartBeat(kvrpcpb.TxnHeartBeatRequest) returns (kvrpcpb.TxnHeartBeatResponse);
+
+    rpc KvGC(kvrpcpb.GCRequest) returns (kvrpcpb.GCResponse);
+    rpc KvDeleteRange(kvrpcpb.DeleteRangeRequest) returns (kvrpcpb.DeleteRangeResponse);
+
+    // ---- Raw KV ----
+    rpc RawGet(kvrpcpb.RawGetRequest) returns (kvrpcpb.RawGetResponse);
+    rpc RawBatchGet(kvrpcpb.RawBatchGetRequest) returns (kvrpcpb.RawBatchGetResponse);
+    rpc RawPut(kvrpcpb.RawPutRequest) returns (kvrpcpb.RawPutResponse);
+    rpc RawBatchPut(kvrpcpb.RawBatchPutRequest) returns (kvrpcpb.RawBatchPutResponse);
+    rpc RawDelete(kvrpcpb.RawDeleteRequest) returns (kvrpcpb.RawDeleteResponse);
+    rpc RawBatchDelete(kvrpcpb.RawBatchDeleteRequest) returns (kvrpcpb.RawBatchDeleteResponse);
+    rpc RawScan(kvrpcpb.RawScanRequest) returns (kvrpcpb.RawScanResponse);
+    rpc RawDeleteRange(kvrpcpb.RawDeleteRangeRequest) returns (kvrpcpb.RawDeleteRangeResponse);
+    rpc RawCAS(kvrpcpb.RawCASRequest) returns (kvrpcpb.RawCASResponse);
+
+    // ---- Coprocessor (push-down compute) ----
+    rpc Coprocessor(coprocessor.Request) returns (coprocessor.Response);
+    rpc CoprocessorStream(coprocessor.Request) returns (stream coprocessor.StreamResponse);
+    rpc BatchCoprocessor(coprocessor.BatchRequest) returns (stream coprocessor.BatchResponse);
+
+    // ---- Region admin (called by client / pd-ctl) ----
+    rpc SplitRegion(kvrpcpb.SplitRegionRequest) returns (kvrpcpb.SplitRegionResponse);
+
+    // ---- Mvcc inspection ----
+    rpc MvccGetByKey(kvrpcpb.MvccGetByKeyRequest) returns (kvrpcpb.MvccGetByKeyResponse);
+    rpc MvccGetByStartTs(kvrpcpb.MvccGetByStartTsRequest) returns (kvrpcpb.MvccGetByStartTsResponse);
+
+    // ---- BatchCommands: bidi stream that multiplexes any number of the
+    //      above RPCs over a single gRPC stream. The killer feature for
+    //      throughput — one fsync trip in the server can flush replies for
+    //      hundreds of in-flight requests. ----
+    rpc BatchCommands(stream BatchCommandsRequest) returns (stream BatchCommandsResponse);
+}
+
+// ---- BatchCommands wire format ----
+//
+// Each BatchCommandsRequest carries N RPCs; the server pairs each request
+// with a response by index. request_ids[i] is opaque to the server and
+// returned verbatim so the client can match.
+message BatchCommandsRequest {
+    repeated Request requests = 1;
+    repeated uint64 request_ids = 2;
+
+    message Request {
+        oneof cmd {
+            kvrpcpb.GetRequest Get = 1;
+            kvrpcpb.ScanRequest Scan = 2;
+            kvrpcpb.PrewriteRequest Prewrite = 3;
+            kvrpcpb.CommitRequest Commit = 4;
+            kvrpcpb.CleanupRequest Cleanup = 5;
+            kvrpcpb.BatchGetRequest BatchGet = 6;
+            kvrpcpb.BatchRollbackRequest BatchRollback = 7;
+            kvrpcpb.ScanLockRequest ScanLock = 8;
+            kvrpcpb.ResolveLockRequest ResolveLock = 9;
+            kvrpcpb.GCRequest GC = 10;
+            kvrpcpb.DeleteRangeRequest DeleteRange = 11;
+            kvrpcpb.RawGetRequest RawGet = 12;
+            kvrpcpb.RawBatchGetRequest RawBatchGet = 13;
+            kvrpcpb.RawPutRequest RawPut = 14;
+            kvrpcpb.RawBatchPutRequest RawBatchPut = 15;
+            kvrpcpb.RawDeleteRequest RawDelete = 16;
+            kvrpcpb.RawBatchDeleteRequest RawBatchDelete = 17;
+            kvrpcpb.RawScanRequest RawScan = 18;
+            kvrpcpb.RawDeleteRangeRequest RawDeleteRange = 19;
+            kvrpcpb.RawCASRequest RawCAS = 20;
+            coprocessor.Request Coprocessor = 21;
+            kvrpcpb.PessimisticLockRequest PessimisticLock = 22;
+            kvrpcpb.PessimisticRollbackRequest PessimisticRollback = 23;
+            kvrpcpb.CheckTxnStatusRequest CheckTxnStatus = 24;
+            kvrpcpb.CheckSecondaryLocksRequest CheckSecondaryLocks = 25;
+            kvrpcpb.TxnHeartBeatRequest TxnHeartBeat = 26;
+            Empty Empty = 255;
+        }
+    }
+}
+
+message BatchCommandsResponse {
+    repeated Response responses = 1;
+    repeated uint64 request_ids = 2;
+    uint64 transport_layer_load = 3;
+
+    message Response {
+        oneof cmd {
+            kvrpcpb.GetResponse Get = 1;
+            kvrpcpb.ScanResponse Scan = 2;
+            kvrpcpb.PrewriteResponse Prewrite = 3;
+            kvrpcpb.CommitResponse Commit = 4;
+            kvrpcpb.CleanupResponse Cleanup = 5;
+            kvrpcpb.BatchGetResponse BatchGet = 6;
+            kvrpcpb.BatchRollbackResponse BatchRollback = 7;
+            kvrpcpb.ScanLockResponse ScanLock = 8;
+            kvrpcpb.ResolveLockResponse ResolveLock = 9;
+            kvrpcpb.GCResponse GC = 10;
+            kvrpcpb.DeleteRangeResponse DeleteRange = 11;
+            kvrpcpb.RawGetResponse RawGet = 12;
+            kvrpcpb.RawBatchGetResponse RawBatchGet = 13;
+            kvrpcpb.RawPutResponse RawPut = 14;
+            kvrpcpb.RawBatchPutResponse RawBatchPut = 15;
+            kvrpcpb.RawDeleteResponse RawDelete = 16;
+            kvrpcpb.RawBatchDeleteResponse RawBatchDelete = 17;
+            kvrpcpb.RawScanResponse RawScan = 18;
+            kvrpcpb.RawDeleteRangeResponse RawDeleteRange = 19;
+            kvrpcpb.RawCASResponse RawCAS = 20;
+            coprocessor.Response Coprocessor = 21;
+            kvrpcpb.PessimisticLockResponse PessimisticLock = 22;
+            kvrpcpb.PessimisticRollbackResponse PessimisticRollback = 23;
+            kvrpcpb.CheckTxnStatusResponse CheckTxnStatus = 24;
+            kvrpcpb.CheckSecondaryLocksResponse CheckSecondaryLocks = 25;
+            kvrpcpb.TxnHeartBeatResponse TxnHeartBeat = 26;
+            Empty Empty = 255;
+        }
+    }
+}
+
+// Heartbeat keep-alive on otherwise idle BatchCommands streams.
+message Empty {
+    uint64 test_id = 1;
+}

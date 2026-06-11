@@ -1,0 +1,10 @@
+<?xml version='1.0'?>
+<configuration>
+  <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+    <encoder><pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern></encoder>
+  </appender>
+  <logger name="raft" level="INFO"/>
+  <logger name="io.github.xinfra.lab.raft" level="INFO"/>
+  <logger name="io.github.xinfra.lab.xkv" level="DEBUG"/>
+  <root level="WARN"><appender-ref ref="STDOUT"/></root>
+</configuration>

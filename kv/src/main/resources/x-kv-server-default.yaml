@@ -1,0 +1,73 @@
+# x-kv KV Store configuration
+# Override with CLI args (--key value), env vars (X_KV_KEY), or this file (--config path).
+# Priority: CLI args > env vars > YAML file > defaults below.
+
+# Store identity
+store-id: 1
+
+# PD endpoints (comma-separated or YAML list)
+pd-endpoints:
+  - "127.0.0.1:2379"
+
+# gRPC addresses
+client-address: "0.0.0.0:20160"
+raft-address: "0.0.0.0:20170"
+
+# Data directory for RocksDB + raft logs + snapshots
+data-dir: "/data/x-kv"
+
+# Prometheus metrics HTTP port (0 = disabled)
+metrics-port: 9191
+
+# Max concurrent gRPC requests (0 = unlimited)
+max-concurrent-requests: 10000
+
+# Slow-log threshold (requests exceeding this duration are logged as warnings)
+slow-log-threshold-ms: 1000
+
+# Graceful drain timeout (ms to wait for leader transfer before hard shutdown)
+drain-timeout-ms: 10000
+
+# RocksDB engine tuning
+engine:
+  block-cache-bytes: 268435456     # 256 MB
+  write-buffer-bytes: 67108864     # 64 MB
+  max-background-jobs: 4
+  enable-statistics: false
+
+# Raft tuning
+raft:
+  election-tick-ms: 1000
+  heartbeat-tick-ms: 100
+  max-size-per-msg: 1048576        # 1 MB
+  max-inflight-msgs: 256
+  snapshot-interval-entries: 10000
+  apply-batch-entries: 64
+
+# Region management
+region:
+  max-region-bytes: 100663296      # 96 MB
+  split-region-bytes: 67108864     # 64 MB
+  merge-region-bytes: 8388608      # 8 MB
+  region-max-keys: 1440000
+
+# Background workers
+worker:
+  log-compaction-interval-ms: 60000
+  log-compaction-gap-threshold: 10000
+  log-compaction-safety-margin: 1000
+  gc-interval-ms: 60000
+
+# Security (optional)
+# security:
+#   auth-token: "your-secret-token"
+#   client-tls:
+#     cert-chain: /etc/x-kv/tls/server.crt
+#     private-key: /etc/x-kv/tls/server.key
+#     trust-certs: /etc/x-kv/tls/ca.crt
+#     mtls: false
+#   raft-tls:
+#     cert-chain: /etc/x-kv/tls/raft.crt
+#     private-key: /etc/x-kv/tls/raft.key
+#     trust-certs: /etc/x-kv/tls/ca.crt
+#     mtls: false

@@ -1,0 +1,93 @@
+syntax = "proto3";
+
+package coprocessor;
+
+import "errorpb.proto";
+import "kvrpcpb.proto";
+import "metapb.proto";
+
+option java_package = "io.github.xinfra.lab.xkv.proto";
+option java_outer_classname = "Coprocessor";
+option java_multiple_files = false;
+
+// Pushed-down compute over a range of keys. The SQL layer encodes its operator
+// tree into `data` and the KV-side coprocessor decodes / executes it.
+//
+// Two response shapes:
+//   - Response (one-shot)   — small results
+//   - StreamResponse        — large scans; bounded memory on both sides
+message KeyRange {
+    bytes start = 1;
+    bytes end = 2;
+}
+
+message Request {
+    kvrpcpb.Context context = 1;
+    int64 tp = 2;             // request type opaque to KV
+    bytes data = 3;           // serialized SQL operator tree
+    uint64 start_ts = 4;
+    repeated KeyRange ranges = 5;
+    int64 schema_ver = 6;
+    bool is_trace_enabled = 7;
+    bool is_cache_enabled = 8;
+    uint64 cache_if_match_version = 9;
+    int64 paging_size = 10;
+
+    reserved 11 to 30;
+}
+
+message Response {
+    bytes data = 1;
+    errorpb.Error region_error = 2;
+    kvrpcpb.KeyError locked = 3;
+    string other_error = 4;
+    KeyRange range = 5;
+
+    bool can_be_cached = 6;
+    uint64 cache_last_version = 7;
+    bool is_cache_hit = 8;
+
+    int64 exec_details_ms = 9;
+
+    reserved 10 to 30;
+}
+
+// Streaming response — preferred for large scans. Each StreamResponse is one
+// chunk; client concatenates `data` until the stream closes. `range` is the
+// last range fully covered so the client can resume on partial failure.
+message StreamResponse {
+    bytes data = 1;
+    errorpb.Error region_error = 2;
+    kvrpcpb.KeyError locked = 3;
+    string other_error = 4;
+    KeyRange range = 5;
+
+    reserved 6 to 30;
+}
+
+// BatchRequest: same Request shape but addressed to multiple regions in one
+// gRPC. Server fans out to each region's coprocessor and streams partial
+// results back in arrival order. Used by SQL TableScan parallelism.
+message BatchRequest {
+    int64 tp = 1;
+    bytes data = 2;
+    uint64 start_ts = 3;
+    repeated RegionInfo regions = 4;
+    int64 schema_ver = 5;
+    int64 paging_size = 6;
+
+    reserved 7 to 20;
+}
+
+message RegionInfo {
+    uint64 region_id = 1;
+    metapb.RegionEpoch region_epoch = 2;
+    repeated KeyRange ranges = 3;
+}
+
+message BatchResponse {
+    bytes data = 1;
+    errorpb.Error region_error = 2;
+    string other_error = 3;
+    uint64 region_id = 4;
+}
