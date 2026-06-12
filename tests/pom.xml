@@ -7,12 +7,17 @@
     <parent>
         <groupId>io.github.x-infra-lab</groupId>
         <artifactId>x-kv</artifactId>
-        <version>0.2.0</version>
+        <version>0.2.0-RC1</version>
     </parent>
 
     <artifactId>x-kv-tests</artifactId>
     <name>x-kv-tests</name>
     <description>End-to-end / chaos / linearizability / benchmark suite.</description>
+
+    <properties>
+        <maven.deploy.skip>true</maven.deploy.skip>
+        <skipPublishing>true</skipPublishing>
+    </properties>
 
     <dependencies>
         <dependency>
