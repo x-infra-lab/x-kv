@@ -37,7 +37,7 @@ public final class RuleCheckerScheduler implements AutoCloseable {
     public static final int MAX_OPERATORS_PER_TICK = 4;
 
     private final PdStateMachine state;
-    private final OperatorQueue operators;
+    private final OperatorController controller;
     private final StoreStatsCache storeStats;
     private final long intervalMs;
     private final ScheduledExecutorService timer;
@@ -46,11 +46,11 @@ public final class RuleCheckerScheduler implements AutoCloseable {
     private volatile boolean closed = false;
 
     public RuleCheckerScheduler(PdStateMachine state,
-                                OperatorQueue operators,
+                                OperatorController controller,
                                 StoreStatsCache storeStats,
                                 long intervalMs) {
         this.state = state;
-        this.operators = operators;
+        this.controller = controller;
         this.storeStats = storeStats;
         this.intervalMs = intervalMs;
         this.timer = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -100,7 +100,7 @@ public final class RuleCheckerScheduler implements AutoCloseable {
 
         for (var region : state.allRegions()) {
             if (scheduled >= MAX_OPERATORS_PER_TICK) break;
-            if (operators.size(region.getId()) > 0) continue;
+            if (controller.getOperator(region.getId()).isPresent()) continue;
 
             // 1. Replace Down/Tombstone peers.
             for (var peer : region.getPeersList()) {
@@ -110,8 +110,17 @@ public final class RuleCheckerScheduler implements AutoCloseable {
                 var storeState = storeOpt.get().getState();
                 if (storeState == Metapb.StoreState.Down
                         || storeState == Metapb.StoreState.Tombstone) {
-                    operators.scheduleChangePeer(region.getId(), peer,
-                            Pdpb.ConfChangeType.RemoveNode);
+                    var resp = Pdpb.RegionHeartbeatResponse.newBuilder()
+                            .setRegionId(region.getId())
+                            .setChangePeer(peer)
+                            .addChangePeerV2(Pdpb.ChangePeer.newBuilder()
+                                    .setPeer(peer).setChangeType(Pdpb.ConfChangeType.RemoveNode).build())
+                            .build();
+                    var op = new SimpleOperator(
+                            System.nanoTime(), region.getId(), Operator.Kind.RULE_FIX,
+                            "rule-checker: remove " + storeState + " peer " + peer.getId(),
+                            resp, java.util.Set.of(peer.getStoreId()));
+                    if (!controller.addOperator(op)) break;
                     operatorsScheduled.incrementAndGet();
                     scheduled++;
                     log.info("rule-checker: removing {} peer {} from region={} (store {} is {})",
@@ -122,7 +131,7 @@ public final class RuleCheckerScheduler implements AutoCloseable {
             }
 
             if (scheduled >= MAX_OPERATORS_PER_TICK) break;
-            if (operators.size(region.getId()) > 0) continue;
+            if (controller.getOperator(region.getId()).isPresent()) continue;
 
             int peerCount = region.getPeersCount();
 
@@ -152,13 +161,23 @@ public final class RuleCheckerScheduler implements AutoCloseable {
                             .setStoreId(bestStore)
                             .setRole(Metapb.PeerRole.Voter)
                             .build();
-                    operators.scheduleChangePeer(region.getId(), newPeer,
-                            Pdpb.ConfChangeType.AddNode);
-                    operatorsScheduled.incrementAndGet();
-                    scheduled++;
-                    regionCountByStore.merge(bestStore, 1, Integer::sum);
-                    log.info("rule-checker: under-replicated region={} ({}/{}) — adding peer on store {}",
-                            region.getId(), peerCount, maxPeerCount, bestStore);
+                    var resp = Pdpb.RegionHeartbeatResponse.newBuilder()
+                            .setRegionId(region.getId())
+                            .setChangePeer(newPeer)
+                            .addChangePeerV2(Pdpb.ChangePeer.newBuilder()
+                                    .setPeer(newPeer).setChangeType(Pdpb.ConfChangeType.AddNode).build())
+                            .build();
+                    var op = new SimpleOperator(
+                            System.nanoTime(), region.getId(), Operator.Kind.RULE_FIX,
+                            "rule-checker: add peer on store " + bestStore,
+                            resp, java.util.Set.of(bestStore));
+                    if (controller.addOperator(op)) {
+                        operatorsScheduled.incrementAndGet();
+                        scheduled++;
+                        regionCountByStore.merge(bestStore, 1, Integer::sum);
+                        log.info("rule-checker: under-replicated region={} ({}/{}) — adding peer on store {}",
+                                region.getId(), peerCount, maxPeerCount, bestStore);
+                    }
                 }
                 continue;
             }
@@ -181,13 +200,23 @@ public final class RuleCheckerScheduler implements AutoCloseable {
                 }
 
                 if (victim != null) {
-                    operators.scheduleChangePeer(region.getId(), victim,
-                            Pdpb.ConfChangeType.RemoveNode);
-                    operatorsScheduled.incrementAndGet();
-                    scheduled++;
-                    log.info("rule-checker: over-replicated region={} ({}/{}) — removing peer {} on store {}",
-                            region.getId(), peerCount, maxPeerCount,
-                            victim.getId(), victim.getStoreId());
+                    var resp = Pdpb.RegionHeartbeatResponse.newBuilder()
+                            .setRegionId(region.getId())
+                            .setChangePeer(victim)
+                            .addChangePeerV2(Pdpb.ChangePeer.newBuilder()
+                                    .setPeer(victim).setChangeType(Pdpb.ConfChangeType.RemoveNode).build())
+                            .build();
+                    var op = new SimpleOperator(
+                            System.nanoTime(), region.getId(), Operator.Kind.RULE_FIX,
+                            "rule-checker: remove peer " + victim.getId() + " from store " + victim.getStoreId(),
+                            resp, java.util.Set.of(victim.getStoreId()));
+                    if (controller.addOperator(op)) {
+                        operatorsScheduled.incrementAndGet();
+                        scheduled++;
+                        log.info("rule-checker: over-replicated region={} ({}/{}) — removing peer {} on store {}",
+                                region.getId(), peerCount, maxPeerCount,
+                                victim.getId(), victim.getStoreId());
+                    }
                 }
             }
         }

@@ -14,6 +14,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 public final class GrpcServerMetricsInterceptor implements ServerInterceptor {
@@ -44,11 +45,14 @@ public final class GrpcServerMetricsInterceptor implements ServerInterceptor {
         Timer.Sample sample = Timer.start(registry);
         long startNanos = System.nanoTime();
         activeRequests.incrementAndGet();
+        var decremented = new AtomicBoolean(false);
 
         var wrappedCall = new ForwardingServerCall.SimpleForwardingServerCall<>(call) {
             @Override
             public void close(Status status, Metadata trailers) {
-                activeRequests.decrementAndGet();
+                if (decremented.compareAndSet(false, true)) {
+                    activeRequests.decrementAndGet();
+                }
                 String statusCode = status.getCode().name();
 
                 sample.stop(Timer.builder("grpc_server_request_duration_seconds")
@@ -75,7 +79,9 @@ public final class GrpcServerMetricsInterceptor implements ServerInterceptor {
         return new ForwardingServerCallListener.SimpleForwardingServerCallListener<>(listener) {
             @Override
             public void onCancel() {
-                activeRequests.decrementAndGet();
+                if (decremented.compareAndSet(false, true)) {
+                    activeRequests.decrementAndGet();
+                }
                 Counter.builder("grpc_server_requests_total")
                         .tag("method", method)
                         .tag("status", "CANCELLED")

@@ -105,9 +105,28 @@ public final class MvccApplyHandler implements ApplyHandler {
     // Prewrite
     // ===================================================================
 
+    private static final int MAX_KEY_SIZE = 4096;
+    private static final int MAX_VALUE_SIZE = 8 * 1024 * 1024;
+
     private Result applyPrewrite(byte[] payload, StorageEngine.WriteBatch batch)
             throws InvalidProtocolBufferException {
         var req = Kvrpcpb.PrewriteRequest.parseFrom(payload);
+
+        for (var m : req.getMutationsList()) {
+            if (m.getKey().size() > MAX_KEY_SIZE) {
+                return Result.ok(Kvrpcpb.PrewriteResponse.newBuilder()
+                        .addErrors(Kvrpcpb.KeyError.newBuilder()
+                                .setAbort("key too large: " + m.getKey().size()))
+                        .build().toByteArray());
+            }
+            if (m.getValue().size() > MAX_VALUE_SIZE) {
+                return Result.ok(Kvrpcpb.PrewriteResponse.newBuilder()
+                        .addErrors(Kvrpcpb.KeyError.newBuilder()
+                                .setAbort("value too large: " + m.getValue().size()))
+                        .build().toByteArray());
+            }
+        }
+
         var reader = new MvccReader(engine, null, true /* ignoreLocks for inner reads */);
         var txn = new MvccTxn(batch, reader);
 
@@ -126,7 +145,7 @@ public final class MvccApplyHandler implements ApplyHandler {
                     && req.getIsPessimisticLock(i) != 0L;
             var oc = isPessimistic
                     ? txn.checkPessimisticPrewrite(key, req.getStartVersion())
-                    : txn.checkPrewrite(key, req.getStartVersion());
+                    : txn.checkPrewrite(key, req.getStartVersion(), mapOp(m.getOp()));
             checks.add(oc);
             if (oc instanceof MvccTxn.PrewriteWriteConflict wc) {
                 errors.add(Kvrpcpb.KeyError.newBuilder()
@@ -148,6 +167,11 @@ public final class MvccApplyHandler implements ApplyHandler {
             } else if (oc instanceof MvccTxn.PrewritePessimisticLockNotFound nf) {
                 errors.add(Kvrpcpb.KeyError.newBuilder()
                         .setAbort("pessimistic-lock-not-found startTs=" + nf.startTs())
+                        .build());
+            } else if (oc instanceof MvccTxn.PrewriteAlreadyExist ae) {
+                errors.add(Kvrpcpb.KeyError.newBuilder()
+                        .setAlreadyExist(Kvrpcpb.AlreadyExist.newBuilder()
+                                .setKey(com.google.protobuf.ByteString.copyFrom(ae.key())))
                         .build());
             }
         }
@@ -472,7 +496,7 @@ public final class MvccApplyHandler implements ApplyHandler {
         // Bounded to keep one apply round from holding the writer lock
         // arbitrarily long. Caller re-issues until the lock CF is drained
         // (the verdict cache makes follow-up calls cheap).
-        record Target(byte[] key, long startTs, long commitTs) {}
+        record Target(byte[] userKey, long startTs, long commitTs) {}
         var targets = new ArrayList<Target>();
         try (var it = engine.newIterator(StorageEngine.Cf.LOCK, engine.newReadOptions())) {
             for (it.seek(new byte[]{0}); it.isValid()
@@ -485,15 +509,16 @@ public final class MvccApplyHandler implements ApplyHandler {
                 }
                 Long ct = verdict.get(lock.startTs());
                 if (ct == null) continue;
-                targets.add(new Target(it.key().clone(), lock.startTs(), ct));
+                byte[] userKey = MvccKey.userKeyFromLockKey(it.key());
+                targets.add(new Target(userKey, lock.startTs(), ct));
             }
         }
 
         for (var t : targets) {
             if (t.commitTs() > 0) {
-                txn.resolveLockCommit(t.key(), t.startTs(), t.commitTs());
+                txn.resolveLockCommit(t.userKey(), t.startTs(), t.commitTs());
             } else {
-                txn.resolveLockRollback(t.key(), t.startTs());
+                txn.resolveLockRollback(t.userKey(), t.startTs());
             }
         }
         return Result.ok(Kvrpcpb.ResolveLockResponse.newBuilder().build().toByteArray());
@@ -586,7 +611,7 @@ public final class MvccApplyHandler implements ApplyHandler {
                     .useAsyncCommit(existing.useAsyncCommit())
                     .secondaries(existing.secondaries())
                     .build();
-            batch.put(StorageEngine.Cf.LOCK, primary, refreshed.encode());
+            batch.put(StorageEngine.Cf.LOCK, MvccKey.lockKey(primary), refreshed.encode());
         }
 
         return Result.ok(Kvrpcpb.TxnHeartBeatResponse.newBuilder()
@@ -726,19 +751,11 @@ public final class MvccApplyHandler implements ApplyHandler {
                     .build()
                     .toByteArray());
         }
-        // For DEFAULT and WRITE CFs the keys are {@code userKey || 8B-ts}.
-        // RocksDB's deleteRange is half-open [lower, upper). Using {@code
-        // end} (the bare user-key) as the exclusive upper bound deletes
-        // every entry whose user-key is strictly less than {@code end} —
-        // because for any user-key u == end, its encoded key starts with
-        // {@code end || some-byte} which sorts after {@code end} (a strict
-        // prefix is lexicographically smaller). NOT {@code
-        // afterAllVersionsOf(end)} — that would also catch user-keys whose
-        // bytes start with {@code end} and continue beyond, which is wrong
-        // for the half-open [start, end) semantics the caller asked for.
-        batch.deleteRange(StorageEngine.Cf.DEFAULT, start, end);
-        batch.deleteRange(StorageEngine.Cf.WRITE, start, end);
-        batch.deleteRange(StorageEngine.Cf.LOCK, start, end);
+        byte[] encodedStart = MvccKey.lockKey(start);
+        byte[] encodedEnd = MvccKey.lockKey(end);
+        batch.deleteRange(StorageEngine.Cf.DEFAULT, encodedStart, encodedEnd);
+        batch.deleteRange(StorageEngine.Cf.WRITE, encodedStart, encodedEnd);
+        batch.deleteRange(StorageEngine.Cf.LOCK, encodedStart, encodedEnd);
         return Result.ok(Kvrpcpb.DeleteRangeResponse.newBuilder().build().toByteArray());
     }
 

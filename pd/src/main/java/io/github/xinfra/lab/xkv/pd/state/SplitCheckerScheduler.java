@@ -6,7 +6,6 @@ import io.micrometer.core.instrument.Counter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -24,18 +23,18 @@ public final class SplitCheckerScheduler implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(SplitCheckerScheduler.class);
 
     private final PdStateMachine state;
-    private final OperatorQueue operators;
+    private final OperatorController controller;
     private final long splitThresholdBytes;
     private final long intervalMs;
     private final ScheduledExecutorService timer;
     private final Counter errorCounter = XKvMetrics.errorCounter("split_checker", "tick");
 
     public SplitCheckerScheduler(PdStateMachine state,
-                                  OperatorQueue operators,
+                                  OperatorController controller,
                                   long splitThresholdBytes,
                                   long intervalMs) {
         this.state = state;
-        this.operators = operators;
+        this.controller = controller;
         this.splitThresholdBytes = splitThresholdBytes;
         this.intervalMs = intervalMs;
         this.timer = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -62,14 +61,29 @@ public final class SplitCheckerScheduler implements AutoCloseable {
             long regionId = entry.getKey();
             var stats = entry.getValue();
             if (stats.approximateSize() < splitThresholdBytes) continue;
-            if (operators.size(regionId) > 0) continue;
+            if (controller.getOperator(regionId).isPresent()) continue;
 
             var regionOpt = state.getRegion(regionId);
             if (regionOpt.isEmpty()) continue;
 
+            var region = regionOpt.get();
+            var storeIds = new java.util.HashSet<Long>();
+            for (var p : region.getPeersList()) storeIds.add(p.getStoreId());
+
+            var sr = Pdpb.SplitRegion.newBuilder()
+                    .setPolicy(Pdpb.SplitRegion.Policy.APPROXIMATE).build();
+            var resp = Pdpb.RegionHeartbeatResponse.newBuilder()
+                    .setRegionId(regionId)
+                    .setSplitRegion(sr)
+                    .build();
+            var op = new SimpleOperator(
+                    System.nanoTime(), regionId, Operator.Kind.SPLIT,
+                    "split-checker: approxSize=" + stats.approximateSize(),
+                    resp, storeIds);
+            if (!controller.addOperator(op)) continue;
+
             log.info("split-checker: region={} approxSize={} exceeds threshold={}, scheduling APPROXIMATE split",
                     regionId, stats.approximateSize(), splitThresholdBytes);
-            operators.scheduleSplit(regionId, List.of(), Pdpb.SplitRegion.Policy.APPROXIMATE);
         }
     }
 

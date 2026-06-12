@@ -150,7 +150,7 @@ final class MvccReaderTest {
                 .ttlMs(3_000)
                 .build();
         try (var b = engine.newWriteBatch()) {
-            b.put(StorageEngine.Cf.LOCK, userKey.getBytes(), lock.encode());
+            b.put(StorageEngine.Cf.LOCK, MvccKey.lockKey(userKey.getBytes()), lock.encode());
             engine.write(b, false);
         }
     }

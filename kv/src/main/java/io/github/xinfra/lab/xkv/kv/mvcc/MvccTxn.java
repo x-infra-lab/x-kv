@@ -69,7 +69,7 @@ public final class MvccTxn {
      * <p>Idempotent OK: if lock CF has a lock from THIS txn (matching
      * startTs), the prewrite has already happened — return ok and skip.
      */
-    public PrewriteOutcome checkPrewrite(byte[] key, long startTs) {
+    public PrewriteOutcome checkPrewrite(byte[] key, long startTs, Op op) {
         // 1) Same-txn ROLLBACK record.
         var rb = reader.findWriteByStartTs(key, startTs);
         if (rb.isPresent() && rb.get().type() == Write.Type.ROLLBACK) {
@@ -89,7 +89,14 @@ public final class MvccTxn {
             }
         }
 
-        // 3) Lock conflict.
+        // 3) INSERT / CHECK_NOT_EXISTS: reject if a committed PUT already exists.
+        if (op == Op.INSERT || op == Op.CHECK_NOT_EXISTS) {
+            if (latest.isPresent() && latest.get().type() == Write.Type.PUT) {
+                return PrewriteOutcome.alreadyExist(key);
+            }
+        }
+
+        // 4) Lock conflict.
         var lockOpt = reader.readLock(key);
         if (lockOpt.isPresent()) {
             var lock = lockOpt.get();
@@ -157,7 +164,7 @@ public final class MvccTxn {
      * Returns 0 if none exists.
      */
     public long findLatestNonRollbackCommitTs(byte[] key) {
-        var iter = readerEngine().newIterator(StorageEngine.Cf.WRITE, readerEngine().newReadOptions());
+        var iter = readerEngine().newIterator(StorageEngine.Cf.WRITE, reader.snapshotReadOpts());
         try (iter) {
             iter.seek(MvccKey.firstVersionFor(key));
             while (iter.isValid()) {
@@ -225,7 +232,7 @@ public final class MvccTxn {
                 .useAsyncCommit(useAsyncCommit)
                 .secondaries(secondaries)
                 .build();
-        batch.put(StorageEngine.Cf.LOCK, key, lock.encode());
+        batch.put(StorageEngine.Cf.LOCK, MvccKey.lockKey(key), lock.encode());
     }
 
     // =====================================================================
@@ -299,7 +306,7 @@ public final class MvccTxn {
         }
 
         batch.put(StorageEngine.Cf.WRITE, MvccKey.encode(key, commitTs), writeRecord.encode());
-        batch.delete(StorageEngine.Cf.LOCK, key);
+        batch.delete(StorageEngine.Cf.LOCK, MvccKey.lockKey(key));
         return CommitOutcome.committed(commitTs);
     }
 
@@ -334,7 +341,7 @@ public final class MvccTxn {
         // 3) If our lock still sits on this key, drop it + any default CF.
         var lockOpt = reader.readLock(key);
         if (lockOpt.isPresent() && lockOpt.get().startTs() == startTs) {
-            batch.delete(StorageEngine.Cf.LOCK, key);
+            batch.delete(StorageEngine.Cf.LOCK, MvccKey.lockKey(key));
             // Remove default CF entry only for PUT/PESSIMISTIC types where
             // we may have written one.
             var t = lockOpt.get().type();
@@ -347,7 +354,7 @@ public final class MvccTxn {
 
     /** Find the commitTs for a given startTs by linear scan of the userKey block. */
     public long findCommitTsForStartTs(byte[] key, long startTs) {
-        var iter = readerEngine().newIterator(StorageEngine.Cf.WRITE, readerEngine().newReadOptions());
+        var iter = readerEngine().newIterator(StorageEngine.Cf.WRITE, reader.snapshotReadOpts());
         try (iter) {
             iter.seek(MvccKey.firstVersionFor(key));
             while (iter.isValid()) {
@@ -371,6 +378,12 @@ public final class MvccTxn {
                                                           long startTs,
                                                           long forUpdateTs,
                                                           long ttlMs) {
+        // Reject if a ROLLBACK record at this startTs already exists.
+        var rb = reader.findWriteByStartTs(key, startTs);
+        if (rb.isPresent() && rb.get().type() == Write.Type.ROLLBACK) {
+            return PessimisticLockOutcome.writeConflict(key, startTs, 0);
+        }
+
         // Write conflict: any commit at commitTs >= forUpdateTs ?
         long latestCommit = findLatestNonRollbackCommitTs(key);
         if (latestCommit >= forUpdateTs) {
@@ -393,14 +406,14 @@ public final class MvccTxn {
                 .forUpdateTs(forUpdateTs)
                 .ttlMs(ttlMs)
                 .build();
-        batch.put(StorageEngine.Cf.LOCK, key, lock.encode());
+        batch.put(StorageEngine.Cf.LOCK, MvccKey.lockKey(key), lock.encode());
         return PessimisticLockOutcome.acquired();
     }
 
     public void pessimisticRollback(byte[] key, long startTs, long forUpdateTs) {
         var lockOpt = reader.readLock(key);
         if (lockOpt.isPresent() && lockOpt.get().startTs() == startTs && lockOpt.get().isPessimistic()) {
-            batch.delete(StorageEngine.Cf.LOCK, key);
+            batch.delete(StorageEngine.Cf.LOCK, MvccKey.lockKey(key));
         }
     }
 
@@ -462,7 +475,7 @@ public final class MvccTxn {
             // drop the lock (and the inline DEFAULT-CF backing if any).
             batch.put(StorageEngine.Cf.WRITE, MvccKey.encode(primaryKey, lockTs),
                     Write.rollback(lockTs).encode());
-            batch.delete(StorageEngine.Cf.LOCK, primaryKey);
+            batch.delete(StorageEngine.Cf.LOCK, MvccKey.lockKey(primaryKey));
             if (lock.type() == Lock.Type.PUT || lock.type() == Lock.Type.PESSIMISTIC) {
                 batch.delete(StorageEngine.Cf.DEFAULT, MvccKey.encode(primaryKey, lockTs));
             }
@@ -510,7 +523,8 @@ public final class MvccTxn {
     public sealed interface PrewriteOutcome
             permits PrewriteOk, PrewriteAlready, PrewriteWriteConflict,
                     PrewriteKeyLocked, PrewriteSelfRolledBack,
-                    PrewritePessimisticUpgrade, PrewritePessimisticLockNotFound {
+                    PrewritePessimisticUpgrade, PrewritePessimisticLockNotFound,
+                    PrewriteAlreadyExist {
         static PrewriteOk ok() { return new PrewriteOk(); }
         static PrewriteAlready alreadyPrewritten(byte[] key, Lock l) { return new PrewriteAlready(key, l); }
         static PrewriteWriteConflict writeConflict(byte[] key, long startTs, long conflictCt) {
@@ -525,6 +539,9 @@ public final class MvccTxn {
         }
         static PrewritePessimisticLockNotFound pessimisticLockNotFound(byte[] key, long startTs) {
             return new PrewritePessimisticLockNotFound(key, startTs);
+        }
+        static PrewriteAlreadyExist alreadyExist(byte[] key) {
+            return new PrewriteAlreadyExist(key);
         }
     }
     public record PrewriteOk() implements PrewriteOutcome {}
@@ -546,6 +563,8 @@ public final class MvccTxn {
      * unsound because no write-conflict check ran for this key.
      */
     public record PrewritePessimisticLockNotFound(byte[] key, long startTs) implements PrewriteOutcome {}
+    /** INSERT / CHECK_NOT_EXISTS: a committed PUT already exists for this key. */
+    public record PrewriteAlreadyExist(byte[] key) implements PrewriteOutcome {}
 
     public sealed interface CommitOutcome
             permits CommitCommitted, CommitAlreadyCommitted, CommitAlreadyRolledBack,

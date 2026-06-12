@@ -2,6 +2,7 @@ package io.github.xinfra.lab.xkv.pd.state;
 
 import com.google.protobuf.ByteString;
 import io.github.xinfra.lab.xkv.proto.Metapb;
+import io.github.xinfra.lab.xkv.proto.Pdpb;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -38,7 +39,7 @@ public final class MergeCheckerScheduler implements AutoCloseable {
     public static final int MAX_MERGES_PER_TICK = 2;
 
     private final PdStateMachine state;
-    private final OperatorQueue operators;
+    private final OperatorController controller;
     private final long mergeThresholdBytes;
     private final long intervalMs;
     private final ScheduledExecutorService timer;
@@ -47,11 +48,11 @@ public final class MergeCheckerScheduler implements AutoCloseable {
     private volatile boolean closed = false;
 
     public MergeCheckerScheduler(PdStateMachine state,
-                                 OperatorQueue operators,
+                                 OperatorController controller,
                                  long mergeThresholdBytes,
                                  long intervalMs) {
         this.state = state;
-        this.operators = operators;
+        this.controller = controller;
         this.mergeThresholdBytes = mergeThresholdBytes;
         this.intervalMs = intervalMs;
         this.timer = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -94,7 +95,7 @@ public final class MergeCheckerScheduler implements AutoCloseable {
             if (scheduled >= MAX_MERGES_PER_TICK) break;
             long regionId = region.getId();
             if (paired.contains(regionId)) continue;
-            if (operators.size(regionId) > 0) continue;
+            if (controller.getOperator(regionId).isPresent()) continue;
 
             // Check if region is small.
             var stats = allStats.get(regionId);
@@ -108,7 +109,7 @@ public final class MergeCheckerScheduler implements AutoCloseable {
             var neighbor = byStartKey.get(endKey);
             if (neighbor == null) continue;
             if (paired.contains(neighbor.getId())) continue;
-            if (operators.size(neighbor.getId()) > 0) continue;
+            if (controller.getOperator(neighbor.getId()).isPresent()) continue;
 
             // Neighbor must also be small.
             var neighborStats = allStats.get(neighbor.getId());
@@ -118,7 +119,17 @@ public final class MergeCheckerScheduler implements AutoCloseable {
             // Both regions must be hosted on the same stores.
             if (!sameStores(region, neighbor)) continue;
 
-            operators.scheduleMerge(region.getId(), neighbor);
+            var storeIds = new HashSet<Long>();
+            for (var p : region.getPeersList()) storeIds.add(p.getStoreId());
+            var resp = Pdpb.RegionHeartbeatResponse.newBuilder()
+                    .setRegionId(region.getId())
+                    .setMerge(Pdpb.Merge.newBuilder().setTarget(neighbor).build())
+                    .build();
+            var op = new SimpleOperator(
+                    System.nanoTime(), region.getId(), Operator.Kind.MERGE,
+                    "merge-checker: merge region " + region.getId() + " into " + neighbor.getId(),
+                    resp, storeIds);
+            if (!controller.addOperator(op)) continue;
             operatorsScheduled.incrementAndGet();
             scheduled++;
             paired.add(regionId);

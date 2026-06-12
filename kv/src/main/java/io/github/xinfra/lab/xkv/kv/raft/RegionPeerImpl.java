@@ -491,6 +491,7 @@ public final class RegionPeerImpl implements RegionPeer {
     private void applyReadyLocked(Ready ready) throws Exception {
         var pending = new ArrayList<PendingDispatch>();
         var confChanges = new ArrayList<Eraftpb.ConfChangeV2>();
+        var postFlushCallbacks = new ArrayList<Runnable>();
         boolean wroteAnything = false;
 
         // === Phase 0: install incoming snapshot (if any) ===
@@ -551,7 +552,7 @@ public final class RegionPeerImpl implements RegionPeer {
                 long idx = entry.getIndex();
                 if (idx <= raftEngine.appliedIndex()) continue; // already applied (replay)
 
-                if (applyOneEntry(entry, pending, confChanges, idx)) {
+                if (applyOneEntry(entry, pending, confChanges, postFlushCallbacks, idx)) {
                     wroteAnything = true;
                 }
             }
@@ -613,6 +614,11 @@ public final class RegionPeerImpl implements RegionPeer {
             storage.flushWal(true);
         }
 
+        for (var cb : postFlushCallbacks) {
+            try { cb.run(); }
+            catch (Throwable t) { log.warn("region={} postFlush callback failed", regionId, t); }
+        }
+
         // === Post-write fan-out ===
 
         raftStorage.postApply(ready.hardState());
@@ -654,6 +660,7 @@ public final class RegionPeerImpl implements RegionPeer {
     private boolean applyOneEntry(Eraftpb.Entry entry,
                                    List<PendingDispatch> pending,
                                    List<Eraftpb.ConfChangeV2> confChanges,
+                                   List<Runnable> postFlushCallbacks,
                                    long idx) throws Exception {
         if (entry.getEntryType() == Eraftpb.EntryType.EntryConfChange) {
             var cc = Eraftpb.ConfChange.parseFrom(entry.getData());
@@ -719,7 +726,7 @@ public final class RegionPeerImpl implements RegionPeer {
         var keys = ProposalKeyScope.peekKeys(decoded);
         java.util.function.Supplier<Void> work = () -> {
             try (var batch = storage.newWriteBatch()) {
-                applyDecoded(decoded, batch, pending);
+                applyDecoded(decoded, batch, pending, postFlushCallbacks);
                 raftEngine.saveAppliedIndex(idx, batch);
                 storage.write(batch, false);
             } catch (Exception e) {
@@ -741,11 +748,15 @@ public final class RegionPeerImpl implements RegionPeer {
 
     private void applyDecoded(ProposalCodec.Decoded decoded,
                                StorageEngine.WriteBatch batch,
-                               List<PendingDispatch> pending) {
+                               List<PendingDispatch> pending,
+                               List<Runnable> postFlushCallbacks) {
         ApplyHandler.Result r = applyHandler.apply(decoded, batch);
         ApplyResult outcome = r.success() ? ApplyResult.ok(r.response()) : ApplyResult.err(r.errorMessage());
         if (decoded.proposeSeq() != 0) {
             pending.add(new PendingDispatch(decoded.proposeSeq(), outcome));
+        }
+        if (r.postFlush() != null) {
+            postFlushCallbacks.add(r.postFlush());
         }
     }
 

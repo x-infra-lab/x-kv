@@ -200,9 +200,12 @@ public final class HlcTsoOracle implements Tso {
 
     @Override
     public void reloadAfterLeaderChange() {
-        // Re-read persisted physical_bound and bump the cursor strictly past
-        // it. NEVER reuse a TSO range that may have been issued by a prior
-        // leader. The +1 is critical.
+        // Cancel any stale in-flight extend from the previous leader term.
+        var stale = inFlightExtend.get();
+        if (stale != null) {
+            stale.cancel(true);
+            inFlightExtend.set(null);
+        }
         lock.lock();
         try {
             currentPhysical = physicalBound + 1;

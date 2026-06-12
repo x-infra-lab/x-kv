@@ -1,6 +1,7 @@
 package io.github.xinfra.lab.xkv.pd.state;
 
 import io.github.xinfra.lab.xkv.proto.Metapb;
+import io.github.xinfra.lab.xkv.proto.Pdpb;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -44,7 +45,7 @@ public final class LeaderBalanceScheduler implements AutoCloseable {
     public static final int MAX_OPERATORS_PER_TICK = 4;
 
     private final PdStateMachine state;
-    private final OperatorQueue operators;
+    private final OperatorController controller;
     private final StoreStatsCache storeStats;
     private final long intervalMs;
     private final ScheduledExecutorService timer;
@@ -52,14 +53,14 @@ public final class LeaderBalanceScheduler implements AutoCloseable {
     private final AtomicLong operatorsScheduled = new AtomicLong();
     private volatile boolean closed = false;
 
-    public LeaderBalanceScheduler(PdStateMachine state, OperatorQueue operators, long intervalMs) {
-        this(state, operators, new StoreStatsCache(), intervalMs);
+    public LeaderBalanceScheduler(PdStateMachine state, OperatorController controller, long intervalMs) {
+        this(state, controller, new StoreStatsCache(), intervalMs);
     }
 
-    public LeaderBalanceScheduler(PdStateMachine state, OperatorQueue operators,
+    public LeaderBalanceScheduler(PdStateMachine state, OperatorController controller,
                                    StoreStatsCache storeStats, long intervalMs) {
         this.state = state;
-        this.operators = operators;
+        this.controller = controller;
         this.storeStats = storeStats;
         this.intervalMs = intervalMs;
         this.timer = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -149,7 +150,15 @@ public final class LeaderBalanceScheduler implements AutoCloseable {
                 continue;
             }
 
-            operators.scheduleTransferLeader(move.region().getId(), target);
+            var resp = Pdpb.RegionHeartbeatResponse.newBuilder()
+                    .setRegionId(move.region().getId())
+                    .setTransferLeader(target)
+                    .build();
+            var op = new SimpleOperator(
+                    System.nanoTime(), move.region().getId(), Operator.Kind.BALANCE_LEADER,
+                    "leader-balance: transfer leader to store " + target.getStoreId(),
+                    resp, java.util.Set.of(target.getStoreId()));
+            if (!controller.addOperator(op)) continue;
             operatorsScheduled.incrementAndGet();
             scheduled++;
             counts.merge(maxStore, -1, Integer::sum);

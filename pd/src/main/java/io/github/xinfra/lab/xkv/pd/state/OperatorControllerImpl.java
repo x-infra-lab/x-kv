@@ -46,7 +46,7 @@ public final class OperatorControllerImpl implements OperatorController {
     }
 
     @Override
-    public boolean addOperator(Operator op) {
+    public synchronized boolean addOperator(Operator op) {
         long regionId = op.regionId();
 
         if (inFlight.containsKey(regionId)) {
@@ -85,7 +85,7 @@ public final class OperatorControllerImpl implements OperatorController {
     }
 
     @Override
-    public boolean removeOperator(long regionId) {
+    public synchronized boolean removeOperator(long regionId) {
         var record = inFlight.remove(regionId);
         if (record == null) return false;
         decrementStoreCounters(record.targetStoreIds());

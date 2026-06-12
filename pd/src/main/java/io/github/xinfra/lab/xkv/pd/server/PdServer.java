@@ -130,33 +130,33 @@ public final class PdServer {
         scheduler.scheduleAtFixedRate(this::cleanupDeadlockSafely,
                 DEADLOCK_CLEANUP_INTERVAL_MS, DEADLOCK_CLEANUP_INTERVAL_MS, TimeUnit.MILLISECONDS);
 
+        operatorController = new io.github.xinfra.lab.xkv.pd.state.OperatorControllerImpl(
+                operators, config.scheduler().maxOperatorsPerStore(), OPERATOR_TIMEOUT_MS);
+
         leaderBalance = new io.github.xinfra.lab.xkv.pd.state.LeaderBalanceScheduler(
-                state, operators, storeStatsCache, LEADER_BALANCE_INTERVAL_MS);
+                state, operatorController, storeStatsCache, LEADER_BALANCE_INTERVAL_MS);
         leaderBalance.start();
 
         regionBalance = new io.github.xinfra.lab.xkv.pd.state.RegionBalanceScheduler(
-                state, operators, storeStatsCache, REGION_BALANCE_INTERVAL_MS);
+                state, operatorController, storeStatsCache, REGION_BALANCE_INTERVAL_MS);
         regionBalance.start();
 
         splitChecker = new io.github.xinfra.lab.xkv.pd.state.SplitCheckerScheduler(
-                state, operators, config.scheduler().regionSplitBytes(),
+                state, operatorController, config.scheduler().regionSplitBytes(),
                 config.scheduler().heartbeatIntervalMs());
         splitChecker.start();
-
-        operatorController = new io.github.xinfra.lab.xkv.pd.state.OperatorControllerImpl(
-                operators, config.scheduler().maxOperatorsPerStore(), OPERATOR_TIMEOUT_MS);
 
         hotRegion = new io.github.xinfra.lab.xkv.pd.state.HotRegionScheduler(
                 state, operatorController, operators, storeStatsCache, HOT_REGION_INTERVAL_MS);
         hotRegion.start();
 
         mergeChecker = new io.github.xinfra.lab.xkv.pd.state.MergeCheckerScheduler(
-                state, operators, config.scheduler().regionSplitBytes() / 10,
+                state, operatorController, config.scheduler().regionSplitBytes() / 10,
                 MERGE_CHECKER_INTERVAL_MS);
         mergeChecker.start();
 
         ruleChecker = new io.github.xinfra.lab.xkv.pd.state.RuleCheckerScheduler(
-                state, operators, storeStatsCache, RULE_CHECKER_INTERVAL_MS);
+                state, operatorController, storeStatsCache, RULE_CHECKER_INTERVAL_MS);
         ruleChecker.start();
     }
 
@@ -178,11 +178,16 @@ public final class PdServer {
 
         // Start the raft gRPC server on the raft address.
         var raftAddr = GrpcChannelFactory.parseHostPort(config.raftAddress());
-        raftGrpcServer = GrpcChannelFactory.serverBuilder(
+        var raftBuilder = GrpcChannelFactory.serverBuilder(
                         new InetSocketAddress(raftAddr.host(), raftAddr.port()), config.raftTls())
-                .addService(new PdRaftServiceImpl(raftTransport))
-                .build()
-                .start();
+                .addService(new PdRaftServiceImpl(raftTransport));
+        if (config.maxConcurrentRequests() > 0) {
+            raftBuilder.intercept(new ConcurrencyLimitInterceptor(config.maxConcurrentRequests()));
+        }
+        if (config.authToken() != null) {
+            raftBuilder.intercept(new AuthServerInterceptor(config.authToken()));
+        }
+        raftGrpcServer = raftBuilder.build().start();
 
         // Build the peer list for raft initialization.
         var raftPeers = new ArrayList<Peer>();

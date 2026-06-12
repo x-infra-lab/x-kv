@@ -16,16 +16,32 @@ public final class MetricsHttpServer implements AutoCloseable {
     private static final byte[] OK = "OK".getBytes(StandardCharsets.UTF_8);
     private static final byte[] UNAVAILABLE = "Service Unavailable".getBytes(StandardCharsets.UTF_8);
 
+    private static final byte[] UNAUTHORIZED = "Unauthorized".getBytes(StandardCharsets.UTF_8);
+
     private final HttpServer httpServer;
 
     public MetricsHttpServer(int port, PrometheusMeterRegistry registry) throws IOException {
-        this(port, registry, () -> true);
+        this(port, registry, () -> true, null);
     }
 
     public MetricsHttpServer(int port, PrometheusMeterRegistry registry,
                              Supplier<Boolean> readinessChecker) throws IOException {
+        this(port, registry, readinessChecker, null);
+    }
+
+    public MetricsHttpServer(int port, PrometheusMeterRegistry registry,
+                             Supplier<Boolean> readinessChecker,
+                             String metricsAuthToken) throws IOException {
         httpServer = HttpServer.create(new InetSocketAddress(port), 0);
         httpServer.createContext("/metrics", exchange -> {
+            if (metricsAuthToken != null) {
+                String authHeader = exchange.getRequestHeaders().getFirst("Authorization");
+                if (authHeader == null || !authHeader.equals("Bearer " + metricsAuthToken)) {
+                    exchange.sendResponseHeaders(401, UNAUTHORIZED.length);
+                    try (var os = exchange.getResponseBody()) { os.write(UNAUTHORIZED); }
+                    return;
+                }
+            }
             String body = registry.scrape();
             byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
             exchange.getResponseHeaders().set("Content-Type",

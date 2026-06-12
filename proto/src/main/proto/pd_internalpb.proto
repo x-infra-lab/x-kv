@@ -93,6 +93,14 @@ message PdSnapshot {
     repeated metapb.Region regions = 4;
     uint64 id_allocator_next = 5;
     uint64 gc_safe_point = 6;
+    map<uint64, metapb.Peer> leaders = 7;
+    repeated RegionStatsEntry region_stats = 8;
 
-    reserved 7 to 30;
+    reserved 9 to 30;
+}
+
+message RegionStatsEntry {
+    uint64 region_id = 1;
+    int64 approximate_size = 2;
+    int64 approximate_keys = 3;
 }
