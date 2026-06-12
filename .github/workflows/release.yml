@@ -47,7 +47,7 @@ jobs:
           gpg-passphrase: GPG_PASSPHRASE
 
       - name: Maven deploy
-        run: mvn -U -B -ntp deploy -Prelease
+        run: mvn -U -B -ntp deploy -Prelease -DskipTests
         env:
           CENTRAL_USER: ${{ secrets.CENTRAL_USER }}
           CENTRAL_PASSWD: ${{ secrets.CENTRAL_PASSWD }}

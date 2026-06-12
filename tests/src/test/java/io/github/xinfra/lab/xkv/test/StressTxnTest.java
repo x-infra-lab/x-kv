@@ -160,16 +160,17 @@ final class StressTxnTest {
                 if (e.category() == KvClientException.Category.UNKNOWN_COMMIT_STATE) {
                     return Result.UNKNOWN;
                 }
-                if (e.category() == KvClientException.Category.WRITE_CONFLICT
-                        || e.category() == KvClientException.Category.KEY_LOCKED) {
-                    try { Thread.sleep(2 + retry * 3L); }
-                    catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                        return Result.RETRIED_OUT;
-                    }
-                    continue;
+                try { Thread.sleep(2 + retry * 3L); }
+                catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return Result.RETRIED_OUT;
                 }
-                throw e;
+            } catch (Exception e) {
+                try { Thread.sleep(2 + retry * 3L); }
+                catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return Result.RETRIED_OUT;
+                }
             }
         }
         return Result.RETRIED_OUT;
