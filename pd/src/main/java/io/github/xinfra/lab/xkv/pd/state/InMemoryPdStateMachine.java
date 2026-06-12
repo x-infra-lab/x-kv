@@ -58,7 +58,8 @@ public final class InMemoryPdStateMachine implements PdStateMachine {
             (a, b) -> com.google.protobuf.ByteString.unsignedLexicographicalComparator().compare(a, b));
 
     private final java.util.HashMap<Long, Metapb.Peer> leaders = new java.util.HashMap<>();
-    private final java.util.concurrent.ConcurrentHashMap<Long, RegionStats> regionStats = new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.concurrent.ConcurrentHashMap<Long, RegionStats> regionStats =
+            new java.util.concurrent.ConcurrentHashMap<>();
 
     private final AtomicLong idAllocator = new AtomicLong(1000);   // start ids past well-known reserved ones
 

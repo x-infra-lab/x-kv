@@ -364,7 +364,9 @@ public final class TransactionImpl implements Transaction {
             // Check for write conflict — non-retryable for pessimistic lock.
             for (var err : resp.getErrorsList()) {
                 if (err.hasConflict()) {
-                    throw new KvClientException(KvClientException.Category.WRITE_CONFLICT, err.getConflict().toString());
+                    throw new KvClientException(
+                            KvClientException.Category.WRITE_CONFLICT,
+                            err.getConflict().toString());
                 }
             }
             // KeyError.locked — the key is held by another txn. Backoff and retry.
@@ -550,14 +552,22 @@ public final class TransactionImpl implements Transaction {
     }
 
     private static KvClientException mapKeyError(Kvrpcpb.KeyError ke) {
-        if (ke.hasConflict()) return new KvClientException(KvClientException.Category.WRITE_CONFLICT, ke.toString());
-        if (ke.hasDeadlock()) return new KvClientException(KvClientException.Category.DEADLOCK, ke.toString());
-        if (ke.hasAlreadyExist()) return new KvClientException(KvClientException.Category.ALREADY_EXIST, ke.toString());
-        if (ke.hasTxnNotFound()) return new KvClientException(KvClientException.Category.TXN_NOT_FOUND, ke.toString());
-        if (ke.hasCommitTsExpired()) return new KvClientException(KvClientException.Category.COMMIT_TS_EXPIRED, ke.toString());
-        if (ke.hasCommitTsTooLarge()) return new KvClientException(KvClientException.Category.COMMIT_TS_TOO_LARGE, ke.toString());
-        if (ke.hasAssertionFailed()) return new KvClientException(KvClientException.Category.ASSERTION_FAILED, ke.toString());
-        return new KvClientException(KvClientException.Category.OTHER, ke.toString());
+        var msg = ke.toString();
+        if (ke.hasConflict()) return new KvClientException(
+                KvClientException.Category.WRITE_CONFLICT, msg);
+        if (ke.hasDeadlock()) return new KvClientException(
+                KvClientException.Category.DEADLOCK, msg);
+        if (ke.hasAlreadyExist()) return new KvClientException(
+                KvClientException.Category.ALREADY_EXIST, msg);
+        if (ke.hasTxnNotFound()) return new KvClientException(
+                KvClientException.Category.TXN_NOT_FOUND, msg);
+        if (ke.hasCommitTsExpired()) return new KvClientException(
+                KvClientException.Category.COMMIT_TS_EXPIRED, msg);
+        if (ke.hasCommitTsTooLarge()) return new KvClientException(
+                KvClientException.Category.COMMIT_TS_TOO_LARGE, msg);
+        if (ke.hasAssertionFailed()) return new KvClientException(
+                KvClientException.Category.ASSERTION_FAILED, msg);
+        return new KvClientException(KvClientException.Category.OTHER, msg);
     }
 
     private enum State { ACTIVE, COMMITTED, ROLLED_BACK, UNKNOWN }

@@ -4,11 +4,13 @@ import io.github.xinfra.lab.xkv.ctl.cmd.ClusterCommand;
 import io.github.xinfra.lab.xkv.ctl.cmd.GcCommand;
 import io.github.xinfra.lab.xkv.ctl.cmd.RegionCommand;
 import io.github.xinfra.lab.xkv.ctl.cmd.StoreCommand;
-import io.github.xinfra.lab.xkv.common.tls.GrpcChannelFactory;
 import io.github.xinfra.lab.xkv.proto.PDGrpc;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.concurrent.TimeUnit;
 
@@ -19,6 +21,7 @@ public final class XKvCtl {
 
             Global options:
               --pd <host:port>    PD endpoint (default: 127.0.0.1:2379)
+              --completion        Print bash completion script and exit
 
             Commands:
               cluster health              Show cluster health status
@@ -38,6 +41,13 @@ public final class XKvCtl {
         if (args.length == 0) {
             System.out.println(USAGE);
             System.exit(0);
+        }
+
+        for (String arg : args) {
+            if ("--completion".equals(arg)) {
+                printCompletion();
+                System.exit(0);
+            }
         }
 
         String pdEndpoint = "127.0.0.1:2379";
@@ -86,6 +96,22 @@ public final class XKvCtl {
             channel.shutdown();
             try { channel.awaitTermination(3, TimeUnit.SECONDS); }
             catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+        }
+    }
+
+    private static void printCompletion() {
+        try (var in = XKvCtl.class.getResourceAsStream("/xkv-ctl-completion.bash")) {
+            if (in == null) {
+                System.err.println("completion script not found");
+                return;
+            }
+            var reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8));
+            String line;
+            while ((line = reader.readLine()) != null) {
+                System.out.println(line);
+            }
+        } catch (Exception e) {
+            System.err.println("failed to read completion script: " + e.getMessage());
         }
     }
 }

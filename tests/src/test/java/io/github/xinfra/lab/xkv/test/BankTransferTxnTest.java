@@ -57,23 +57,17 @@ import static org.assertj.core.api.Assertions.assertThat;
  * and logical bits as the within-millisecond counter — mirrors PD's
  * monotonic semantics.
  *
- * <h3>Known limitation under heavy contention</h3>
+ * <h3>Concurrency</h3>
  *
- * <p>This test runs at THREADS=2. With 3+ concurrent writer threads
- * empirically the test exhibits SI violations, ultimately rooted in the
- * fact that v2's apply path reads {@code max_ts} <em>without</em> a
- * concurrency-manager / sharded latch protecting the read-then-prewrite
- * window. TiKV solves this with the {@code concurrency-manager} crate +
- * memory locks + transaction-aware key latches; Phase 4 adds the same
- * machinery. Until then, treating {@code max_ts} updates as fully
- * observable across reader threads and apply threads is best-effort, and
- * a small fraction of high-contention transfers may witness inconsistent
- * snapshots.
+ * <p>Runs with THREADS=4 concurrent writer threads.
+ * {@link io.github.xinfra.lab.xkv.kv.mvcc.ConcurrencyManager} serializes
+ * the read-then-prewrite window via 32-stripe per-key latches, ensuring SI
+ * correctness under contention.
  */
 final class BankTransferTxnTest {
     private static final int ACCOUNTS = 8;
     private static final int INITIAL_BALANCE = 100;
-    private static final int THREADS = 2;
+    private static final int THREADS = 4;
     private static final int TRANSFERS_PER_THREAD = 60;
     private static final int MAX_RETRIES = 50;
 

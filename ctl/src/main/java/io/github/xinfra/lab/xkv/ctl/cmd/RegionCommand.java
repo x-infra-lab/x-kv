@@ -1,7 +1,6 @@
 package io.github.xinfra.lab.xkv.ctl.cmd;
 
 import com.google.protobuf.ByteString;
-import io.github.xinfra.lab.xkv.proto.Metapb;
 import io.github.xinfra.lab.xkv.proto.PDGrpc;
 import io.github.xinfra.lab.xkv.proto.Pdpb;
 

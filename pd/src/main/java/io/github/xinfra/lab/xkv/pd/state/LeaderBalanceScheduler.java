@@ -6,7 +6,6 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -112,8 +111,10 @@ public final class LeaderBalanceScheduler implements AutoCloseable {
         for (var e : byLeaderStore.entrySet()) counts.put(e.getKey(), e.getValue().size());
 
         while (scheduled < MAX_OPERATORS_PER_TICK) {
-            long maxStore = -1, minStore = -1;
-            int max = Integer.MIN_VALUE, min = Integer.MAX_VALUE;
+            long maxStore = -1;
+            long minStore = -1;
+            int max = Integer.MIN_VALUE;
+            int min = Integer.MAX_VALUE;
             int maxSlow = -1;
             for (var e : counts.entrySet()) {
                 int slow = storeStats.slowScore(e.getKey());

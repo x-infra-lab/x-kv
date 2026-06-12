@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — 0.2.0-SNAPSHOT
+## [0.2.0] — 2026-06-11
 
 Complete rewrite of x-kv v0.1. The v0.1 audit identified 10 classes of
 data-integrity defects (C1-C10); v0.2 addresses every one at its layer,
@@ -114,6 +114,11 @@ behind hard interface contracts.
 - `LeaderBalanceScheduler` — balances region leaders across stores
 - `RegionBalanceScheduler` — balances region replicas across stores
 - `SplitCheckerScheduler` — auto-split when region exceeds size threshold
+- `HotRegionScheduler` — transfers leadership of QPS-hot regions to less-hot stores
+- `MergeCheckerScheduler` — merges adjacent small regions below size threshold
+- `RuleCheckerScheduler` — enforces replica count rules (under/over-replicated, down-peer replacement)
+- `OperatorControllerImpl` — operator lifecycle management with per-store concurrency limits (token bucket)
+- `SimpleOperator` — minimal Operator implementation for scheduler-to-controller bridge
 - `DeadlockDetector` — distributed wait-for graph cycle detection
 
 **Test infrastructure**

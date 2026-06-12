@@ -116,8 +116,10 @@ public final class RegionBalanceScheduler implements AutoCloseable {
         for (var e : byStore.entrySet()) counts.put(e.getKey(), e.getValue().size());
 
         while (scheduled < MAX_OPERATORS_PER_TICK) {
-            long maxStore = -1, minStore = -1;
-            int max = Integer.MIN_VALUE, min = Integer.MAX_VALUE;
+            long maxStore = -1;
+            long minStore = -1;
+            int max = Integer.MIN_VALUE;
+            int min = Integer.MAX_VALUE;
             for (var e : counts.entrySet()) {
                 if (e.getValue() > max) { max = e.getValue(); maxStore = e.getKey(); }
                 // Skip busy stores and stores with critically low disk space.

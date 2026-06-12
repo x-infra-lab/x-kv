@@ -1,6 +1,5 @@
 package io.github.xinfra.lab.xkv.kv.config;
 
-import io.github.xinfra.lab.xkv.common.config.YamlConfigLoader;
 import io.github.xinfra.lab.xkv.common.tls.TlsConfig;
 
 import java.io.IOException;

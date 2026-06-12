@@ -202,6 +202,41 @@ services:
     networks:
       - xkv-net
 
+  # ============================================================
+  # Monitoring — Prometheus + Grafana
+  # ============================================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: x-prometheus
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - xkv-net
+    depends_on:
+      pd1:
+        condition: service_healthy
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: x-grafana
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    networks:
+      - xkv-net
+    depends_on:
+      - prometheus
+
 volumes:
   pd1-data:
   pd2-data:
@@ -209,6 +244,8 @@ volumes:
   kv1-data:
   kv2-data:
   kv3-data:
+  prometheus-data:
+  grafana-data:
 
 networks:
   xkv-net:

@@ -289,7 +289,9 @@ public final class PerRegionRaftEngine implements RaftEngine {
         // Drop everything under the region's RAFT-CF subtree, then mark the
         // applied range in the data CFs for later GC by the store.
         try (var b = storage.newWriteBatch()) {
-            for (byte type : new byte[] { TYPE_LOG, TYPE_META, TYPE_APPLIED, TYPE_DEDUP, TYPE_SNAPMETA, TYPE_CONFSTATE, TYPE_REGION }) {
+            for (byte type : new byte[] {
+                    TYPE_LOG, TYPE_META, TYPE_APPLIED, TYPE_DEDUP,
+                    TYPE_SNAPMETA, TYPE_CONFSTATE, TYPE_REGION }) {
                 b.deleteRange(StorageEngine.Cf.RAFT,
                         regionTypePrefix(regionId, type),
                         regionTypePrefix(regionId + 1, type));

@@ -6,7 +6,7 @@ Distributed transactional KV store. Java 17, RocksDB, gRPC, Multi-Raft via
 [`x-raft-lib`](https://github.com/x-infra-lab/x-raft-lib). Targets parity
 with TiKV v8.x at the wire-protocol level.
 
-> **Status: v0.2.0-SNAPSHOT** — Multi-Raft cluster with MVCC + Percolator
+> **Status: v0.2.0** — Multi-Raft cluster with MVCC + Percolator
 > transactions, PD-driven routing, client SDK, region auto-split/merge,
 > Jepsen-style linearizability tests, and benchmarks.
 
@@ -19,7 +19,8 @@ with TiKV v8.x at the wire-protocol level.
 - **MVCC + Percolator transactions** — optimistic 2PC, pessimistic locking,
   async commit, 1PC short-circuit, distributed deadlock detection
 - **Placement Driver (PD)** — 3-node HA Raft cluster for cluster metadata,
-  monotonic TSO, region/leader/split scheduling, GC safe-point management
+  monotonic TSO, region/leader/split/merge/hot-region scheduling, GC safe-point
+  management, OperatorController with per-store concurrency limits
 - **Client SDK** — PD-aware routing, region cache with epoch invalidation,
   TSO batcher (coalesces N callers into one RPC), lock resolver, automatic
   txn conflict retry with exponential backoff
@@ -34,7 +35,7 @@ with TiKV v8.x at the wire-protocol level.
 - **Operational tooling** — CLI (`xkv-ctl`), Prometheus metrics, structured
   logging (logstash-logback-encoder), health checks, rate limiting, TLS/mTLS,
   auth tokens, graceful drain
-- **Test suite** — 309 test methods: E2E, linearizability (Wing-Gong with
+- **Test suite** — 332 test methods: E2E, linearizability (Wing-Gong with
   chaos monkey), chaos (leader kill / follower kill / network partition),
   stress, bank transfer SI, crash recovery, leader failover,
   snapshot catch-up, benchmarks
@@ -83,7 +84,7 @@ Add the dependency (once published):
 <dependency>
     <groupId>io.github.x-infra-lab</groupId>
     <artifactId>x-client</artifactId>
-    <version>0.2.0-SNAPSHOT</version>
+    <version>0.2.0</version>
 </dependency>
 ```
 
@@ -157,7 +158,7 @@ java -jar ctl/target/x-kv-ctl.jar --pd 127.0.0.1:2379 gc safepoint
 # Compile everything
 mvn install -DskipTests
 
-# Run the full test suite (309 test methods, ~9 min)
+# Run the full test suite (332 test methods, ~9 min)
 mvn test
 
 # Run a specific test module
@@ -176,6 +177,8 @@ mvn test -pl tests -Dtest=LinearizabilityE2ETest
 | [Architecture](./docs/architecture.md) ([中文](./docs/architecture_zh.md)) | System overview, module dependencies, load-bearing invariants, deployment |
 | [Design](./docs/design.md) ([中文](./docs/design_zh.md)) | Storage engine, Raft integration, MVCC/Percolator, PD, client SDK, CDC |
 | [Testing](./docs/testing.md) ([中文](./docs/testing_zh.md)) | Test strategy, categories, linearizability/chaos testing, benchmarks, CI |
+| [Deployment](./docs/deployment.md) ([中文](./docs/deployment_zh.md)) | Docker Compose, bare metal, TLS, monitoring, operational notes |
+| [Configuration](./docs/configuration.md) ([中文](./docs/configuration_zh.md)) | All KV and PD configuration fields with defaults |
 | [Changelog](./CHANGELOG.md) | All notable changes (Keep a Changelog format) |
 | [Contributing](./CONTRIBUTING.md) | Build setup, code style, PR workflow |
 
@@ -197,10 +200,6 @@ mvn test -pl tests -Dtest=LinearizabilityE2ETest
 ### Remaining work (Phase 7+)
 
 - Backup / Restore (BR-style SST export + service safe-point)
-- Full Scheduler set: hot-region, rule-checker, merge-checker
-- `OperatorController` with store-limit token bucket
-- JMH benchmark suite
-- 24h soak test harness
 
 ---
 

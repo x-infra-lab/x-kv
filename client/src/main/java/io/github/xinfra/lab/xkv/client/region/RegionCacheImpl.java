@@ -75,7 +75,9 @@ public final class RegionCacheImpl implements RegionCache {
             var resp = pdClient.blockingStub().getRegionByID(Pdpb.GetRegionByIDRequest.newBuilder()
                     .setRegionId(regionId).build());
             if (!resp.hasRegion()) return Optional.empty();
-            var info = new RegionInfo(resp.getRegion(), resp.hasLeader() ? resp.getLeader() : Metapb.Peer.getDefaultInstance());
+            var leader = resp.hasLeader()
+                    ? resp.getLeader() : Metapb.Peer.getDefaultInstance();
+            var info = new RegionInfo(resp.getRegion(), leader);
             update(info.region(), info.leader());
             return Optional.of(info);
         } catch (Throwable t) {

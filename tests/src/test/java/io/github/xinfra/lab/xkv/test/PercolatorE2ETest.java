@@ -422,11 +422,11 @@ final class PercolatorE2ETest {
 
     @Test
     void scanReturnsCommittedPairs() {
-        // 4 keys committed at ts=20.
+        // 4 keys committed at unique startTs to avoid write conflicts.
         commitOnce("a", "va", 10, 20);
-        commitOnce("b", "vb", 10, 20);
-        commitOnce("c", "vc", 10, 20);
-        commitOnce("d", "vd", 10, 20);
+        commitOnce("b", "vb", 30, 40);
+        commitOnce("c", "vc", 50, 60);
+        commitOnce("d", "vd", 70, 80);
 
         var resp = tikv.kvScan(Kvrpcpb.ScanRequest.newBuilder()
                 .setStartKey(ByteString.copyFromUtf8("b"))

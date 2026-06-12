@@ -18,7 +18,6 @@ import io.micrometer.core.instrument.Counter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import io.github.xinfra.lab.raft.ReadState;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
@@ -108,7 +107,8 @@ public final class RegionPeerImpl implements RegionPeer {
      * Accessed only from the ready-loop thread (single-writer), so a
      * ConcurrentSkipListMap is used solely for O(log n) headMap draining.
      */
-    private final ConcurrentSkipListMap<Long, List<CompletableFuture<Void>>> readIndexWaiters = new ConcurrentSkipListMap<>();
+    private final ConcurrentSkipListMap<Long, List<CompletableFuture<Void>>> readIndexWaiters =
+            new ConcurrentSkipListMap<>();
 
     private final AtomicBoolean leader = new AtomicBoolean(false);
     private volatile boolean destroyed = false;
@@ -272,6 +272,10 @@ public final class RegionPeerImpl implements RegionPeer {
     @Override public boolean isDestroyed() { return destroyed; }
     @Override public long firstIndex() { return raftEngine.firstIndex(); }
     @Override public long appliedIndex() { return raftEngine.appliedIndex(); }
+    @Override public long maxTs() {
+        if (cm == null) return 0;
+        return Math.max(cm.maxTs().current(), cm.safeTs());
+    }
     @Override public long currentTerm() { return raftEngine.currentTerm(); }
     @Override public long votedFor() { return raftEngine.votedFor(); }
     @Override public long commitIndex() { return raftEngine.commitIndex(); }

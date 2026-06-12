@@ -1,0 +1,22 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'x-pd'
+    static_configs:
+      - targets:
+          - 'pd1:9190'
+          - 'pd2:9190'
+          - 'pd3:9190'
+        labels:
+          cluster: 'x-kv'
+
+  - job_name: 'x-kv'
+    static_configs:
+      - targets:
+          - 'kv1:9191'
+          - 'kv2:9192'
+          - 'kv3:9193'
+        labels:
+          cluster: 'x-kv'

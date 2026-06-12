@@ -167,8 +167,9 @@ public final class MergeProtocolImpl implements MergeProtocol {
                                         + "(epoch {} → {}). Source stays quiesced — manual intervention needed.",
                                 sourceId, ms.targetId, prepareVersion, currentVersion);
                         throw new IllegalStateException(
-                                "cannot rollback: target " + ms.targetId + " already committed merge "
-                                        + "(epoch version advanced from " + prepareVersion + " to " + currentVersion + ")");
+                                "cannot rollback: target " + ms.targetId
+                                        + " already committed merge (epoch version advanced from "
+                                        + prepareVersion + " to " + currentVersion + ")");
                     }
                 }
 

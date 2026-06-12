@@ -170,20 +170,26 @@ public final class TwoPhaseCommitterImpl implements TwoPhaseCommitter {
             return primaryFailure != null ? primaryFailure : CommitResult.unknown("primary not committed");
         }
 
-        // Async secondaries (Phase 5 simplification: still synchronous serial).
-        // The contract: secondary failure does NOT change the txn outcome —
-        // primary commit decided. Secondaries are best-effort cleanup that
-        // a background resolver can finish later.
+        // Secondary commits are best-effort — primary commit already decided
+        // the txn outcome. Failures are resolved by the background lock resolver.
+        var secondaryFutures = new ArrayList<CompletableFuture<Void>>();
+        final long secondaryCommitTs = commitTs;
         for (var entry : keysByRegion.entrySet()) {
             boolean isPrimaryGroup = entry.getValue().stream()
                     .anyMatch(k -> java.util.Arrays.equals(k.toByteArray(), primary));
             if (isPrimaryGroup) continue;
-            try {
-                var bo = new BackofferImpl(backoffCfg);
-                doCommitGroup(bo, ctx.startTs(), commitTs, entry.getValue());
-            } catch (Throwable t) {
-                log.debug("secondary commit failed (lock resolver will clean up): {}", t.getMessage());
-            }
+            var keys = entry.getValue();
+            secondaryFutures.add(CompletableFuture.runAsync(() -> {
+                try {
+                    var bo = new BackofferImpl(backoffCfg);
+                    doCommitGroup(bo, ctx.startTs(), secondaryCommitTs, keys);
+                } catch (Throwable t) {
+                    log.debug("secondary commit failed (lock resolver will clean up): {}", t.getMessage());
+                }
+            }));
+        }
+        if (!secondaryFutures.isEmpty()) {
+            CompletableFuture.allOf(secondaryFutures.toArray(CompletableFuture[]::new)).join();
         }
 
         return CommitResult.committed(commitTs);

@@ -2,7 +2,6 @@ package io.github.xinfra.lab.xkv.kv.server;
 
 import com.google.protobuf.ByteString;
 import io.github.xinfra.lab.xkv.common.metrics.XKvMetrics;
-import io.github.xinfra.lab.xkv.kv.engine.RaftEngine;
 import io.github.xinfra.lab.xkv.kv.engine.StorageEngine;
 import io.github.xinfra.lab.xkv.kv.store.Store;
 import io.github.xinfra.lab.xkv.proto.DebugGrpc;
@@ -63,7 +62,9 @@ public final class DebugServiceImpl extends DebugGrpc.DebugImplBase {
         }
         var peerOpt = store.peerForRegion(request.getRegionId());
         if (peerOpt.isEmpty()) {
-            responseObserver.onError(Status.NOT_FOUND.withDescription("region not found on this store").asRuntimeException());
+            responseObserver.onError(Status.NOT_FOUND
+                    .withDescription("region not found on this store")
+                    .asRuntimeException());
             return;
         }
         var peer = peerOpt.get();
@@ -89,7 +90,9 @@ public final class DebugServiceImpl extends DebugGrpc.DebugImplBase {
         }
         var peerOpt = store.peerForRegion(request.getRegionId());
         if (peerOpt.isEmpty()) {
-            responseObserver.onError(Status.NOT_FOUND.withDescription("region not found on this store").asRuntimeException());
+            responseObserver.onError(Status.NOT_FOUND
+                    .withDescription("region not found on this store")
+                    .asRuntimeException());
             return;
         }
         var peer = peerOpt.get();
@@ -114,7 +117,9 @@ public final class DebugServiceImpl extends DebugGrpc.DebugImplBase {
         }
         var peerOpt = store.peerForRegion(request.getRegionId());
         if (peerOpt.isEmpty()) {
-            responseObserver.onError(Status.NOT_FOUND.withDescription("region not found on this store").asRuntimeException());
+            responseObserver.onError(Status.NOT_FOUND
+                    .withDescription("region not found on this store")
+                    .asRuntimeException());
             return;
         }
         var peer = peerOpt.get();

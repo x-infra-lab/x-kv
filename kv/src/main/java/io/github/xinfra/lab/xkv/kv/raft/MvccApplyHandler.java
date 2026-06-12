@@ -17,7 +17,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.List;
+
 import java.util.Map;
 
 /**
@@ -284,6 +284,8 @@ public final class MvccApplyHandler implements ApplyHandler {
             realTxn.commit(k.toByteArray(),
                     req.getStartVersion(), req.getCommitVersion());
         }
+
+        cm.observeSafeTs(req.getCommitVersion());
 
         // CDC: publish commit events.
         if (cdcLocks != null) {

@@ -4,7 +4,6 @@ import com.google.protobuf.ByteString;
 import io.github.xinfra.lab.xkv.kv.engine.StorageEngine;
 import io.github.xinfra.lab.xkv.kv.mvcc.KeyLockedException;
 import io.github.xinfra.lab.xkv.kv.mvcc.MvccReader;
-import io.github.xinfra.lab.xkv.proto.Coprocessor.KeyRange;
 import io.github.xinfra.lab.xkv.proto.Coprocessor.Request;
 import io.github.xinfra.lab.xkv.proto.Coprocessor.Response;
 import io.github.xinfra.lab.xkv.proto.Coprocessor.StreamResponse;

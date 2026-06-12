@@ -580,7 +580,8 @@ public final class MvccTxn {
         static PessimisticKeyLocked keyLocked(byte[] key, Lock l) { return new PessimisticKeyLocked(key, l); }
     }
     public record PessimisticAcquired() implements PessimisticLockOutcome {}
-    public record PessimisticWriteConflict(byte[] key, long startTs, long conflictCommitTs) implements PessimisticLockOutcome {}
+    public record PessimisticWriteConflict(byte[] key, long startTs,
+            long conflictCommitTs) implements PessimisticLockOutcome {}
     public record PessimisticKeyLocked(byte[] key, Lock lock) implements PessimisticLockOutcome {}
 
     public sealed interface CheckTxnStatusOutcome

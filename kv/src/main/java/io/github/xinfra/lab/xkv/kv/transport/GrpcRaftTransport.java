@@ -242,7 +242,8 @@ public final class GrpcRaftTransport implements Transport {
                     @Override public void onNext(KvServerpb.Done v) {}
                     @Override public void onError(Throwable t) {
                         sendErrorCounter.increment();
-                        log.debug("region={} outbound stream to peer={} error: {}", regionId, targetPeerId, t.getMessage());
+                        log.debug("region={} outbound stream to peer={} error: {}",
+                                regionId, targetPeerId, t.getMessage());
                         resetStream();
                     }
                     @Override public void onCompleted() { resetStream(); }

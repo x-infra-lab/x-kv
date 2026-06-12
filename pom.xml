@@ -6,7 +6,7 @@
 
     <groupId>io.github.x-infra-lab</groupId>
     <artifactId>x-kv</artifactId>
-    <version>0.2.0-SNAPSHOT</version>
+    <version>0.2.0</version>
     <packaging>pom</packaging>
 
     <name>x-kv (parent)</name>
@@ -31,6 +31,7 @@
         <module>client</module>
         <module>ctl</module>
         <module>tests</module>
+        <module>bench</module>
     </modules>
 
     <properties>
@@ -58,6 +59,7 @@
         <micrometer.version>1.14.4</micrometer.version>
         <logstash.encoder.version>8.0</logstash.encoder.version>
         <snakeyaml.version>2.2</snakeyaml.version>
+        <jmh.version>1.37</jmh.version>
     </properties>
 
     <dependencyManagement>
@@ -218,6 +220,24 @@
                     <groupId>org.jacoco</groupId>
                     <artifactId>jacoco-maven-plugin</artifactId>
                     <version>${jacoco.version}</version>
+                </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-checkstyle-plugin</artifactId>
+                    <version>3.3.1</version>
+                    <configuration>
+                        <configLocation>checkstyle.xml</configLocation>
+                        <consoleOutput>true</consoleOutput>
+                        <failsOnError>true</failsOnError>
+                        <includeTestSourceRoots>false</includeTestSourceRoots>
+                    </configuration>
+                    <dependencies>
+                        <dependency>
+                            <groupId>com.puppycrawl.tools</groupId>
+                            <artifactId>checkstyle</artifactId>
+                            <version>10.17.0</version>
+                        </dependency>
+                    </dependencies>
                 </plugin>
             </plugins>
         </pluginManagement>
