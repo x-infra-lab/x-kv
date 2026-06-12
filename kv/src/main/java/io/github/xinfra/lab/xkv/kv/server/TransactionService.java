@@ -223,8 +223,9 @@ public final class TransactionService {
         try (var snap = engine.newSnapshot();
              var ro = engine.newReadOptions().snapshot(snap)) {
 
-            // Lock CF
-            byte[] lockBytes = engine.get(StorageEngine.Cf.LOCK, userKey, ro);
+            // Lock CF (keys stored as KeyCodec.encodeBytes(userKey))
+            byte[] lockBytes = engine.get(StorageEngine.Cf.LOCK,
+                    io.github.xinfra.lab.xkv.kv.mvcc.MvccKey.lockKey(userKey), ro);
             if (lockBytes != null) {
                 info.setLock(toLockInfo(userKey, Lock.decode(lockBytes)));
             }
@@ -287,8 +288,9 @@ public final class TransactionService {
                 for (it.seek(new byte[]{0}); it.isValid(); it.next()) {
                     var lock = Lock.decode(it.value());
                     if (lock.startTs() == startTs) {
-                        return resp.setKey(ByteString.copyFrom(it.key()))
-                                .setInfo(buildMvccInfoForKey(it.key()))
+                        byte[] rawKey = io.github.xinfra.lab.xkv.kv.mvcc.MvccKey.userKeyFromLockKey(it.key());
+                        return resp.setKey(ByteString.copyFrom(rawKey))
+                                .setInfo(buildMvccInfoForKey(rawKey))
                                 .build();
                     }
                 }
