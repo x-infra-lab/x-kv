@@ -10,12 +10,15 @@ import java.util.List;
 
 public final class GrpcChannelFactory {
 
+    public static final int MAX_INBOUND_MESSAGE_SIZE = 16 * 1024 * 1024;
+
     private GrpcChannelFactory() {}
 
     public static ManagedChannel build(String address, TlsConfig tls,
                                        List<ClientInterceptor> interceptors) {
         var hp = parseHostPort(address);
-        var builder = NettyChannelBuilder.forAddress(hp.host(), hp.port());
+        var builder = NettyChannelBuilder.forAddress(hp.host(), hp.port())
+                .maxInboundMessageSize(MAX_INBOUND_MESSAGE_SIZE);
         if (tls != null) {
             try {
                 var sslCtx = SslContextFactory.forClient(tls);
@@ -38,7 +41,8 @@ public final class GrpcChannelFactory {
     }
 
     public static NettyServerBuilder serverBuilder(InetSocketAddress addr, TlsConfig tls) {
-        var builder = NettyServerBuilder.forAddress(addr);
+        var builder = NettyServerBuilder.forAddress(addr)
+                .maxInboundMessageSize(MAX_INBOUND_MESSAGE_SIZE);
         if (tls != null) {
             try {
                 var sslCtx = SslContextFactory.forServer(tls);

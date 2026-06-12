@@ -274,7 +274,7 @@ public final class RocksDbPdStateMachine implements PdStateMachine {
                 long prevVer = prev.getRegionEpoch().getVersion();
                 long newConf = region.getRegionEpoch().getConfVer();
                 long newVer = region.getRegionEpoch().getVersion();
-                if (newConf < prevConf || (newConf == prevConf && newVer < prevVer)) {
+                if (newConf < prevConf || newVer < prevVer) {
                     log.debug("dropping stale region update id={} epoch=({},{}) < prev=({},{})",
                             region.getId(), newConf, newVer, prevConf, prevVer);
                     return;

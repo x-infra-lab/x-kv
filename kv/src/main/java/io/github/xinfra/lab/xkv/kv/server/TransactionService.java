@@ -89,8 +89,8 @@ public final class TransactionService {
         }
         return cm.withReader(key, req.getVersion(), () -> {
             var b = Kvrpcpb.GetResponse.newBuilder();
-            try (var snap = engine.newSnapshot()) {
-                var reader = new MvccReader(engine, snap, false);
+            try (var snap = engine.newSnapshot();
+                 var reader = new MvccReader(engine, snap, false)) {
                 try {
                     var v = reader.get(key, req.getVersion());
                     if (v.isEmpty()) {
@@ -148,8 +148,8 @@ public final class TransactionService {
         }
         return cm.withReader(req.getVersion(), () -> {
             var b = Kvrpcpb.BatchGetResponse.newBuilder();
-            try (var snap = engine.newSnapshot()) {
-                var reader = new MvccReader(engine, snap, false);
+            try (var snap = engine.newSnapshot();
+                 var reader = new MvccReader(engine, snap, false)) {
                 for (var k : req.getKeysList()) {
                     try {
                         var v = reader.get(k.toByteArray(), req.getVersion());
@@ -178,27 +178,27 @@ public final class TransactionService {
         if (le != null) return Kvrpcpb.ScanResponse.newBuilder().setRegionError(le).build();
         return cm.withReader(req.getVersion(), () -> {
             var b = Kvrpcpb.ScanResponse.newBuilder();
-            try (var snap = engine.newSnapshot()) {
-                var reader = new MvccReader(engine, snap, false);
-                try {
-                    byte[] start = req.getStartKey().toByteArray();
-                    byte[] end = req.getEndKey().isEmpty() ? null : req.getEndKey().toByteArray();
-                    int limit = req.getLimit() <= 0 ? Integer.MAX_VALUE : req.getLimit();
-                    List<MvccReader.KvPair> pairs;
-                    if (req.getReverse()) {
-                        pairs = reader.reverseScan(start, end, limit, req.getVersion());
-                    } else {
-                        pairs = reader.scan(start, end, limit, req.getVersion());
+            try (var snap = engine.newSnapshot();
+                 var reader = new MvccReader(engine, snap, false)) {
+                byte[] start = req.getStartKey().toByteArray();
+                byte[] end = req.getEndKey().isEmpty() ? null : req.getEndKey().toByteArray();
+                int limit = req.getLimit() <= 0 ? Integer.MAX_VALUE : req.getLimit();
+                MvccReader.ScanResult result;
+                if (req.getReverse()) {
+                    result = reader.reverseScan(start, end, limit, req.getVersion());
+                } else {
+                    result = reader.scan(start, end, limit, req.getVersion());
+                }
+                for (var p : result.pairs()) {
+                    var pb = Kvrpcpb.KvPair.newBuilder()
+                            .setKey(ByteString.copyFrom(p.key()));
+                    if (!req.getKeyOnly()) {
+                        pb.setValue(ByteString.copyFrom(p.value()));
                     }
-                    for (var p : pairs) {
-                        var pb = Kvrpcpb.KvPair.newBuilder()
-                                .setKey(ByteString.copyFrom(p.key()));
-                        if (!req.getKeyOnly()) {
-                            pb.setValue(ByteString.copyFrom(p.value()));
-                        }
-                        b.addPairs(pb.build());
-                    }
-                } catch (KeyLockedException e) {
+                    b.addPairs(pb.build());
+                }
+                if (result.lockError() != null) {
+                    var e = result.lockError();
                     b.addPairs(Kvrpcpb.KvPair.newBuilder()
                             .setKey(ByteString.copyFrom(e.key()))
                             .setError(Kvrpcpb.KeyError.newBuilder()
@@ -220,11 +220,12 @@ public final class TransactionService {
     public Kvrpcpb.MvccGetByKeyResponse kvMvccGetByKey(Kvrpcpb.MvccGetByKeyRequest req) {
         byte[] userKey = req.getKey().toByteArray();
         var info = Kvrpcpb.MvccInfo.newBuilder();
-        try (var snap = engine.newSnapshot()) {
-            var ro = engine.newReadOptions().snapshot(snap);
+        try (var snap = engine.newSnapshot();
+             var ro = engine.newReadOptions().snapshot(snap)) {
 
-            // Lock CF
-            byte[] lockBytes = engine.get(StorageEngine.Cf.LOCK, userKey, ro);
+            // Lock CF (keys stored as KeyCodec.encodeBytes(userKey))
+            byte[] lockBytes = engine.get(StorageEngine.Cf.LOCK,
+                    io.github.xinfra.lab.xkv.kv.mvcc.MvccKey.lockKey(userKey), ro);
             if (lockBytes != null) {
                 info.setLock(toLockInfo(userKey, Lock.decode(lockBytes)));
             }
@@ -279,16 +280,17 @@ public final class TransactionService {
     public Kvrpcpb.MvccGetByStartTsResponse kvMvccGetByStartTs(Kvrpcpb.MvccGetByStartTsRequest req) {
         long startTs = req.getStartTs();
         var resp = Kvrpcpb.MvccGetByStartTsResponse.newBuilder();
-        try (var snap = engine.newSnapshot()) {
-            var ro = engine.newReadOptions().snapshot(snap);
+        try (var snap = engine.newSnapshot();
+             var ro = engine.newReadOptions().snapshot(snap)) {
 
             // Look in lock CF first (faster, smaller).
             try (var it = engine.newIterator(StorageEngine.Cf.LOCK, ro)) {
                 for (it.seek(new byte[]{0}); it.isValid(); it.next()) {
                     var lock = Lock.decode(it.value());
                     if (lock.startTs() == startTs) {
-                        return resp.setKey(ByteString.copyFrom(it.key()))
-                                .setInfo(buildMvccInfoForKey(it.key()))
+                        byte[] rawKey = io.github.xinfra.lab.xkv.kv.mvcc.MvccKey.userKeyFromLockKey(it.key());
+                        return resp.setKey(ByteString.copyFrom(rawKey))
+                                .setInfo(buildMvccInfoForKey(rawKey))
                                 .build();
                     }
                 }
@@ -320,7 +322,8 @@ public final class TransactionService {
     public Kvrpcpb.ScanLockResponse kvScanLock(Kvrpcpb.ScanLockRequest req) {
         cm.maxTs().observe(req.getMaxVersion());
         var b = Kvrpcpb.ScanLockResponse.newBuilder();
-        try (var it = engine.newIterator(StorageEngine.Cf.LOCK, engine.newReadOptions())) {
+        try (var ro = engine.newReadOptions();
+             var it = engine.newIterator(StorageEngine.Cf.LOCK, ro)) {
             byte[] start = req.getStartKey().isEmpty() ? new byte[]{0} : req.getStartKey().toByteArray();
             byte[] end = req.getEndKey().isEmpty() ? null : req.getEndKey().toByteArray();
             int limit = req.getLimit() <= 0 ? Integer.MAX_VALUE : req.getLimit();

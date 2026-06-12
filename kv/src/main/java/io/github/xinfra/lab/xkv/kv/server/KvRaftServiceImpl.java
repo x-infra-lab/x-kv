@@ -83,11 +83,19 @@ public final class KvRaftServiceImpl extends KvRaftGrpc.KvRaftImplBase {
             return new NoopRequestObserver<>();
         }
         return new StreamObserver<>() {
+            private static final long MAX_SNAPSHOT_BYTES = 256L * 1024 * 1024;
             private final List<SnapshotChunk> buffered = new ArrayList<>();
             private long regionId = 0;
+            private long totalBytes = 0;
 
             @Override
             public void onNext(SnapshotChunk chunk) {
+                totalBytes += chunk.getData().size();
+                if (totalBytes > MAX_SNAPSHOT_BYTES) {
+                    throw Status.RESOURCE_EXHAUSTED
+                            .withDescription("snapshot exceeds " + MAX_SNAPSHOT_BYTES + " bytes")
+                            .asRuntimeException();
+                }
                 if (chunk.hasMeta() && regionId == 0) regionId = chunk.getMeta().getRegionId();
                 buffered.add(chunk);
             }

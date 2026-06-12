@@ -5,6 +5,8 @@ import io.github.xinfra.lab.xkv.proto.KvServerpb;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.github.xinfra.lab.xkv.kv.mvcc.MvccKey;
+
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -105,16 +107,21 @@ public final class SnapshotEngineImpl implements SnapshotEngine {
                           KvServerpb.SnapshotMeta.Builder meta,
                           boolean metaAlreadyEmitted,
                           Consumer<KvServerpb.SnapshotChunk> sink) {
-        var ro = storage.newReadOptions().snapshot(snap);
         long bytes = 0;
         int chunkIndex = 0;
         var buf = new java.io.ByteArrayOutputStream(CHUNK_BYTE_TARGET);
         boolean firstEmit = true;
-        try (var it = storage.newIterator(cf, ro)) {
-            byte[] from = startKey == null || startKey.length == 0 ? new byte[]{0} : startKey;
+        try (var ro = storage.newReadOptions().snapshot(snap);
+             var it = storage.newIterator(cf, ro)) {
+            byte[] from = (startKey == null || startKey.length == 0)
+                    ? new byte[]{0}
+                    : MvccKey.lockKey(startKey);
+            byte[] upperBound = (endKey != null && endKey.length > 0)
+                    ? MvccKey.lockKey(endKey)
+                    : null;
             for (it.seek(from); it.isValid(); it.next()) {
-                if (endKey != null && endKey.length > 0
-                        && Arrays.compareUnsigned(it.key(), endKey) >= 0) break;
+                if (upperBound != null
+                        && Arrays.compareUnsigned(it.key(), upperBound) >= 0) break;
                 byte[] k = it.key();
                 byte[] v = it.value();
                 appendTuple(buf, k, v);
@@ -189,14 +196,20 @@ public final class SnapshotEngineImpl implements SnapshotEngine {
 
         byte[] startKey = meta.getStartKey().toByteArray();
         byte[] endKey = meta.getEndKey().isEmpty() ? null : meta.getEndKey().toByteArray();
-        if (startKey.length == 0) startKey = new byte[]{0};
 
         try (var batch = storage.newWriteBatch()) {
-            // Wipe stale data in this region's range across all three CFs.
-            byte[] upper = endKey == null ? new byte[]{(byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF,
-                    (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF} : endKey;
+            byte[] lower = (startKey.length == 0)
+                    ? new byte[]{0}
+                    : MvccKey.lockKey(startKey);
+            byte[] upper;
+            if (endKey == null) {
+                upper = new byte[256];
+                Arrays.fill(upper, (byte) 0xFF);
+            } else {
+                upper = MvccKey.lockKey(endKey);
+            }
             for (var cfName : DATA_CFS) {
-                batch.deleteRange(cfFor(cfName), startKey, upper);
+                batch.deleteRange(cfFor(cfName), lower, upper);
             }
             // Insert fresh data.
             for (var cfName : DATA_CFS) {

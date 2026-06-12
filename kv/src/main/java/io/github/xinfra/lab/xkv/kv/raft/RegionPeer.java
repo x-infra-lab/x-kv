@@ -49,6 +49,9 @@ public interface RegionPeer {
     /** Highest committed-and-applied raft index. */
     long appliedIndex();
 
+    /** Highest observed timestamp (max of all read_ts and commit_ts). */
+    default long maxTs() { return 0; }
+
     default long currentTerm() { return 0; }
 
     default long votedFor() { return 0; }

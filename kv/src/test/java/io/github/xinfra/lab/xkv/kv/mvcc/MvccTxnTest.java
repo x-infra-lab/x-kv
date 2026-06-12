@@ -35,7 +35,7 @@ final class MvccTxnTest {
     void prewriteHappyPath() {
         try (var b = engine.newWriteBatch()) {
             var txn = newTxn(b);
-            var check = txn.checkPrewrite("k".getBytes(), 100);
+            var check = txn.checkPrewrite("k".getBytes(), 100, MvccTxn.Op.PUT);
             assertThat(check).isInstanceOf(MvccTxn.PrewriteOk.class);
             txn.writePrewrite("k".getBytes(), "v".getBytes(),
                     MvccTxn.Op.PUT, "k".getBytes(),
@@ -43,7 +43,7 @@ final class MvccTxnTest {
             engine.write(b, true);
         }
         // Lock CF should now hold one entry.
-        assertThat(engine.get(StorageEngine.Cf.LOCK, "k".getBytes())).isNotNull();
+        assertThat(engine.get(StorageEngine.Cf.LOCK, MvccKey.lockKey("k".getBytes()))).isNotNull();
     }
 
     @Test
@@ -53,7 +53,7 @@ final class MvccTxnTest {
         try (var b = engine.newWriteBatch()) {
             var txn = newTxn(b);
             // Later txn with startTs=40 sees a commit at ts=50 — write conflict.
-            var check = txn.checkPrewrite("k".getBytes(), 40);
+            var check = txn.checkPrewrite("k".getBytes(), 40, MvccTxn.Op.PUT);
             assertThat(check).isInstanceOf(MvccTxn.PrewriteWriteConflict.class);
             engine.write(b, true);
         }
@@ -71,7 +71,7 @@ final class MvccTxnTest {
         // Re-prewrite at same startTs is idempotent.
         try (var b = engine.newWriteBatch()) {
             var txn = newTxn(b);
-            var check = txn.checkPrewrite("k".getBytes(), 100);
+            var check = txn.checkPrewrite("k".getBytes(), 100, MvccTxn.Op.PUT);
             assertThat(check).isInstanceOf(MvccTxn.PrewriteAlready.class);
             engine.write(b, true);
         }
@@ -87,7 +87,7 @@ final class MvccTxnTest {
         }
         // Different startTs → KeyLocked.
         try (var b = engine.newWriteBatch()) {
-            var check = newTxn(b).checkPrewrite("k".getBytes(), 200);
+            var check = newTxn(b).checkPrewrite("k".getBytes(), 200, MvccTxn.Op.PUT);
             assertThat(check).isInstanceOf(MvccTxn.PrewriteKeyLocked.class);
         }
     }
@@ -108,7 +108,7 @@ final class MvccTxnTest {
             engine.write(b, true);
         }
         // Lock gone, write CF has commit record at ts=150.
-        assertThat(engine.get(StorageEngine.Cf.LOCK, "k".getBytes())).isNull();
+        assertThat(engine.get(StorageEngine.Cf.LOCK, MvccKey.lockKey("k".getBytes()))).isNull();
         var r = new MvccReader(engine, null, false);
         assertThat(r.get("k".getBytes(), 200).map(String::new)).contains("v");
     }
@@ -172,7 +172,7 @@ final class MvccTxnTest {
             engine.write(b, true);
         }
         // Lock gone; default CF entry gone; ROLLBACK record present.
-        assertThat(engine.get(StorageEngine.Cf.LOCK, "k".getBytes())).isNull();
+        assertThat(engine.get(StorageEngine.Cf.LOCK, MvccKey.lockKey("k".getBytes()))).isNull();
         assertThat(engine.get(StorageEngine.Cf.DEFAULT,
                 MvccKey.encode("k".getBytes(), 100))).isNull();
 
@@ -210,7 +210,7 @@ final class MvccTxnTest {
             engine.write(b, true);
         }
         try (var b = engine.newWriteBatch()) {
-            var oc = newTxn(b).checkPrewrite("k".getBytes(), 100);
+            var oc = newTxn(b).checkPrewrite("k".getBytes(), 100, MvccTxn.Op.PUT);
             assertThat(oc).isInstanceOf(MvccTxn.PrewriteSelfRolledBack.class);
         }
     }

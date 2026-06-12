@@ -111,6 +111,7 @@ public final class TwoPhaseCommitterImpl implements TwoPhaseCommitter {
 
             var resp = doPrewriteGroup(ctx, primary, entry.getValue());
             if (resp.getErrorsCount() > 0) {
+                cleanupPrimary(ctx.startTs(), primary);
                 return CommitResult.rolledBack("prewrite errors: " + resp.getErrorsList());
             }
         }
@@ -170,20 +171,26 @@ public final class TwoPhaseCommitterImpl implements TwoPhaseCommitter {
             return primaryFailure != null ? primaryFailure : CommitResult.unknown("primary not committed");
         }
 
-        // Async secondaries (Phase 5 simplification: still synchronous serial).
-        // The contract: secondary failure does NOT change the txn outcome —
-        // primary commit decided. Secondaries are best-effort cleanup that
-        // a background resolver can finish later.
+        // Secondary commits are best-effort — primary commit already decided
+        // the txn outcome. Failures are resolved by the background lock resolver.
+        var secondaryFutures = new ArrayList<CompletableFuture<Void>>();
+        final long secondaryCommitTs = commitTs;
         for (var entry : keysByRegion.entrySet()) {
             boolean isPrimaryGroup = entry.getValue().stream()
                     .anyMatch(k -> java.util.Arrays.equals(k.toByteArray(), primary));
             if (isPrimaryGroup) continue;
-            try {
-                var bo = new BackofferImpl(backoffCfg);
-                doCommitGroup(bo, ctx.startTs(), commitTs, entry.getValue());
-            } catch (Throwable t) {
-                log.debug("secondary commit failed (lock resolver will clean up): {}", t.getMessage());
-            }
+            var keys = entry.getValue();
+            secondaryFutures.add(CompletableFuture.runAsync(() -> {
+                try {
+                    var bo = new BackofferImpl(backoffCfg);
+                    doCommitGroup(bo, ctx.startTs(), secondaryCommitTs, keys);
+                } catch (Throwable t) {
+                    log.debug("secondary commit failed (lock resolver will clean up): {}", t.getMessage());
+                }
+            }));
+        }
+        if (!secondaryFutures.isEmpty()) {
+            CompletableFuture.allOf(secondaryFutures.toArray(CompletableFuture[]::new)).join();
         }
 
         return CommitResult.committed(commitTs);
@@ -240,6 +247,25 @@ public final class TwoPhaseCommitterImpl implements TwoPhaseCommitter {
                     return stub.kvPrewrite(b.build());
                 },
                 Kvrpcpb.PrewriteResponse::getRegionError);
+    }
+
+    private void cleanupPrimary(long startTs, byte[] primary) {
+        try {
+            sender.sendKeyed(primary, new BackofferImpl(backoffCfg),
+                    (stub, info) -> stub.kvBatchRollback(
+                            Kvrpcpb.BatchRollbackRequest.newBuilder()
+                                    .setContext(Kvrpcpb.Context.newBuilder()
+                                            .setRegionId(info.region().getId())
+                                            .setRegionEpoch(info.region().getRegionEpoch())
+                                            .setPeer(info.leader())
+                                            .build())
+                                    .setStartVersion(startTs)
+                                    .addKeys(ByteString.copyFrom(primary))
+                                    .build()),
+                    Kvrpcpb.BatchRollbackResponse::getRegionError);
+        } catch (Throwable t) {
+            log.debug("primary cleanup failed (lock resolver will handle): {}", t.getMessage());
+        }
     }
 
     private Map<byte[], List<Kvrpcpb.Mutation>> groupMutationsByRegion(List<Kvrpcpb.Mutation> sorted) {

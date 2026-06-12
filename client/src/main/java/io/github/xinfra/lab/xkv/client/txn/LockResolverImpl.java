@@ -165,6 +165,40 @@ public final class LockResolverImpl implements LockResolver {
                 || action == Kvrpcpb.Action.LockNotExistRollback) {
             return new Verdict(Verdict.Kind.ROLLED_BACK, 0);
         }
+        // NoAction with async-commit lock: escalate to CheckSecondaryLocks
+        // to determine the true commit status.
+        if (action == Kvrpcpb.Action.NoAction && resp.hasLockInfo()
+                && resp.getLockInfo().getUseAsyncCommit()) {
+            var lockInfo = resp.getLockInfo();
+            long maxMinCommitTs = lockInfo.getMinCommitTs();
+
+            for (var sec : lockInfo.getSecondariesList()) {
+                var csResp = sender.sendKeyed(sec.toByteArray(), bo,
+                        (stub, info) -> stub.kvCheckSecondaryLocks(
+                                Kvrpcpb.CheckSecondaryLocksRequest.newBuilder()
+                                        .setContext(Kvrpcpb.Context.newBuilder()
+                                                .setRegionId(info.region().getId())
+                                                .setRegionEpoch(info.region().getRegionEpoch())
+                                                .setPeer(info.leader())
+                                                .build())
+                                        .setStartVersion(lockTs)
+                                        .addKeys(sec)
+                                        .build()),
+                        Kvrpcpb.CheckSecondaryLocksResponse::getRegionError);
+
+                if (csResp.getCommitTs() > 0) {
+                    return new Verdict(Verdict.Kind.COMMITTED, csResp.getCommitTs());
+                }
+                if (csResp.getLocksCount() == 0) {
+                    return new Verdict(Verdict.Kind.ROLLED_BACK, 0);
+                }
+                for (var l : csResp.getLocksList()) {
+                    maxMinCommitTs = Math.max(maxMinCommitTs, l.getMinCommitTs());
+                }
+            }
+            return new Verdict(Verdict.Kind.COMMITTED, maxMinCommitTs);
+        }
+
         // NoAction → live, caller must backoff.
         return new Verdict(Verdict.Kind.ALIVE, 0);
     }

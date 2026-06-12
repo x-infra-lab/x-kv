@@ -33,7 +33,8 @@ public interface Operator {
         SCATTER,
         BALANCE_REGION,
         BALANCE_LEADER,
-        HOT_REGION
+        HOT_REGION,
+        RULE_FIX
     }
 
     /** Steps that compose the operator. */

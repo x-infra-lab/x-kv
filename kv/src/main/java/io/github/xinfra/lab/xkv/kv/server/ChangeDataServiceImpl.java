@@ -9,6 +9,7 @@ import io.grpc.stub.StreamObserver;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Arrays;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
@@ -50,8 +51,16 @@ public final class ChangeDataServiceImpl extends ChangeDataGrpc.ChangeDataImplBa
                 long regionId = req.getRegionId();
                 if (req.hasRegister()) {
                     if (subscriptions.containsKey(regionId)) return;
+                    byte[] filterStart = req.getStartKey().isEmpty()
+                            ? null : req.getStartKey().toByteArray();
+                    byte[] filterEnd = req.getEndKey().isEmpty()
+                            ? null : req.getEndKey().toByteArray();
                     Consumer<CdcEvent> sub = event -> {
                         if (closed) return;
+                        if (filterStart != null
+                                && Arrays.compareUnsigned(event.key(), filterStart) < 0) return;
+                        if (filterEnd != null
+                                && Arrays.compareUnsigned(event.key(), filterEnd) >= 0) return;
                         var row = Cdcpb.Row.newBuilder()
                                 .setType(event.type())
                                 .setKey(ByteString.copyFrom(event.key()))

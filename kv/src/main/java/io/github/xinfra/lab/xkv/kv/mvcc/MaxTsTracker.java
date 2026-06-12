@@ -16,13 +16,16 @@ import java.util.concurrent.atomic.AtomicLong;
  *   2) R  fetches read_ts=15
  *   3) R  reads key A at ts=15 (no lock yet) → returns OLD value
  *   4) T1 prewrites A and B (locks placed)
- *   5) T1 fetches commit_ts=10  (note: monotonic TSO, so T1.commit_ts &gt; R.read_ts? NO — TSO calls happen in this order: 5, 15, 10? — that's not monotonic, so impossible)
+ *   5) T1 fetches commit_ts=10  (note: monotonic TSO, so
+ *      T1.commit_ts &gt; R.read_ts? NO — TSO calls happen in
+ *      this order: 5, 15, 10? — that's not monotonic, so impossible)
  * </pre>
  *
- * <p>OK, with strictly monotonic TSO, T1's commit_ts &gt; R's read_ts, so R
- * CAN'T have read A before T1 prewrote AND T1's commit be invisible. Yet
- * BankTransferTxnTest empirically loses/creates money under high contention.
- * The actual culprit: <strong>follower / stale-read paths</strong> and
+ * <p>OK, with strictly monotonic TSO, T1's commit_ts &gt; R's read_ts,
+ * so R CAN'T have read A before T1 prewrote AND T1's commit be
+ * invisible. Yet BankTransferTxnTest empirically loses/creates money
+ * under high contention. The actual culprit:
+ * <strong>follower / stale-read paths</strong> and
  * <strong>multi-key reads at the same read_ts</strong> where the second
  * read sees a fresher state than the first because the tracker isn't
  * pinning the read view.

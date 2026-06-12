@@ -6,7 +6,7 @@
 
     <groupId>io.github.x-infra-lab</groupId>
     <artifactId>x-kv</artifactId>
-    <version>0.2.0-SNAPSHOT</version>
+    <version>0.2.0-RC1</version>
     <packaging>pom</packaging>
 
     <name>x-kv (parent)</name>
@@ -22,6 +22,38 @@
           - client:  PD-aware Java SDK (raw KV + transactional)
           - tests:   integration / chaos / linearizability / benchmark suite
     </description>
+    <url>https://github.com/x-infra-lab/x-kv</url>
+    <inceptionYear>2024</inceptionYear>
+
+    <licenses>
+        <license>
+            <name>The Apache License, Version 2.0</name>
+            <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+
+    <developers>
+        <developer>
+            <id>JoeCqupt</id>
+            <name>JoeCqupt</name>
+            <email>joe469391363@gmail.com</email>
+            <organization>x-infra-lab</organization>
+            <organizationUrl>https://github.com/x-infra-lab</organizationUrl>
+        </developer>
+    </developers>
+
+    <scm>
+        <url>https://github.com/x-infra-lab/x-kv</url>
+        <connection>scm:git:https://github.com/x-infra-lab/x-kv.git</connection>
+        <developerConnection>scm:git:git@github.com:x-infra-lab/x-kv.git</developerConnection>
+        <tag>HEAD</tag>
+    </scm>
+
+    <issueManagement>
+        <system>GitHub Issues</system>
+        <url>https://github.com/x-infra-lab/x-kv/issues</url>
+    </issueManagement>
 
     <modules>
         <module>proto</module>
@@ -31,6 +63,7 @@
         <module>client</module>
         <module>ctl</module>
         <module>tests</module>
+        <module>bench</module>
     </modules>
 
     <properties>
@@ -58,6 +91,7 @@
         <micrometer.version>1.14.4</micrometer.version>
         <logstash.encoder.version>8.0</logstash.encoder.version>
         <snakeyaml.version>2.2</snakeyaml.version>
+        <jmh.version>1.37</jmh.version>
     </properties>
 
     <dependencyManagement>
@@ -74,17 +108,17 @@
             <!-- Internal modules -->
             <dependency>
                 <groupId>io.github.x-infra-lab</groupId>
-                <artifactId>x-common</artifactId>
+                <artifactId>x-kv-common</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>
                 <groupId>io.github.x-infra-lab</groupId>
-                <artifactId>x-proto</artifactId>
+                <artifactId>x-kv-proto</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>
                 <groupId>io.github.x-infra-lab</groupId>
-                <artifactId>x-pd</artifactId>
+                <artifactId>x-kv-pd</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>
@@ -94,7 +128,7 @@
             </dependency>
             <dependency>
                 <groupId>io.github.x-infra-lab</groupId>
-                <artifactId>x-client</artifactId>
+                <artifactId>x-kv-client</artifactId>
                 <version>${project.version}</version>
             </dependency>
 
@@ -122,6 +156,13 @@
                 <groupId>javax.annotation</groupId>
                 <artifactId>javax.annotation-api</artifactId>
                 <version>1.3.2</version>
+            </dependency>
+
+            <!-- Convergence pins (transitive conflicts) -->
+            <dependency>
+                <groupId>com.google.errorprone</groupId>
+                <artifactId>error_prone_annotations</artifactId>
+                <version>2.48.0</version>
             </dependency>
 
             <!-- Caches / utilities -->
@@ -219,6 +260,39 @@
                     <artifactId>jacoco-maven-plugin</artifactId>
                     <version>${jacoco.version}</version>
                 </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-checkstyle-plugin</artifactId>
+                    <version>3.3.1</version>
+                    <configuration>
+                        <configLocation>checkstyle.xml</configLocation>
+                        <consoleOutput>true</consoleOutput>
+                        <failsOnError>true</failsOnError>
+                        <includeTestSourceRoots>false</includeTestSourceRoots>
+                    </configuration>
+                    <dependencies>
+                        <dependency>
+                            <groupId>com.puppycrawl.tools</groupId>
+                            <artifactId>checkstyle</artifactId>
+                            <version>10.17.0</version>
+                        </dependency>
+                    </dependencies>
+                </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-source-plugin</artifactId>
+                    <version>3.3.1</version>
+                </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-javadoc-plugin</artifactId>
+                    <version>3.7.0</version>
+                </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-gpg-plugin</artifactId>
+                    <version>3.2.4</version>
+                </plugin>
             </plugins>
         </pluginManagement>
 
@@ -243,6 +317,136 @@
                     </excludes>
                 </configuration>
             </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-enforcer-plugin</artifactId>
+                <version>3.5.0</version>
+                <dependencies>
+                    <dependency>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>extra-enforcer-rules</artifactId>
+                        <version>1.8.0</version>
+                    </dependency>
+                </dependencies>
+                <executions>
+                    <execution>
+                        <id>enforce</id>
+                        <goals><goal>enforce</goal></goals>
+                        <configuration>
+                            <rules>
+                                <requireMavenVersion>
+                                    <version>3.8.0</version>
+                                </requireMavenVersion>
+                                <requireJavaVersion>
+                                    <version>17</version>
+                                </requireJavaVersion>
+                                <dependencyConvergence/>
+                                <reactorModuleConvergence/>
+                                <banDuplicateClasses>
+                                    <ignoreWhenIdentical>true</ignoreWhenIdentical>
+                                </banDuplicateClasses>
+                            </rules>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <profile>
+            <id>release</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-source-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>attach-sources</id>
+                                <goals>
+                                    <goal>jar-no-fork</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-javadoc-plugin</artifactId>
+                        <configuration>
+                            <doclint>none</doclint>
+                            <failOnError>false</failOnError>
+                        </configuration>
+                        <executions>
+                            <execution>
+                                <id>attach-javadocs</id>
+                                <goals>
+                                    <goal>jar</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>flatten-maven-plugin</artifactId>
+                        <version>1.6.0</version>
+                        <configuration>
+                            <embedBuildProfileDependencies>true</embedBuildProfileDependencies>
+                            <flattenMode>ossrh</flattenMode>
+                        </configuration>
+                        <executions>
+                            <execution>
+                                <id>flatten</id>
+                                <phase>process-resources</phase>
+                                <goals>
+                                    <goal>flatten</goal>
+                                </goals>
+                            </execution>
+                            <execution>
+                                <id>flatten.clean</id>
+                                <phase>clean</phase>
+                                <goals>
+                                    <goal>clean</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-gpg-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>sign-artifacts</id>
+                                <phase>verify</phase>
+                                <goals>
+                                    <goal>sign</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                        <configuration>
+                            <gpgArguments>
+                                <arg>--pinentry-mode</arg>
+                                <arg>loopback</arg>
+                            </gpgArguments>
+                        </configuration>
+                    </plugin>
+
+                    <plugin>
+                        <groupId>org.sonatype.central</groupId>
+                        <artifactId>central-publishing-maven-plugin</artifactId>
+                        <version>0.10.0</version>
+                        <extensions>true</extensions>
+                        <configuration>
+                            <publishingServerId>central</publishingServerId>
+                            <autoPublish>true</autoPublish>
+                            <waitUntil>published</waitUntil>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>

@@ -6,6 +6,9 @@ import io.grpc.ServerCallHandler;
 import io.grpc.ServerInterceptor;
 import io.grpc.Status;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+
 public final class AuthServerInterceptor implements ServerInterceptor {
 
     private final String expectedToken;
@@ -23,7 +26,9 @@ public final class AuthServerInterceptor implements ServerInterceptor {
             ServerCallHandler<ReqT, RespT> next) {
 
         String token = headers.get(AuthConstants.AUTH_TOKEN_KEY);
-        if (token == null || !expectedToken.equals(token)) {
+        if (token == null || !MessageDigest.isEqual(
+                expectedToken.getBytes(StandardCharsets.UTF_8),
+                token.getBytes(StandardCharsets.UTF_8))) {
             call.close(Status.UNAUTHENTICATED
                     .withDescription("invalid or missing auth token"), new Metadata());
             return new ServerCall.Listener<>() {};

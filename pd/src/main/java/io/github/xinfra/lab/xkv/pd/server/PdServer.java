@@ -5,7 +5,6 @@ import io.github.xinfra.lab.xkv.pd.config.PdConfig;
 import io.github.xinfra.lab.xkv.pd.raft.PdRaftNode;
 import io.github.xinfra.lab.xkv.pd.state.HlcTsoOracle;
 import io.github.xinfra.lab.xkv.pd.state.InMemorySafePointService;
-import io.github.xinfra.lab.xkv.pd.state.PdStateMachine;
 import io.github.xinfra.lab.xkv.pd.state.RocksDbPdStateMachine;
 import io.github.xinfra.lab.xkv.pd.state.StoreStatsCache;
 import io.github.xinfra.lab.xkv.common.auth.AuthServerInterceptor;
@@ -18,7 +17,6 @@ import io.github.xinfra.lab.xkv.common.tls.GrpcChannelFactory;
 import io.github.xinfra.lab.xkv.pd.transport.PdRaftServiceImpl;
 import io.github.xinfra.lab.xkv.pd.transport.PdRaftTransport;
 import io.grpc.Server;
-import io.grpc.netty.shaded.io.grpc.netty.NettyServerBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -50,6 +48,10 @@ public final class PdServer {
     static final long LEADER_BALANCE_INTERVAL_MS = 5_000L;
     static final long REGION_BALANCE_INTERVAL_MS = 10_000L;
     static final long DEADLOCK_CLEANUP_INTERVAL_MS = 10_000L;
+    static final long HOT_REGION_INTERVAL_MS = 5_000L;
+    static final long MERGE_CHECKER_INTERVAL_MS = 10_000L;
+    static final long RULE_CHECKER_INTERVAL_MS = 10_000L;
+    static final long OPERATOR_TIMEOUT_MS = 10 * 60_000L;
 
     private final PdConfig config;
     private Server grpcServer;
@@ -62,6 +64,10 @@ public final class PdServer {
     private io.github.xinfra.lab.xkv.pd.state.LeaderBalanceScheduler leaderBalance;
     private io.github.xinfra.lab.xkv.pd.state.RegionBalanceScheduler regionBalance;
     private io.github.xinfra.lab.xkv.pd.state.SplitCheckerScheduler splitChecker;
+    private io.github.xinfra.lab.xkv.pd.state.OperatorControllerImpl operatorController;
+    private io.github.xinfra.lab.xkv.pd.state.HotRegionScheduler hotRegion;
+    private io.github.xinfra.lab.xkv.pd.state.MergeCheckerScheduler mergeChecker;
+    private io.github.xinfra.lab.xkv.pd.state.RuleCheckerScheduler ruleChecker;
     private StoreStatsCache storeStatsCache;
     private PdServiceImpl service;
     private PdRaftNode raftNode;
@@ -124,18 +130,67 @@ public final class PdServer {
         scheduler.scheduleAtFixedRate(this::cleanupDeadlockSafely,
                 DEADLOCK_CLEANUP_INTERVAL_MS, DEADLOCK_CLEANUP_INTERVAL_MS, TimeUnit.MILLISECONDS);
 
+        operatorController = new io.github.xinfra.lab.xkv.pd.state.OperatorControllerImpl(
+                operators, config.scheduler().maxOperatorsPerStore(), OPERATOR_TIMEOUT_MS);
+
+        if (config.peers().isEmpty()) {
+            startSchedulers();
+        } else {
+            raftNode.setLeaderObserver(isLeader -> {
+                if (isLeader) {
+                    startSchedulers();
+                } else {
+                    stopSchedulers();
+                }
+            });
+        }
+    }
+
+    private volatile boolean schedulersRunning = false;
+
+    private synchronized void startSchedulers() {
+        if (schedulersRunning) return;
+        log.info("PD node {} starting schedulers (became leader)", config.nodeId());
+
         leaderBalance = new io.github.xinfra.lab.xkv.pd.state.LeaderBalanceScheduler(
-                state, operators, storeStatsCache, LEADER_BALANCE_INTERVAL_MS);
+                state, operatorController, storeStatsCache, LEADER_BALANCE_INTERVAL_MS);
         leaderBalance.start();
 
         regionBalance = new io.github.xinfra.lab.xkv.pd.state.RegionBalanceScheduler(
-                state, operators, storeStatsCache, REGION_BALANCE_INTERVAL_MS);
+                state, operatorController, storeStatsCache, REGION_BALANCE_INTERVAL_MS);
         regionBalance.start();
 
         splitChecker = new io.github.xinfra.lab.xkv.pd.state.SplitCheckerScheduler(
-                state, operators, config.scheduler().regionSplitBytes(),
+                state, operatorController, config.scheduler().regionSplitBytes(),
                 config.scheduler().heartbeatIntervalMs());
         splitChecker.start();
+
+        hotRegion = new io.github.xinfra.lab.xkv.pd.state.HotRegionScheduler(
+                state, operatorController, operators, storeStatsCache, HOT_REGION_INTERVAL_MS);
+        hotRegion.start();
+
+        mergeChecker = new io.github.xinfra.lab.xkv.pd.state.MergeCheckerScheduler(
+                state, operatorController, config.scheduler().regionSplitBytes() / 10,
+                MERGE_CHECKER_INTERVAL_MS);
+        mergeChecker.start();
+
+        ruleChecker = new io.github.xinfra.lab.xkv.pd.state.RuleCheckerScheduler(
+                state, operatorController, storeStatsCache, RULE_CHECKER_INTERVAL_MS);
+        ruleChecker.start();
+
+        schedulersRunning = true;
+    }
+
+    private synchronized void stopSchedulers() {
+        if (!schedulersRunning) return;
+        log.info("PD node {} stopping schedulers (lost leadership)", config.nodeId());
+        if (ruleChecker != null) { ruleChecker.close(); ruleChecker = null; }
+        if (mergeChecker != null) { mergeChecker.close(); mergeChecker = null; }
+        if (hotRegion != null) { hotRegion.close(); hotRegion = null; }
+        if (splitChecker != null) { splitChecker.close(); splitChecker = null; }
+        if (regionBalance != null) { regionBalance.close(); regionBalance = null; }
+        if (leaderBalance != null) { leaderBalance.close(); leaderBalance = null; }
+        schedulersRunning = false;
     }
 
     /**
@@ -156,11 +211,16 @@ public final class PdServer {
 
         // Start the raft gRPC server on the raft address.
         var raftAddr = GrpcChannelFactory.parseHostPort(config.raftAddress());
-        raftGrpcServer = GrpcChannelFactory.serverBuilder(
+        var raftBuilder = GrpcChannelFactory.serverBuilder(
                         new InetSocketAddress(raftAddr.host(), raftAddr.port()), config.raftTls())
-                .addService(new PdRaftServiceImpl(raftTransport))
-                .build()
-                .start();
+                .addService(new PdRaftServiceImpl(raftTransport));
+        if (config.maxConcurrentRequests() > 0) {
+            raftBuilder.intercept(new ConcurrencyLimitInterceptor(config.maxConcurrentRequests()));
+        }
+        if (config.authToken() != null) {
+            raftBuilder.intercept(new AuthServerInterceptor(config.authToken()));
+        }
+        raftGrpcServer = raftBuilder.build().start();
 
         // Build the peer list for raft initialization.
         var raftPeers = new ArrayList<Peer>();
@@ -212,9 +272,8 @@ public final class PdServer {
         if (metricsHttpServer != null) {
             try { metricsHttpServer.close(); } catch (Exception ignored) {}
         }
-        if (splitChecker != null) splitChecker.close();
-        if (regionBalance != null) regionBalance.close();
-        if (leaderBalance != null) leaderBalance.close();
+        stopSchedulers();
+        if (operatorController != null) operatorController.shutdown();
         if (scheduler != null) scheduler.shutdownNow();
         if (grpcServer != null) {
             grpcServer.shutdown();

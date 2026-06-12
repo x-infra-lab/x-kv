@@ -364,7 +364,9 @@ public final class TransactionImpl implements Transaction {
             // Check for write conflict — non-retryable for pessimistic lock.
             for (var err : resp.getErrorsList()) {
                 if (err.hasConflict()) {
-                    throw new KvClientException(KvClientException.Category.WRITE_CONFLICT, err.getConflict().toString());
+                    throw new KvClientException(
+                            KvClientException.Category.WRITE_CONFLICT,
+                            err.getConflict().toString());
                 }
             }
             // KeyError.locked — the key is held by another txn. Backoff and retry.
@@ -444,48 +446,56 @@ public final class TransactionImpl implements Transaction {
             }
         }
         if (!pessOnlyKeys.isEmpty()) {
-            try {
-                var bo = new BackofferImpl(backoffCfg);
-                sender.sendKeyed(pessOnlyKeys.get(0).toByteArray(), bo,
-                        (stub, info) -> {
-                            var b = Kvrpcpb.PessimisticRollbackRequest.newBuilder()
-                                    .setContext(Kvrpcpb.Context.newBuilder()
-                                            .setRegionId(info.region().getId())
-                                            .setRegionEpoch(info.region().getRegionEpoch())
-                                            .setPeer(info.leader())
-                                            .build())
-                                    .setStartVersion(startTs)
-                                    .setForUpdateTs(forUpdateTs);
-                            for (var k : pessOnlyKeys) b.addKeys(k);
-                            return stub.kvPessimisticRollback(b.build());
-                        },
-                        Kvrpcpb.PessimisticRollbackResponse::getRegionError);
-            } catch (Throwable t) {
-                log.debug("pessimistic rollback error (TTL cleanup will handle): {}", t.getMessage());
+            var grouped = groupByRegion(pessOnlyKeys);
+            for (var entry : grouped.entrySet()) {
+                var regionKeys = entry.getValue();
+                try {
+                    var bo = new BackofferImpl(backoffCfg);
+                    sender.sendKeyed(regionKeys.get(0).toByteArray(), bo,
+                            (stub, info) -> {
+                                var b = Kvrpcpb.PessimisticRollbackRequest.newBuilder()
+                                        .setContext(Kvrpcpb.Context.newBuilder()
+                                                .setRegionId(info.region().getId())
+                                                .setRegionEpoch(info.region().getRegionEpoch())
+                                                .setPeer(info.leader())
+                                                .build())
+                                        .setStartVersion(startTs)
+                                        .setForUpdateTs(forUpdateTs);
+                                for (var k : regionKeys) b.addKeys(k);
+                                return stub.kvPessimisticRollback(b.build());
+                            },
+                            Kvrpcpb.PessimisticRollbackResponse::getRegionError);
+                } catch (Throwable t) {
+                    log.debug("pessimistic rollback error (TTL cleanup will handle): {}", t.getMessage());
+                }
             }
         }
 
         // Prewritten keys (in buffer) use kvBatchRollback.
         if (!buffer.isEmpty()) {
-            var bo = new BackofferImpl(backoffCfg);
-            var keys = new ArrayList<>(buffer.keySet());
-            try {
-                var sample = keys.get(0);
-                sender.sendKeyed(sample, bo,
-                        (stub, info) -> {
-                            var b = Kvrpcpb.BatchRollbackRequest.newBuilder()
-                                    .setContext(Kvrpcpb.Context.newBuilder()
-                                            .setRegionId(info.region().getId())
-                                            .setRegionEpoch(info.region().getRegionEpoch())
-                                            .setPeer(info.leader())
-                                            .build())
-                                    .setStartVersion(startTs);
-                            for (var k : keys) b.addKeys(ByteString.copyFrom(k));
-                            return stub.kvBatchRollback(b.build());
-                        },
-                        Kvrpcpb.BatchRollbackResponse::getRegionError);
-            } catch (Throwable t) {
-                log.debug("rollback RPC error (resolver will clean up): {}", t.getMessage());
+            var keyBs = new ArrayList<ByteString>();
+            for (var k : buffer.keySet()) keyBs.add(ByteString.copyFrom(k));
+            var grouped = groupByRegion(keyBs);
+            for (var entry : grouped.entrySet()) {
+                var regionKeys = entry.getValue();
+                try {
+                    var bo = new BackofferImpl(backoffCfg);
+                    sender.sendKeyed(regionKeys.get(0).toByteArray(), bo,
+                            (stub, info) -> {
+                                var b = Kvrpcpb.BatchRollbackRequest.newBuilder()
+                                        .setContext(Kvrpcpb.Context.newBuilder()
+                                                .setRegionId(info.region().getId())
+                                                .setRegionEpoch(info.region().getRegionEpoch())
+                                                .setPeer(info.leader())
+                                                .build())
+                                        .setStartVersion(startTs);
+                                for (var k : regionKeys) b.addKeys(k);
+                                return stub.kvBatchRollback(b.build());
+                            },
+                            Kvrpcpb.BatchRollbackResponse::getRegionError);
+                } catch (Throwable t) {
+                    log.debug("rollback RPC error (resolver will clean up): {}", t.getMessage());
+                }
             }
         }
         state = State.ROLLED_BACK;
@@ -550,14 +560,32 @@ public final class TransactionImpl implements Transaction {
     }
 
     private static KvClientException mapKeyError(Kvrpcpb.KeyError ke) {
-        if (ke.hasConflict()) return new KvClientException(KvClientException.Category.WRITE_CONFLICT, ke.toString());
-        if (ke.hasDeadlock()) return new KvClientException(KvClientException.Category.DEADLOCK, ke.toString());
-        if (ke.hasAlreadyExist()) return new KvClientException(KvClientException.Category.ALREADY_EXIST, ke.toString());
-        if (ke.hasTxnNotFound()) return new KvClientException(KvClientException.Category.TXN_NOT_FOUND, ke.toString());
-        if (ke.hasCommitTsExpired()) return new KvClientException(KvClientException.Category.COMMIT_TS_EXPIRED, ke.toString());
-        if (ke.hasCommitTsTooLarge()) return new KvClientException(KvClientException.Category.COMMIT_TS_TOO_LARGE, ke.toString());
-        if (ke.hasAssertionFailed()) return new KvClientException(KvClientException.Category.ASSERTION_FAILED, ke.toString());
-        return new KvClientException(KvClientException.Category.OTHER, ke.toString());
+        var msg = ke.toString();
+        if (ke.hasConflict()) return new KvClientException(
+                KvClientException.Category.WRITE_CONFLICT, msg);
+        if (ke.hasDeadlock()) return new KvClientException(
+                KvClientException.Category.DEADLOCK, msg);
+        if (ke.hasAlreadyExist()) return new KvClientException(
+                KvClientException.Category.ALREADY_EXIST, msg);
+        if (ke.hasTxnNotFound()) return new KvClientException(
+                KvClientException.Category.TXN_NOT_FOUND, msg);
+        if (ke.hasCommitTsExpired()) return new KvClientException(
+                KvClientException.Category.COMMIT_TS_EXPIRED, msg);
+        if (ke.hasCommitTsTooLarge()) return new KvClientException(
+                KvClientException.Category.COMMIT_TS_TOO_LARGE, msg);
+        if (ke.hasAssertionFailed()) return new KvClientException(
+                KvClientException.Category.ASSERTION_FAILED, msg);
+        return new KvClientException(KvClientException.Category.OTHER, msg);
+    }
+
+    private Map<Long, List<ByteString>> groupByRegion(List<ByteString> keys) {
+        var groups = new LinkedHashMap<Long, List<ByteString>>();
+        for (var k : keys) {
+            var info = regionCache.locateKey(k.toByteArray()).orElse(null);
+            long regionId = info != null ? info.region().getId() : 0L;
+            groups.computeIfAbsent(regionId, id -> new ArrayList<>()).add(k);
+        }
+        return groups;
     }
 
     private enum State { ACTIVE, COMMITTED, ROLLED_BACK, UNKNOWN }

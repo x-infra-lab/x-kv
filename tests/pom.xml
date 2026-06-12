@@ -7,25 +7,30 @@
     <parent>
         <groupId>io.github.x-infra-lab</groupId>
         <artifactId>x-kv</artifactId>
-        <version>0.2.0-SNAPSHOT</version>
+        <version>0.2.0-RC1</version>
     </parent>
 
-    <artifactId>x-tests</artifactId>
-    <name>x-tests</name>
+    <artifactId>x-kv-tests</artifactId>
+    <name>x-kv-tests</name>
     <description>End-to-end / chaos / linearizability / benchmark suite.</description>
+
+    <properties>
+        <maven.deploy.skip>true</maven.deploy.skip>
+        <skipPublishing>true</skipPublishing>
+    </properties>
 
     <dependencies>
         <dependency>
             <groupId>io.github.x-infra-lab</groupId>
-            <artifactId>x-common</artifactId>
+            <artifactId>x-kv-common</artifactId>
         </dependency>
         <dependency>
             <groupId>io.github.x-infra-lab</groupId>
-            <artifactId>x-proto</artifactId>
+            <artifactId>x-kv-proto</artifactId>
         </dependency>
         <dependency>
             <groupId>io.github.x-infra-lab</groupId>
-            <artifactId>x-pd</artifactId>
+            <artifactId>x-kv-pd</artifactId>
         </dependency>
         <dependency>
             <groupId>io.github.x-infra-lab</groupId>
@@ -33,7 +38,7 @@
         </dependency>
         <dependency>
             <groupId>io.github.x-infra-lab</groupId>
-            <artifactId>x-client</artifactId>
+            <artifactId>x-kv-client</artifactId>
         </dependency>
 
         <dependency>

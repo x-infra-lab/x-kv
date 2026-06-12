@@ -222,17 +222,18 @@ public final class RegionHeartbeater implements AutoCloseable {
         try {
             byte[] start = region.getStartKey().toByteArray();
             byte[] end = region.getEndKey().toByteArray();
-            var opts = engine.newReadOptions();
-            if (end.length > 0) opts.iterateUpperBound(end);
-            try (var iter = engine.newIterator(StorageEngine.Cf.DEFAULT, opts)) {
-                iter.seek(start.length > 0 ? start : new byte[]{0});
-                int count = 0;
-                while (iter.isValid()) { count++; iter.next(); }
-                if (count < 2) return null;
-                int mid = count / 2;
-                iter.seek(start.length > 0 ? start : new byte[]{0});
-                for (int i = 0; i < mid && iter.isValid(); i++) iter.next();
-                return iter.isValid() ? iter.key() : null;
+            try (var opts = engine.newReadOptions()) {
+                if (end.length > 0) opts.iterateUpperBound(end);
+                try (var iter = engine.newIterator(StorageEngine.Cf.DEFAULT, opts)) {
+                    iter.seek(start.length > 0 ? start : new byte[]{0});
+                    int count = 0;
+                    while (iter.isValid()) { count++; iter.next(); }
+                    if (count < 2) return null;
+                    int mid = count / 2;
+                    iter.seek(start.length > 0 ? start : new byte[]{0});
+                    for (int i = 0; i < mid && iter.isValid(); i++) iter.next();
+                    return iter.isValid() ? iter.key() : null;
+                }
             }
         } catch (Throwable t) {
             log.debug("computeApproximateMidKey failed region={}: {}", region.getId(), t.getMessage());

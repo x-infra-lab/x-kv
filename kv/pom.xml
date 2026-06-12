@@ -7,21 +7,26 @@
     <parent>
         <groupId>io.github.x-infra-lab</groupId>
         <artifactId>x-kv</artifactId>
-        <version>0.2.0-SNAPSHOT</version>
+        <version>0.2.0-RC1</version>
     </parent>
 
     <artifactId>x-kv-store</artifactId>
     <name>x-kv-store</name>
     <description>Multi-Raft KV store with MVCC + Percolator transactions.</description>
 
+    <properties>
+        <maven.deploy.skip>true</maven.deploy.skip>
+        <skipPublishing>true</skipPublishing>
+    </properties>
+
     <dependencies>
         <dependency>
             <groupId>io.github.x-infra-lab</groupId>
-            <artifactId>x-common</artifactId>
+            <artifactId>x-kv-common</artifactId>
         </dependency>
         <dependency>
             <groupId>io.github.x-infra-lab</groupId>
-            <artifactId>x-proto</artifactId>
+            <artifactId>x-kv-proto</artifactId>
         </dependency>
 
         <dependency>

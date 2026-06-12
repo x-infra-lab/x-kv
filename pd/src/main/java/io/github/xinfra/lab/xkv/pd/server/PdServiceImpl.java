@@ -8,7 +8,66 @@ import io.github.xinfra.lab.xkv.pd.state.StoreStatsCache;
 import io.github.xinfra.lab.xkv.pd.state.Tso;
 import io.github.xinfra.lab.xkv.proto.Kvrpcpb;
 import io.github.xinfra.lab.xkv.proto.PDGrpc;
-import io.github.xinfra.lab.xkv.proto.Pdpb.*;
+import io.github.xinfra.lab.xkv.proto.Pdpb.AllocIDRequest;
+import io.github.xinfra.lab.xkv.proto.Pdpb.AllocIDResponse;
+import io.github.xinfra.lab.xkv.proto.Pdpb.AskBatchSplitRequest;
+import io.github.xinfra.lab.xkv.proto.Pdpb.AskBatchSplitResponse;
+import io.github.xinfra.lab.xkv.proto.Pdpb.AskSplitRequest;
+import io.github.xinfra.lab.xkv.proto.Pdpb.AskSplitResponse;
+import io.github.xinfra.lab.xkv.proto.Pdpb.BootstrapRequest;
+import io.github.xinfra.lab.xkv.proto.Pdpb.BootstrapResponse;
+import io.github.xinfra.lab.xkv.proto.Pdpb.CleanupWaitForRequest;
+import io.github.xinfra.lab.xkv.proto.Pdpb.CleanupWaitForResponse;
+import io.github.xinfra.lab.xkv.proto.Pdpb.DetectDeadlockRequest;
+import io.github.xinfra.lab.xkv.proto.Pdpb.DetectDeadlockResponse;
+import io.github.xinfra.lab.xkv.proto.Pdpb.GetAllServiceGCSafePointsRequest;
+import io.github.xinfra.lab.xkv.proto.Pdpb.GetAllServiceGCSafePointsResponse;
+import io.github.xinfra.lab.xkv.proto.Pdpb.GetAllStoresRequest;
+import io.github.xinfra.lab.xkv.proto.Pdpb.GetAllStoresResponse;
+import io.github.xinfra.lab.xkv.proto.Pdpb.GetClusterInfoRequest;
+import io.github.xinfra.lab.xkv.proto.Pdpb.GetClusterInfoResponse;
+import io.github.xinfra.lab.xkv.proto.Pdpb.GetGCSafePointRequest;
+import io.github.xinfra.lab.xkv.proto.Pdpb.GetGCSafePointResponse;
+import io.github.xinfra.lab.xkv.proto.Pdpb.GetMembersRequest;
+import io.github.xinfra.lab.xkv.proto.Pdpb.GetMembersResponse;
+import io.github.xinfra.lab.xkv.proto.Pdpb.GetOperatorRequest;
+import io.github.xinfra.lab.xkv.proto.Pdpb.GetOperatorResponse;
+import io.github.xinfra.lab.xkv.proto.Pdpb.GetRegionByIDRequest;
+import io.github.xinfra.lab.xkv.proto.Pdpb.GetRegionRequest;
+import io.github.xinfra.lab.xkv.proto.Pdpb.GetRegionResponse;
+import io.github.xinfra.lab.xkv.proto.Pdpb.GetStoreRequest;
+import io.github.xinfra.lab.xkv.proto.Pdpb.GetStoreResponse;
+import io.github.xinfra.lab.xkv.proto.Pdpb.IsBootstrappedRequest;
+import io.github.xinfra.lab.xkv.proto.Pdpb.IsBootstrappedResponse;
+import io.github.xinfra.lab.xkv.proto.Pdpb.Member;
+import io.github.xinfra.lab.xkv.proto.Pdpb.OperatorStatus;
+import io.github.xinfra.lab.xkv.proto.Pdpb.PutStoreRequest;
+import io.github.xinfra.lab.xkv.proto.Pdpb.PutStoreResponse;
+import io.github.xinfra.lab.xkv.proto.Pdpb.RegionHeartbeatRequest;
+import io.github.xinfra.lab.xkv.proto.Pdpb.RegionHeartbeatResponse;
+import io.github.xinfra.lab.xkv.proto.Pdpb.ReportBatchSplitRequest;
+import io.github.xinfra.lab.xkv.proto.Pdpb.ReportBatchSplitResponse;
+import io.github.xinfra.lab.xkv.proto.Pdpb.ReportSplitRequest;
+import io.github.xinfra.lab.xkv.proto.Pdpb.ReportSplitResponse;
+import io.github.xinfra.lab.xkv.proto.Pdpb.ResponseHeader;
+import io.github.xinfra.lab.xkv.proto.Pdpb.ScanRegionsRequest;
+import io.github.xinfra.lab.xkv.proto.Pdpb.ScanRegionsResponse;
+import io.github.xinfra.lab.xkv.proto.Pdpb.ScatterRegionRequest;
+import io.github.xinfra.lab.xkv.proto.Pdpb.ScatterRegionResponse;
+import io.github.xinfra.lab.xkv.proto.Pdpb.ServiceSafePoint;
+import io.github.xinfra.lab.xkv.proto.Pdpb.SplitID;
+import io.github.xinfra.lab.xkv.proto.Pdpb.SplitRegion;
+import io.github.xinfra.lab.xkv.proto.Pdpb.SplitRegionsRequest;
+import io.github.xinfra.lab.xkv.proto.Pdpb.SplitRegionsResponse;
+import io.github.xinfra.lab.xkv.proto.Pdpb.StoreHeartbeatRequest;
+import io.github.xinfra.lab.xkv.proto.Pdpb.StoreHeartbeatResponse;
+import io.github.xinfra.lab.xkv.proto.Pdpb.Timestamp;
+import io.github.xinfra.lab.xkv.proto.Pdpb.TsoRequest;
+import io.github.xinfra.lab.xkv.proto.Pdpb.TsoResponse;
+import io.github.xinfra.lab.xkv.proto.Pdpb.UpdateGCSafePointRequest;
+import io.github.xinfra.lab.xkv.proto.Pdpb.UpdateGCSafePointResponse;
+import io.github.xinfra.lab.xkv.proto.Pdpb.UpdateServiceGCSafePointRequest;
+import io.github.xinfra.lab.xkv.proto.Pdpb.UpdateServiceGCSafePointResponse;
 import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
 import org.slf4j.Logger;
@@ -244,12 +303,16 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
     @Override
     public void bootstrap(BootstrapRequest req, StreamObserver<BootstrapResponse> obs) {
         if (!req.hasStore() || !req.hasRegion()) {
-            obs.onError(Status.INVALID_ARGUMENT.withDescription("bootstrap missing store or region").asRuntimeException());
+            obs.onError(Status.INVALID_ARGUMENT
+                    .withDescription("bootstrap missing store or region")
+                    .asRuntimeException());
             return;
         }
         if (state.isBootstrapped()) {
             obs.onNext(BootstrapResponse.newBuilder()
-                    .setHeader(errorHeader(io.github.xinfra.lab.xkv.proto.Pdpb.Error.ErrorType.ALREADY_BOOTSTRAPPED, "cluster already bootstrapped"))
+                    .setHeader(errorHeader(
+                            io.github.xinfra.lab.xkv.proto.Pdpb.Error.ErrorType.ALREADY_BOOTSTRAPPED,
+                            "cluster already bootstrapped"))
                     .build());
             obs.onCompleted();
             return;
@@ -330,7 +393,9 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
                 } catch (Throwable t) {
                     log.warn("TSO alloc failed", t);
                     resp.onNext(TsoResponse.newBuilder()
-                            .setHeader(errorHeader(io.github.xinfra.lab.xkv.proto.Pdpb.Error.ErrorType.UNKNOWN, t.getMessage()))
+                            .setHeader(errorHeader(
+                                    io.github.xinfra.lab.xkv.proto.Pdpb.Error.ErrorType.UNKNOWN,
+                                    t.getMessage()))
                             .build());
                 }
             }

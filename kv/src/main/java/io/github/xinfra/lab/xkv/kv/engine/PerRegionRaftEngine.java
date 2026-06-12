@@ -101,8 +101,8 @@ public final class PerRegionRaftEngine implements RaftEngine {
         this.firstIndex = snapIdx + 1;
         this.lastIndex = snapIdx;
 
-        var ro = storage.newReadOptions().iterateLowerBound(lower).iterateUpperBound(upper);
-        try (var it = storage.newIterator(StorageEngine.Cf.RAFT, ro)) {
+        try (var ro = storage.newReadOptions().iterateLowerBound(lower).iterateUpperBound(upper);
+             var it = storage.newIterator(StorageEngine.Cf.RAFT, ro)) {
             it.seek(lower);
             if (it.isValid()) {
                 this.firstIndex = logIndexFromKey(it.key());
@@ -118,8 +118,8 @@ public final class PerRegionRaftEngine implements RaftEngine {
     private void loadDedup() {
         var lower = regionTypePrefix(regionId, TYPE_DEDUP);
         var upper = regionTypePrefix(regionId + 1, TYPE_DEDUP);
-        var ro = storage.newReadOptions().iterateLowerBound(lower).iterateUpperBound(upper);
-        try (var it = storage.newIterator(StorageEngine.Cf.RAFT, ro)) {
+        try (var ro = storage.newReadOptions().iterateLowerBound(lower).iterateUpperBound(upper);
+             var it = storage.newIterator(StorageEngine.Cf.RAFT, ro)) {
             for (it.seek(lower); it.isValid(); it.next()) {
                 if (it.key()[0] != TYPE_DEDUP) break;
                 long clientId = dedupClientIdFromKey(it.key());
@@ -289,7 +289,10 @@ public final class PerRegionRaftEngine implements RaftEngine {
         // Drop everything under the region's RAFT-CF subtree, then mark the
         // applied range in the data CFs for later GC by the store.
         try (var b = storage.newWriteBatch()) {
-            for (byte type : new byte[] { TYPE_LOG, TYPE_META, TYPE_APPLIED, TYPE_DEDUP, TYPE_SNAPMETA, TYPE_CONFSTATE, TYPE_REGION }) {
+            for (byte type : new byte[] {
+                    TYPE_LOG, TYPE_META, TYPE_APPLIED, TYPE_DEDUP,
+                    TYPE_SNAPMETA, TYPE_CONFSTATE, TYPE_REGION,
+                    TYPE_MAX_TS, TYPE_MERGE_STATE }) {
                 b.deleteRange(StorageEngine.Cf.RAFT,
                         regionTypePrefix(regionId, type),
                         regionTypePrefix(regionId + 1, type));
@@ -303,6 +306,8 @@ public final class PerRegionRaftEngine implements RaftEngine {
         lastSnapshotMeta = null;
         currentTerm = 0;
         votedFor = 0;
+        persistedMaxTs = 0;
+        mergeState = null;
     }
 
     @Override public void close() { /* storage is owned by Store */ }

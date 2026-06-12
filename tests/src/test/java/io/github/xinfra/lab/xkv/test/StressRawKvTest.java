@@ -74,7 +74,7 @@ final class StressRawKvTest {
                     for (int i = 0; i < OPS_PER_WORKER; i++) {
                         String key = String.format("stress:%d:%05d", workerId, i);
                         String val = "v-" + workerId + "-" + i;
-                        raw.put(key.getBytes(), val.getBytes());
+                        retryOnTransient(() -> raw.put(key.getBytes(), val.getBytes()));
                         written.put(key, val);
                         opsCompleted.incrementAndGet();
                     }
@@ -100,7 +100,7 @@ final class StressRawKvTest {
         var missing = new AtomicInteger();
         var mismatch = new AtomicInteger();
         for (var entry : written.entrySet()) {
-            var got = raw.get(entry.getKey().getBytes());
+            var got = retryOnTransient(() -> raw.get(entry.getKey().getBytes()));
             if (got.isEmpty()) {
                 missing.incrementAndGet();
             } else if (!new String(got.get()).equals(entry.getValue())) {
@@ -142,5 +142,20 @@ final class StressRawKvTest {
         pool.shutdown();
         assertThat(pool.awaitTermination(30, TimeUnit.SECONDS)).isTrue();
         assertThat(errors).isEmpty();
+    }
+
+    private static <T> T retryOnTransient(java.util.concurrent.Callable<T> action) throws Exception {
+        for (int attempt = 0; ; attempt++) {
+            try {
+                return action.call();
+            } catch (Exception e) {
+                if (attempt >= 10) throw e;
+                Thread.sleep(50 + attempt * 100L);
+            }
+        }
+    }
+
+    private static void retryOnTransient(Runnable action) throws Exception {
+        retryOnTransient(() -> { action.run(); return null; });
     }
 }

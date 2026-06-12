@@ -66,7 +66,7 @@ public final class GcWorker implements AutoCloseable {
     }
 
     public void start() {
-        timer.scheduleAtFixedRate(this::tickSafely, intervalMs, intervalMs, TimeUnit.MILLISECONDS);
+        timer.scheduleWithFixedDelay(this::tickSafely, intervalMs, intervalMs, TimeUnit.MILLISECONDS);
         log.info("GcWorker started: interval={}ms", intervalMs);
     }
 

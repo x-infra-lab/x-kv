@@ -28,7 +28,8 @@ public final class PdRaftTransport implements Transport {
     private final TlsConfig tls;
     private final ConcurrentHashMap<Long, String> peerAddresses = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Long, ManagedChannel> channels = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<Long, StreamObserver<PdInternalpb.PdRaftMessage>> outbounds = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Long, StreamObserver<PdInternalpb.PdRaftMessage>> outbounds =
+            new ConcurrentHashMap<>();
     private volatile MessageReceiver receiver;
 
     public PdRaftTransport(long selfId) {

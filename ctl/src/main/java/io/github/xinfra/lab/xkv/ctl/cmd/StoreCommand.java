@@ -1,6 +1,5 @@
 package io.github.xinfra.lab.xkv.ctl.cmd;
 
-import io.github.xinfra.lab.xkv.proto.Metapb;
 import io.github.xinfra.lab.xkv.proto.PDGrpc;
 import io.github.xinfra.lab.xkv.proto.Pdpb;
 

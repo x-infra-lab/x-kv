@@ -58,7 +58,8 @@ public final class InMemoryPdStateMachine implements PdStateMachine {
             (a, b) -> com.google.protobuf.ByteString.unsignedLexicographicalComparator().compare(a, b));
 
     private final java.util.HashMap<Long, Metapb.Peer> leaders = new java.util.HashMap<>();
-    private final java.util.concurrent.ConcurrentHashMap<Long, RegionStats> regionStats = new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.concurrent.ConcurrentHashMap<Long, RegionStats> regionStats =
+            new java.util.concurrent.ConcurrentHashMap<>();
 
     private final AtomicLong idAllocator = new AtomicLong(1000);   // start ids past well-known reserved ones
 
@@ -174,7 +175,7 @@ public final class InMemoryPdStateMachine implements PdStateMachine {
                 long prevVer = prev.getRegionEpoch().getVersion();
                 long newConf = region.getRegionEpoch().getConfVer();
                 long newVer = region.getRegionEpoch().getVersion();
-                if (newConf < prevConf || (newConf == prevConf && newVer < prevVer)) {
+                if (newConf < prevConf || newVer < prevVer) {
                     log.debug("dropping stale region update id={} epoch=({},{}) < prev=({},{})",
                             region.getId(), newConf, newVer, prevConf, prevVer);
                     return;
@@ -257,6 +258,15 @@ public final class InMemoryPdStateMachine implements PdStateMachine {
             if (cluster != null) snap.setCluster(cluster);
             for (var s : stores.values()) snap.addStores(s);
             for (var r : regionsById.values()) snap.addRegions(r);
+            snap.putAllLeaders(leaders);
+            for (var e : regionStats.entrySet()) {
+                snap.addRegionStats(io.github.xinfra.lab.xkv.proto.PdInternalpb.RegionStatsEntry
+                        .newBuilder()
+                        .setRegionId(e.getKey())
+                        .setApproximateSize(e.getValue().approximateSize())
+                        .setApproximateKeys(e.getValue().approximateKeys())
+                        .build());
+            }
             return snap.build().toByteArray();
         } finally {
             lock.readLock().unlock();
@@ -276,6 +286,13 @@ public final class InMemoryPdStateMachine implements PdStateMachine {
             for (var r : snap.getRegionsList()) {
                 regionsById.put(r.getId(), r);
                 regionsByStart.put(r.getStartKey(), r);
+            }
+            leaders.clear();
+            leaders.putAll(snap.getLeadersMap());
+            regionStats.clear();
+            for (var rs : snap.getRegionStatsList()) {
+                regionStats.put(rs.getRegionId(),
+                        new RegionStats(rs.getApproximateSize(), rs.getApproximateKeys()));
             }
             if (snap.getIdAllocatorNext() > 0) {
                 idAllocator.set(snap.getIdAllocatorNext());

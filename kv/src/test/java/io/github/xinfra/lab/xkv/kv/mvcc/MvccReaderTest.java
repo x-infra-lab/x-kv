@@ -91,18 +91,18 @@ final class MvccReaderTest {
         commitPut("d", "vd", 10, 20);
 
         var r = new MvccReader(engine, null, false);
-        var pairs = r.scan("b".getBytes(), "d".getBytes(), 100, 100);
-        assertThat(pairs).hasSize(2);
-        assertThat(new String(pairs.get(0).key())).isEqualTo("b");
-        assertThat(new String(pairs.get(1).key())).isEqualTo("c");
+        var result = r.scan("b".getBytes(), "d".getBytes(), 100, 100);
+        assertThat(result.pairs()).hasSize(2);
+        assertThat(new String(result.pairs().get(0).key())).isEqualTo("b");
+        assertThat(new String(result.pairs().get(1).key())).isEqualTo("c");
     }
 
     @Test
     void scanRespectsLimit() {
         for (int i = 0; i < 10; i++) commitPut("k" + i, "v" + i, 10, 20);
         var r = new MvccReader(engine, null, false);
-        var pairs = r.scan("k0".getBytes(), null, 3, 100);
-        assertThat(pairs).hasSize(3);
+        var result = r.scan("k0".getBytes(), null, 3, 100);
+        assertThat(result.pairs()).hasSize(3);
     }
 
     @Test
@@ -150,7 +150,7 @@ final class MvccReaderTest {
                 .ttlMs(3_000)
                 .build();
         try (var b = engine.newWriteBatch()) {
-            b.put(StorageEngine.Cf.LOCK, userKey.getBytes(), lock.encode());
+            b.put(StorageEngine.Cf.LOCK, MvccKey.lockKey(userKey.getBytes()), lock.encode());
             engine.write(b, false);
         }
     }

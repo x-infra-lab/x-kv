@@ -17,7 +17,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.List;
+
 import java.util.Map;
 
 /**
@@ -105,10 +105,29 @@ public final class MvccApplyHandler implements ApplyHandler {
     // Prewrite
     // ===================================================================
 
+    private static final int MAX_KEY_SIZE = 4096;
+    private static final int MAX_VALUE_SIZE = 8 * 1024 * 1024;
+
     private Result applyPrewrite(byte[] payload, StorageEngine.WriteBatch batch)
             throws InvalidProtocolBufferException {
         var req = Kvrpcpb.PrewriteRequest.parseFrom(payload);
-        var reader = new MvccReader(engine, null, true /* ignoreLocks for inner reads */);
+
+        for (var m : req.getMutationsList()) {
+            if (m.getKey().size() > MAX_KEY_SIZE) {
+                return Result.ok(Kvrpcpb.PrewriteResponse.newBuilder()
+                        .addErrors(Kvrpcpb.KeyError.newBuilder()
+                                .setAbort("key too large: " + m.getKey().size()))
+                        .build().toByteArray());
+            }
+            if (m.getValue().size() > MAX_VALUE_SIZE) {
+                return Result.ok(Kvrpcpb.PrewriteResponse.newBuilder()
+                        .addErrors(Kvrpcpb.KeyError.newBuilder()
+                                .setAbort("value too large: " + m.getValue().size()))
+                        .build().toByteArray());
+            }
+        }
+
+        try (var reader = new MvccReader(engine, null, true /* ignoreLocks for inner reads */)) {
         var txn = new MvccTxn(batch, reader);
 
         // Pass 1: check every mutation. Pessimistic-locked mutations skip
@@ -126,7 +145,7 @@ public final class MvccApplyHandler implements ApplyHandler {
                     && req.getIsPessimisticLock(i) != 0L;
             var oc = isPessimistic
                     ? txn.checkPessimisticPrewrite(key, req.getStartVersion())
-                    : txn.checkPrewrite(key, req.getStartVersion());
+                    : txn.checkPrewrite(key, req.getStartVersion(), mapOp(m.getOp()));
             checks.add(oc);
             if (oc instanceof MvccTxn.PrewriteWriteConflict wc) {
                 errors.add(Kvrpcpb.KeyError.newBuilder()
@@ -148,6 +167,11 @@ public final class MvccApplyHandler implements ApplyHandler {
             } else if (oc instanceof MvccTxn.PrewritePessimisticLockNotFound nf) {
                 errors.add(Kvrpcpb.KeyError.newBuilder()
                         .setAbort("pessimistic-lock-not-found startTs=" + nf.startTs())
+                        .build());
+            } else if (oc instanceof MvccTxn.PrewriteAlreadyExist ae) {
+                errors.add(Kvrpcpb.KeyError.newBuilder()
+                        .setAlreadyExist(Kvrpcpb.AlreadyExist.newBuilder()
+                                .setKey(com.google.protobuf.ByteString.copyFrom(ae.key())))
                         .build());
             }
         }
@@ -217,6 +241,7 @@ public final class MvccApplyHandler implements ApplyHandler {
                 .setMinCommitTs(minCommitTs)
                 .build();
         return Result.ok(resp.toByteArray());
+        } // close reader
     }
 
     // ===================================================================
@@ -226,7 +251,7 @@ public final class MvccApplyHandler implements ApplyHandler {
     private Result applyCommit(byte[] payload, StorageEngine.WriteBatch batch)
             throws InvalidProtocolBufferException {
         var req = Kvrpcpb.CommitRequest.parseFrom(payload);
-        var reader = new MvccReader(engine, null, true);
+        try (var reader = new MvccReader(engine, null, true)) {
 
         // Pass 1: probe every key into a throwaway batch so failure on a
         // late key doesn't leak a partial commit through. The throwaway
@@ -266,14 +291,21 @@ public final class MvccApplyHandler implements ApplyHandler {
             // probe close drops staged writes — Pass 2 re-runs on the real batch.
         }
 
-        // CDC: snapshot lock types before commit deletes them.
+        // CDC: snapshot lock types AND values before commit deletes them.
         Map<com.google.protobuf.ByteString, Lock> cdcLocks = null;
+        Map<com.google.protobuf.ByteString, byte[]> cdcValues = null;
         if (cdcEventBus != null && cdcEventBus.hasSubscribers(regionId)) {
             cdcLocks = new HashMap<>();
+            cdcValues = new HashMap<>();
             for (var k : req.getKeysList()) {
                 var lockOpt = reader.readLock(k.toByteArray());
                 if (lockOpt.isPresent() && lockOpt.get().startTs() == req.getStartVersion()) {
                     cdcLocks.put(k, lockOpt.get());
+                    if (lockOpt.get().type() == Lock.Type.PUT) {
+                        byte[] v = engine.get(StorageEngine.Cf.DEFAULT,
+                                MvccKey.encode(k.toByteArray(), req.getStartVersion()));
+                        if (v != null) cdcValues.put(k, v);
+                    }
                 }
             }
         }
@@ -281,9 +313,16 @@ public final class MvccApplyHandler implements ApplyHandler {
         // Pass 2: real commit, all keys.
         var realTxn = new MvccTxn(batch, reader);
         for (var k : req.getKeysList()) {
-            realTxn.commit(k.toByteArray(),
+            var oc = realTxn.commit(k.toByteArray(),
                     req.getStartVersion(), req.getCommitVersion());
+            if (!(oc instanceof MvccTxn.CommitCommitted)
+                    && !(oc instanceof MvccTxn.CommitAlreadyCommitted)) {
+                log.error("commit pass2 unexpected outcome key={} startTs={}: {}",
+                        k, req.getStartVersion(), oc);
+            }
         }
+
+        cm.observeSafeTs(req.getCommitVersion());
 
         // CDC: publish commit events.
         if (cdcLocks != null) {
@@ -297,11 +336,7 @@ public final class MvccApplyHandler implements ApplyHandler {
                 };
                 if (opType == null) continue;
                 byte[] key = k.toByteArray();
-                byte[] value = null;
-                if (opType == Cdcpb.Row.OpType.PUT) {
-                    value = engine.get(StorageEngine.Cf.DEFAULT,
-                            MvccKey.encode(key, req.getStartVersion()));
-                }
+                byte[] value = (opType == Cdcpb.Row.OpType.PUT) ? cdcValues.get(k) : null;
                 cdcEventBus.publish(new CdcEvent(regionId, opType, key, value, null,
                         req.getStartVersion(), req.getCommitVersion()));
             }
@@ -311,6 +346,7 @@ public final class MvccApplyHandler implements ApplyHandler {
                 .setCommitVersion(req.getCommitVersion())
                 .build()
                 .toByteArray());
+        } // close reader
     }
 
     // ===================================================================
@@ -320,7 +356,7 @@ public final class MvccApplyHandler implements ApplyHandler {
     private Result applyRollback(byte[] payload, StorageEngine.WriteBatch batch)
             throws InvalidProtocolBufferException {
         var req = Kvrpcpb.BatchRollbackRequest.parseFrom(payload);
-        var reader = new MvccReader(engine, null, true);
+        try (var reader = new MvccReader(engine, null, true)) {
         var txn = new MvccTxn(batch, reader);
 
         for (var k : req.getKeysList()) {
@@ -343,6 +379,7 @@ public final class MvccApplyHandler implements ApplyHandler {
         }
 
         return Result.ok(Kvrpcpb.BatchRollbackResponse.newBuilder().build().toByteArray());
+        } // close reader
     }
 
     // ===================================================================
@@ -352,7 +389,7 @@ public final class MvccApplyHandler implements ApplyHandler {
     private Result applyPessimisticLock(byte[] payload, StorageEngine.WriteBatch batch)
             throws InvalidProtocolBufferException {
         var req = Kvrpcpb.PessimisticLockRequest.parseFrom(payload);
-        var reader = new MvccReader(engine, null, true);
+        try (var reader = new MvccReader(engine, null, true)) {
         var txn = new MvccTxn(batch, reader);
         // SI: bump max_ts to at least for_update_ts so that any subsequent
         // prewrite for THIS txn (or another) computes min_commit_ts ≥
@@ -388,17 +425,19 @@ public final class MvccApplyHandler implements ApplyHandler {
             }
         }
         return Result.ok(resp.build().toByteArray());
+        } // close reader
     }
 
     private Result applyPessimisticRollback(byte[] payload, StorageEngine.WriteBatch batch)
             throws InvalidProtocolBufferException {
         var req = Kvrpcpb.PessimisticRollbackRequest.parseFrom(payload);
-        var reader = new MvccReader(engine, null, true);
+        try (var reader = new MvccReader(engine, null, true)) {
         var txn = new MvccTxn(batch, reader);
         for (var k : req.getKeysList()) {
             txn.pessimisticRollback(k.toByteArray(), req.getStartVersion(), req.getForUpdateTs());
         }
         return Result.ok(Kvrpcpb.PessimisticRollbackResponse.newBuilder().build().toByteArray());
+        } // close reader
     }
 
     // ===================================================================
@@ -432,7 +471,7 @@ public final class MvccApplyHandler implements ApplyHandler {
     private Result applyResolveLock(byte[] payload, StorageEngine.WriteBatch batch)
             throws InvalidProtocolBufferException {
         var req = Kvrpcpb.ResolveLockRequest.parseFrom(payload);
-        var reader = new MvccReader(engine, null, true);
+        try (var reader = new MvccReader(engine, null, true)) {
         var txn = new MvccTxn(batch, reader);
 
         // Path 1: explicit keys.
@@ -470,9 +509,10 @@ public final class MvccApplyHandler implements ApplyHandler {
         // Bounded to keep one apply round from holding the writer lock
         // arbitrarily long. Caller re-issues until the lock CF is drained
         // (the verdict cache makes follow-up calls cheap).
-        record Target(byte[] key, long startTs, long commitTs) {}
+        record Target(byte[] userKey, long startTs, long commitTs) {}
         var targets = new ArrayList<Target>();
-        try (var it = engine.newIterator(StorageEngine.Cf.LOCK, engine.newReadOptions())) {
+        try (var lockRo = engine.newReadOptions();
+             var it = engine.newIterator(StorageEngine.Cf.LOCK, lockRo)) {
             for (it.seek(new byte[]{0}); it.isValid()
                     && targets.size() < MAX_RESOLVE_LOCKS_PER_APPLY; it.next()) {
                 io.github.xinfra.lab.xkv.kv.mvcc.Lock lock;
@@ -483,18 +523,20 @@ public final class MvccApplyHandler implements ApplyHandler {
                 }
                 Long ct = verdict.get(lock.startTs());
                 if (ct == null) continue;
-                targets.add(new Target(it.key().clone(), lock.startTs(), ct));
+                byte[] userKey = MvccKey.userKeyFromLockKey(it.key());
+                targets.add(new Target(userKey, lock.startTs(), ct));
             }
         }
 
         for (var t : targets) {
             if (t.commitTs() > 0) {
-                txn.resolveLockCommit(t.key(), t.startTs(), t.commitTs());
+                txn.resolveLockCommit(t.userKey(), t.startTs(), t.commitTs());
             } else {
-                txn.resolveLockRollback(t.key(), t.startTs());
+                txn.resolveLockRollback(t.userKey(), t.startTs());
             }
         }
         return Result.ok(Kvrpcpb.ResolveLockResponse.newBuilder().build().toByteArray());
+        } // close reader
     }
 
     /**
@@ -509,7 +551,7 @@ public final class MvccApplyHandler implements ApplyHandler {
     private Result applyCheckTxnStatus(byte[] payload, StorageEngine.WriteBatch batch)
             throws InvalidProtocolBufferException {
         var req = Kvrpcpb.CheckTxnStatusRequest.parseFrom(payload);
-        var reader = new MvccReader(engine, null, true);
+        try (var reader = new MvccReader(engine, null, true)) {
         var txn = new MvccTxn(batch, reader);
         var oc = txn.checkTxnStatus(req.getPrimaryKey().toByteArray(),
                 req.getLockTs(),
@@ -539,6 +581,7 @@ public final class MvccApplyHandler implements ApplyHandler {
                 .setLockInfo(toLockInfo(req.getPrimaryKey().toByteArray(), ac.lock()));
         }
         return Result.ok(resp.build().toByteArray());
+        } // close reader
     }
 
     /**
@@ -556,7 +599,7 @@ public final class MvccApplyHandler implements ApplyHandler {
     private Result applyTxnHeartBeat(byte[] payload, StorageEngine.WriteBatch batch)
             throws InvalidProtocolBufferException {
         var req = Kvrpcpb.TxnHeartBeatRequest.parseFrom(payload);
-        var reader = new MvccReader(engine, null, true);
+        try (var reader = new MvccReader(engine, null, true)) {
         var primary = req.getPrimaryLock().toByteArray();
         var lockOpt = reader.readLock(primary);
 
@@ -584,13 +627,14 @@ public final class MvccApplyHandler implements ApplyHandler {
                     .useAsyncCommit(existing.useAsyncCommit())
                     .secondaries(existing.secondaries())
                     .build();
-            batch.put(StorageEngine.Cf.LOCK, primary, refreshed.encode());
+            batch.put(StorageEngine.Cf.LOCK, MvccKey.lockKey(primary), refreshed.encode());
         }
 
         return Result.ok(Kvrpcpb.TxnHeartBeatResponse.newBuilder()
                 .setLockTtl(newTtl)
                 .build()
                 .toByteArray());
+        } // close reader
     }
 
     /**
@@ -623,7 +667,7 @@ public final class MvccApplyHandler implements ApplyHandler {
     private Result applyCheckSecondaryLocks(byte[] payload, StorageEngine.WriteBatch batch)
             throws InvalidProtocolBufferException {
         var req = Kvrpcpb.CheckSecondaryLocksRequest.parseFrom(payload);
-        var reader = new MvccReader(engine, null, true);
+        try (var reader = new MvccReader(engine, null, true)) {
         long startTs = req.getStartVersion();
         var resp = Kvrpcpb.CheckSecondaryLocksResponse.newBuilder();
         long highestCommitTs = 0;
@@ -645,7 +689,7 @@ public final class MvccApplyHandler implements ApplyHandler {
                 if (w.get().type() == io.github.xinfra.lab.xkv.kv.mvcc.Write.Type.ROLLBACK) {
                     rolledBack = true;
                 } else {
-                    long ct = findCommitTsByStartTs(key, startTs);
+                    long ct = findCommitTsByStartTs(key, startTs, reader.snapshotReadOpts());
                     if (ct > highestCommitTs) highestCommitTs = ct;
                 }
                 continue;
@@ -671,6 +715,7 @@ public final class MvccApplyHandler implements ApplyHandler {
         // takes max of min_commit_ts for async-commit).
 
         return Result.ok(resp.build().toByteArray());
+        } // close reader
     }
 
     /**
@@ -678,8 +723,9 @@ public final class MvccApplyHandler implements ApplyHandler {
      * first non-ROLLBACK record whose {@code startTs} matches. Returns 0
      * if none found.
      */
-    private long findCommitTsByStartTs(byte[] userKey, long startTs) {
-        try (var it = engine.newIterator(StorageEngine.Cf.WRITE, engine.newReadOptions())) {
+    private long findCommitTsByStartTs(byte[] userKey, long startTs,
+                                       StorageEngine.ReadOptions ro) {
+        try (var it = engine.newIterator(StorageEngine.Cf.WRITE, ro)) {
             it.seek(io.github.xinfra.lab.xkv.kv.mvcc.MvccKey.firstVersionFor(userKey));
             while (it.isValid()) {
                 if (!io.github.xinfra.lab.xkv.kv.mvcc.MvccKey.userKeyEquals(it.key(), userKey)) break;
@@ -724,19 +770,11 @@ public final class MvccApplyHandler implements ApplyHandler {
                     .build()
                     .toByteArray());
         }
-        // For DEFAULT and WRITE CFs the keys are {@code userKey || 8B-ts}.
-        // RocksDB's deleteRange is half-open [lower, upper). Using {@code
-        // end} (the bare user-key) as the exclusive upper bound deletes
-        // every entry whose user-key is strictly less than {@code end} —
-        // because for any user-key u == end, its encoded key starts with
-        // {@code end || some-byte} which sorts after {@code end} (a strict
-        // prefix is lexicographically smaller). NOT {@code
-        // afterAllVersionsOf(end)} — that would also catch user-keys whose
-        // bytes start with {@code end} and continue beyond, which is wrong
-        // for the half-open [start, end) semantics the caller asked for.
-        batch.deleteRange(StorageEngine.Cf.DEFAULT, start, end);
-        batch.deleteRange(StorageEngine.Cf.WRITE, start, end);
-        batch.deleteRange(StorageEngine.Cf.LOCK, start, end);
+        byte[] encodedStart = MvccKey.lockKey(start);
+        byte[] encodedEnd = MvccKey.lockKey(end);
+        batch.deleteRange(StorageEngine.Cf.DEFAULT, encodedStart, encodedEnd);
+        batch.deleteRange(StorageEngine.Cf.WRITE, encodedStart, encodedEnd);
+        batch.deleteRange(StorageEngine.Cf.LOCK, encodedStart, encodedEnd);
         return Result.ok(Kvrpcpb.DeleteRangeResponse.newBuilder().build().toByteArray());
     }
 
@@ -776,7 +814,8 @@ public final class MvccApplyHandler implements ApplyHandler {
         byte[] currentUserKey = null;
         boolean keptVisibleForCurrent = false;
 
-        try (var it = engine.newIterator(StorageEngine.Cf.WRITE, engine.newReadOptions())) {
+        try (var gcRo = engine.newReadOptions();
+             var it = engine.newIterator(StorageEngine.Cf.WRITE, gcRo)) {
             it.seek(new byte[]{0});
             while (it.isValid() && deletedWrite < MAX_GC_DELETES_PER_APPLY) {
                 byte[] mvccKey = it.key();

@@ -204,7 +204,7 @@ public final class RocksStorageEngine implements StorageEngine {
         try {
             return db.get(handle(cf), key);
         } catch (RocksDBException e) {
-            throw new RuntimeException("get failed", e);
+            throw StorageException.from("get", e);
         }
     }
 
@@ -214,7 +214,7 @@ public final class RocksStorageEngine implements StorageEngine {
             var ropts = ((RocksReadOptions) opts).inner();
             return db.get(handle(cf), ropts, key);
         } catch (RocksDBException e) {
-            throw new RuntimeException("get failed", e);
+            throw StorageException.from("get", e);
         }
     }
 
@@ -230,7 +230,7 @@ public final class RocksStorageEngine implements StorageEngine {
             }
             return db.multiGetAsList(handles, keyArr);
         } catch (RocksDBException e) {
-            throw new RuntimeException("multiGet failed", e);
+            throw StorageException.from("multiGet", e);
         }
     }
 
@@ -254,7 +254,7 @@ public final class RocksStorageEngine implements StorageEngine {
         try {
             db.flushWal(sync);
         } catch (RocksDBException e) {
-            throw new RuntimeException("flushWal failed", e);
+            throw StorageException.from("flushWal", e);
         }
     }
 
@@ -264,7 +264,7 @@ public final class RocksStorageEngine implements StorageEngine {
         try {
             db.write(sync ? syncWrite : noSyncWrite, rb.inner);
         } catch (RocksDBException e) {
-            throw new RuntimeException("rocksdb write failed", e);
+            throw StorageException.from("write", e);
         }
     }
 
@@ -294,7 +294,7 @@ public final class RocksStorageEngine implements StorageEngine {
             var paths = sstFiles.stream().map(Path::toString).toList();
             db.ingestExternalFile(handle(cf), paths, opts);
         } catch (RocksDBException e) {
-            throw new RuntimeException("ingestSst failed", e);
+            throw StorageException.from("ingestSst", e);
         }
     }
 
@@ -303,7 +303,7 @@ public final class RocksStorageEngine implements StorageEngine {
         try {
             db.compactRange(handle(cf), start, end);
         } catch (RocksDBException e) {
-            throw new RuntimeException("compactRange failed", e);
+            throw StorageException.from("compactRange", e);
         }
     }
 
@@ -332,19 +332,19 @@ public final class RocksStorageEngine implements StorageEngine {
 
         @Override public void put(Cf cf, byte[] key, byte[] value) {
             try { inner.put(handle(cf), key, value); }
-            catch (RocksDBException e) { throw new RuntimeException(e); }
+            catch (RocksDBException e) { throw StorageException.from("batch.put", e); }
         }
         @Override public void delete(Cf cf, byte[] key) {
             try { inner.delete(handle(cf), key); }
-            catch (RocksDBException e) { throw new RuntimeException(e); }
+            catch (RocksDBException e) { throw StorageException.from("batch.delete", e); }
         }
         @Override public void deleteRange(Cf cf, byte[] start, byte[] end) {
             try { inner.deleteRange(handle(cf), start, end); }
-            catch (RocksDBException e) { throw new RuntimeException(e); }
+            catch (RocksDBException e) { throw StorageException.from("batch.deleteRange", e); }
         }
         void deleteRangeInternal(ColumnFamilyHandle h, byte[] start, byte[] end) {
             try { inner.deleteRange(h, start, end); }
-            catch (RocksDBException e) { throw new RuntimeException(e); }
+            catch (RocksDBException e) { throw StorageException.from("batch.deleteRange", e); }
         }
         @Override public int count() { return inner.count(); }
         @Override public long byteSize() { return inner.getDataSize(); }
@@ -378,17 +378,23 @@ public final class RocksStorageEngine implements StorageEngine {
 
     private static final class RocksReadOptions implements ReadOptions {
         private final org.rocksdb.ReadOptions inner = new org.rocksdb.ReadOptions();
+        private org.rocksdb.Slice lowerSlice;
+        private org.rocksdb.Slice upperSlice;
         org.rocksdb.ReadOptions inner() { return inner; }
         @Override public ReadOptions snapshot(Snapshot snap) {
             inner.setSnapshot(((RocksSnapshot) snap).inner);
             return this;
         }
         @Override public ReadOptions iterateLowerBound(byte[] lower) {
-            inner.setIterateLowerBound(new org.rocksdb.Slice(lower));
+            if (lowerSlice != null) lowerSlice.close();
+            lowerSlice = new org.rocksdb.Slice(lower);
+            inner.setIterateLowerBound(lowerSlice);
             return this;
         }
         @Override public ReadOptions iterateUpperBound(byte[] upper) {
-            inner.setIterateUpperBound(new org.rocksdb.Slice(upper));
+            if (upperSlice != null) upperSlice.close();
+            upperSlice = new org.rocksdb.Slice(upper);
+            inner.setIterateUpperBound(upperSlice);
             return this;
         }
         @Override public ReadOptions fillCache(boolean fill) {
@@ -396,6 +402,11 @@ public final class RocksStorageEngine implements StorageEngine {
         }
         @Override public ReadOptions prefixSameAsStart(boolean v) {
             inner.setPrefixSameAsStart(v); return this;
+        }
+        @Override public void close() {
+            inner.close();
+            if (lowerSlice != null) { lowerSlice.close(); lowerSlice = null; }
+            if (upperSlice != null) { upperSlice.close(); upperSlice = null; }
         }
     }
 

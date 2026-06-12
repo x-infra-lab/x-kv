@@ -163,8 +163,18 @@ public final class TsoBatcherImpl implements TsoBatcher {
                     log.warn("TSO response with no pending batch — dropping");
                     return;
                 }
-                long firstTs = (resp.getTimestamp().getPhysical() << 18)
-                        | (resp.getTimestamp().getLogical() - resp.getCount() + 1);
+                long physical = resp.getTimestamp().getPhysical();
+                long lastLogical = resp.getTimestamp().getLogical();
+                int count = resp.getCount();
+                long firstLogical = lastLogical - count + 1;
+                if (firstLogical < 0) {
+                    for (var p : pr.batch) {
+                        p.future.completeExceptionally(
+                                new IllegalStateException("TSO batch crossed physical boundary"));
+                    }
+                    return;
+                }
+                long firstTs = (physical << 18) | firstLogical;
                 long cursor = firstTs;
                 for (var p : pr.batch) {
                     p.future.complete(cursor);

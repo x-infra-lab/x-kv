@@ -2,6 +2,7 @@ package io.github.xinfra.lab.xkv.kv.mvcc;
 
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Supplier;
 
@@ -50,13 +51,16 @@ public final class ConcurrencyManager {
 
     private final ReentrantReadWriteLock[] stripes;
     private final MaxTsTracker maxTs;
+    private final AtomicLong safeTs = new AtomicLong();
 
     public ConcurrencyManager(MaxTsTracker maxTs) {
         this(maxTs, DEFAULT_STRIPES);
     }
 
     public ConcurrencyManager(MaxTsTracker maxTs, int stripeCount) {
-        if (stripeCount <= 0) throw new IllegalArgumentException("stripeCount must be > 0");
+        if (stripeCount <= 0) {
+            throw new IllegalArgumentException("stripeCount > 0");
+        }
         this.maxTs = maxTs;
         this.stripes = new ReentrantReadWriteLock[stripeCount];
         for (int i = 0; i < stripeCount; i++) {
@@ -67,6 +71,12 @@ public final class ConcurrencyManager {
 
     public MaxTsTracker maxTs() { return maxTs; }
     public int stripeCount() { return stripes.length; }
+
+    public void observeSafeTs(long ts) {
+        safeTs.updateAndGet(prev -> Math.max(prev, ts));
+    }
+
+    public long safeTs() { return safeTs.get(); }
 
     // =====================================================================
     // Reader paths

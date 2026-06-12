@@ -24,9 +24,10 @@ public interface ApplyHandler {
      */
     Result apply(ProposalCodec.Decoded decoded, StorageEngine.WriteBatch batch);
 
-    record Result(boolean success, byte[] response, String errorMessage) {
-        public static Result ok(byte[] resp) { return new Result(true, resp, null); }
-        public static Result ok() { return new Result(true, null, null); }
-        public static Result err(String msg) { return new Result(false, null, msg); }
+    record Result(boolean success, byte[] response, String errorMessage, Runnable postFlush) {
+        public static Result ok(byte[] resp) { return new Result(true, resp, null, null); }
+        public static Result ok() { return new Result(true, null, null, null); }
+        public static Result okWithPostFlush(Runnable r) { return new Result(true, null, null, r); }
+        public static Result err(String msg) { return new Result(false, null, msg, null); }
     }
 }

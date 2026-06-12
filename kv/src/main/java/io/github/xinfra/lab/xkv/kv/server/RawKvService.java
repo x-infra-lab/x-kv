@@ -98,8 +98,8 @@ public final class RawKvService {
         boolean keyOnly = req.getKeyOnly();
         int limit = req.getLimit() <= 0 ? Integer.MAX_VALUE : req.getLimit();
 
-        var ro = engine.newReadOptions();
-        try (var it = engine.newIterator(StorageEngine.Cf.DEFAULT, ro)) {
+        try (var ro = engine.newReadOptions();
+             var it = engine.newIterator(StorageEngine.Cf.DEFAULT, ro)) {
             if (req.getReverse()) {
                 // Reverse scan: start is exclusive upper bound, end is inclusive lower bound.
                 it.seekForPrev(start == null ? new byte[0] : start);
@@ -287,6 +287,13 @@ public final class RawKvService {
             log.warn("readIndex failed for region={}: {}", peer.regionId(), e.getMessage());
             return notLeaderError(peer.regionId());
         }
+        if (followerRead && ctx.getStaleReadSafeTs() > 0) {
+            long safeTs = ctx.getStaleReadSafeTs();
+            long currentMaxTs = peer.maxTs();
+            if (currentMaxTs < safeTs) {
+                return dataIsNotReadyError(peer.regionId(), peer.self().getId(), safeTs);
+            }
+        }
         return null;
     }
 
@@ -329,6 +336,18 @@ public final class RawKvService {
                 .setMessage("not leader")
                 .setNotLeader(io.github.xinfra.lab.xkv.proto.Errorpb.NotLeader.newBuilder()
                         .setRegionId(regionId)
+                        .build())
+                .build();
+    }
+
+    static io.github.xinfra.lab.xkv.proto.Errorpb.Error dataIsNotReadyError(
+            long regionId, long peerId, long safeTs) {
+        return io.github.xinfra.lab.xkv.proto.Errorpb.Error.newBuilder()
+                .setMessage("data is not ready")
+                .setDataIsNotReady(io.github.xinfra.lab.xkv.proto.Errorpb.DataIsNotReady.newBuilder()
+                        .setRegionId(regionId)
+                        .setPeerId(peerId)
+                        .setSafeTs(safeTs)
                         .build())
                 .build();
     }

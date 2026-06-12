@@ -2,6 +2,7 @@ package io.github.xinfra.lab.xkv.test;
 
 import com.google.protobuf.ByteString;
 import io.github.xinfra.lab.xkv.pd.state.InMemoryPdStateMachine;
+import io.github.xinfra.lab.xkv.pd.state.OperatorControllerImpl;
 import io.github.xinfra.lab.xkv.pd.state.OperatorQueue;
 import io.github.xinfra.lab.xkv.pd.state.RegionBalanceScheduler;
 import io.github.xinfra.lab.xkv.proto.Metapb;
@@ -45,7 +46,8 @@ final class RegionBalanceSchedulerTest {
         }
 
         var ops = new OperatorQueue();
-        var scheduler = new RegionBalanceScheduler(state, ops, /* intervalMs= */ 60_000);
+        var controller = new OperatorControllerImpl(ops, 64, 600_000);
+        var scheduler = new RegionBalanceScheduler(state, controller, /* intervalMs= */ 60_000);
         try {
             int round1 = scheduler.runOnce();
             assertThat(round1).isGreaterThan(0);

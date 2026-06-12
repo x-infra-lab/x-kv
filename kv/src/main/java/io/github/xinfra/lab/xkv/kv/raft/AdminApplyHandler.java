@@ -173,19 +173,16 @@ public final class AdminApplyHandler implements ApplyHandler {
                 hex(req.getUpdatedParent().getEndKey().toByteArray()),
                 req.getChildrenCount());
 
-        // Fire the observer AFTER staging. For simplicity we fire
-        // synchronously here — the observer should be fast (refresh
-        // descriptor, enqueue spawn request); slow work belongs in a
-        // worker. The batch isn't fsync'd YET when this runs, but the
-        // children's descriptors are already staged — they become visible
-        // immediately after the apply loop's flushWal.
         if (splitObserver != null) {
-            try {
-                splitObserver.onSplit(req.getUpdatedParent(), req.getChildrenList());
-            } catch (Throwable t) {
-                log.warn("split observer failed parent={}",
-                        req.getUpdatedParent().getId(), t);
-            }
+            var parent = req.getUpdatedParent();
+            var children = req.getChildrenList();
+            return Result.okWithPostFlush(() -> {
+                try {
+                    splitObserver.onSplit(parent, children);
+                } catch (Throwable t) {
+                    log.warn("split observer failed parent={}", parent.getId(), t);
+                }
+            });
         }
         return Result.ok();
     }
@@ -257,6 +254,30 @@ public final class AdminApplyHandler implements ApplyHandler {
                     + req.getMergedTarget().getId() + " != local region_id " + raftEngine.regionId());
         }
 
+        // Validate source region epoch against persisted state to prevent
+        // absorbing a range that has been split or re-merged since the
+        // proposal was created.
+        if (storage != null) {
+            byte[] storedSourceBytes = storage.get(StorageEngine.Cf.RAFT,
+                    io.github.xinfra.lab.xkv.kv.engine.RaftCfKeys.regionKey(
+                            req.getSourceRegion().getId()));
+            if (storedSourceBytes != null) {
+                try {
+                    var stored = Metapb.Region.parseFrom(storedSourceBytes);
+                    var se = stored.getRegionEpoch();
+                    var re = req.getSourceRegion().getRegionEpoch();
+                    if (se.getConfVer() != re.getConfVer()
+                            || se.getVersion() != re.getVersion()) {
+                        return Result.err("ADMIN_COMMIT_MERGE: source epoch mismatch: stored=("
+                                + se.getConfVer() + "," + se.getVersion()
+                                + ") req=(" + re.getConfVer() + "," + re.getVersion() + ")");
+                    }
+                } catch (com.google.protobuf.InvalidProtocolBufferException e) {
+                    log.warn("ADMIN_COMMIT_MERGE: cannot parse stored source region", e);
+                }
+            }
+        }
+
         // 1. Save target's new descriptor.
         raftEngine.saveRegion(req.getMergedTarget(), batch);
         // 2. Drop source's region descriptor.
@@ -271,11 +292,15 @@ public final class AdminApplyHandler implements ApplyHandler {
                 hex(req.getMergedTarget().getEndKey().toByteArray()));
 
         if (mergeObserver != null) {
-            try { mergeObserver.onMerge(req.getMergedTarget(), req.getSourceRegion()); }
-            catch (Throwable t) {
-                log.warn("merge observer failed target={} source={}",
-                        req.getMergedTarget().getId(), req.getSourceRegion().getId(), t);
-            }
+            var mergedTarget = req.getMergedTarget();
+            var sourceRegion = req.getSourceRegion();
+            return Result.okWithPostFlush(() -> {
+                try { mergeObserver.onMerge(mergedTarget, sourceRegion); }
+                catch (Throwable t) {
+                    log.warn("merge observer failed target={} source={}",
+                            mergedTarget.getId(), sourceRegion.getId(), t);
+                }
+            });
         }
         return Result.ok();
     }

@@ -44,7 +44,7 @@ public final class RegionBalanceScheduler implements AutoCloseable {
     public static final int MAX_OPERATORS_PER_TICK = 4;
 
     private final PdStateMachine state;
-    private final OperatorQueue operators;
+    private final OperatorController controller;
     private final StoreStatsCache storeStats;
     private final long intervalMs;
     private final ScheduledExecutorService timer;
@@ -55,14 +55,14 @@ public final class RegionBalanceScheduler implements AutoCloseable {
     /** Stores with available ratio below this threshold are not AddPeer targets. */
     private static final double LOW_SPACE_RATIO = 0.05;
 
-    public RegionBalanceScheduler(PdStateMachine state, OperatorQueue operators, long intervalMs) {
-        this(state, operators, new StoreStatsCache(), intervalMs);
+    public RegionBalanceScheduler(PdStateMachine state, OperatorController controller, long intervalMs) {
+        this(state, controller, new StoreStatsCache(), intervalMs);
     }
 
-    public RegionBalanceScheduler(PdStateMachine state, OperatorQueue operators,
+    public RegionBalanceScheduler(PdStateMachine state, OperatorController controller,
                                    StoreStatsCache storeStats, long intervalMs) {
         this.state = state;
-        this.operators = operators;
+        this.controller = controller;
         this.storeStats = storeStats;
         this.intervalMs = intervalMs;
         this.timer = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -116,8 +116,10 @@ public final class RegionBalanceScheduler implements AutoCloseable {
         for (var e : byStore.entrySet()) counts.put(e.getKey(), e.getValue().size());
 
         while (scheduled < MAX_OPERATORS_PER_TICK) {
-            long maxStore = -1, minStore = -1;
-            int max = Integer.MIN_VALUE, min = Integer.MAX_VALUE;
+            long maxStore = -1;
+            long minStore = -1;
+            int max = Integer.MIN_VALUE;
+            int min = Integer.MAX_VALUE;
             for (var e : counts.entrySet()) {
                 if (e.getValue() > max) { max = e.getValue(); maxStore = e.getKey(); }
                 // Skip busy stores and stores with critically low disk space.
@@ -150,7 +152,17 @@ public final class RegionBalanceScheduler implements AutoCloseable {
             long newPeerId = state.allocId(1);
             var newPeer = Metapb.Peer.newBuilder()
                     .setId(newPeerId).setStoreId(minStore).setRole(Metapb.PeerRole.Voter).build();
-            operators.scheduleChangePeer(target.getId(), newPeer, Pdpb.ConfChangeType.AddNode);
+            var resp = Pdpb.RegionHeartbeatResponse.newBuilder()
+                    .setRegionId(target.getId())
+                    .setChangePeer(newPeer)
+                    .addChangePeerV2(Pdpb.ChangePeer.newBuilder()
+                            .setPeer(newPeer).setChangeType(Pdpb.ConfChangeType.AddNode).build())
+                    .build();
+            var op = new SimpleOperator(
+                    System.nanoTime(), target.getId(), Operator.Kind.BALANCE_REGION,
+                    "region-balance: add peer on store " + minStore,
+                    resp, java.util.Set.of(minStore));
+            if (!controller.addOperator(op)) continue;
             operatorsScheduled.incrementAndGet();
             scheduled++;
             byStore.computeIfAbsent(minStore, k -> new ArrayList<>()).add(target);

@@ -75,12 +75,16 @@ public final class RegionCacheImpl implements RegionCache {
             var resp = pdClient.blockingStub().getRegionByID(Pdpb.GetRegionByIDRequest.newBuilder()
                     .setRegionId(regionId).build());
             if (!resp.hasRegion()) return Optional.empty();
-            var info = new RegionInfo(resp.getRegion(), resp.hasLeader() ? resp.getLeader() : Metapb.Peer.getDefaultInstance());
+            var leader = resp.hasLeader()
+                    ? resp.getLeader() : Metapb.Peer.getDefaultInstance();
+            var info = new RegionInfo(resp.getRegion(), leader);
             update(info.region(), info.leader());
             return Optional.of(info);
-        } catch (Throwable t) {
-            log.debug("locateRegion id={} from PD failed: {}", regionId, t.getMessage());
+        } catch (io.grpc.StatusRuntimeException e) {
+            log.debug("locateRegion id={} from PD failed: {}", regionId, e.getMessage());
             return Optional.empty();
+        } catch (Throwable t) {
+            throw new RuntimeException("locateRegion PD call failed for id=" + regionId, t);
         }
     }
 

@@ -77,7 +77,7 @@ public final class LogCompactionWorker implements AutoCloseable {
     }
 
     public void start() {
-        timer.scheduleAtFixedRate(this::tickSafely, intervalMs, intervalMs, TimeUnit.MILLISECONDS);
+        timer.scheduleWithFixedDelay(this::tickSafely, intervalMs, intervalMs, TimeUnit.MILLISECONDS);
         log.info("LogCompactionWorker started: interval={}ms gapThreshold={} safetyMargin={}",
                 intervalMs, gapThreshold, safetyMargin);
     }

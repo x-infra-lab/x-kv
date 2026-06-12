@@ -24,27 +24,21 @@ import io.github.xinfra.lab.xkv.kv.transport.DeadlockClient;
 import io.github.xinfra.lab.xkv.kv.transport.GrpcRaftTransport;
 import io.github.xinfra.lab.xkv.kv.transport.PdEndpointManager;
 import io.github.xinfra.lab.xkv.kv.transport.RaftMessageDispatcher;
-import io.github.xinfra.lab.xkv.common.auth.AuthClientInterceptor;
 import io.github.xinfra.lab.xkv.common.auth.AuthServerInterceptor;
 import io.github.xinfra.lab.xkv.common.logging.MdcServerInterceptor;
-import io.github.xinfra.lab.xkv.common.metrics.GrpcClientMetricsInterceptor;
 import io.github.xinfra.lab.xkv.common.metrics.GrpcServerMetricsInterceptor;
 import io.github.xinfra.lab.xkv.common.metrics.MetricsHttpServer;
 import io.github.xinfra.lab.xkv.common.metrics.XKvMetrics;
 import io.github.xinfra.lab.xkv.common.ratelimit.ConcurrencyLimitInterceptor;
 import io.github.xinfra.lab.xkv.common.ratelimit.DrainingInterceptor;
 import io.github.xinfra.lab.xkv.common.tls.GrpcChannelFactory;
-import io.github.xinfra.lab.xkv.common.tls.TlsConfig;
 import io.github.xinfra.lab.xkv.proto.Metapb;
 import io.github.xinfra.lab.xkv.proto.PDGrpc;
 import io.github.xinfra.lab.xkv.proto.Pdpb;
-import io.grpc.ClientInterceptor;
 import io.grpc.Server;
-import io.grpc.netty.shaded.io.grpc.netty.NettyServerBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.file.Files;
 import java.util.ArrayList;
@@ -140,11 +134,16 @@ public final class KvServer {
         //    as soon as they start.
         var snapshotEngine = new SnapshotEngineImpl(engine, config.dataDir().resolve("snap"));
         var r = GrpcChannelFactory.parseHostPort(config.raftAddress());
-        raftServer = GrpcChannelFactory.serverBuilder(
+        var raftBuilder = GrpcChannelFactory.serverBuilder(
                         new InetSocketAddress(r.host(), r.port()), config.raftTls())
-                .addService(new KvRaftServiceImpl(dispatcher, snapshotEngine))
-                .build()
-                .start();
+                .addService(new KvRaftServiceImpl(dispatcher, snapshotEngine));
+        if (config.maxConcurrentRequests() > 0) {
+            raftBuilder.intercept(new ConcurrencyLimitInterceptor(config.maxConcurrentRequests()));
+        }
+        if (config.authToken() != null) {
+            raftBuilder.intercept(new AuthServerInterceptor(config.authToken()));
+        }
+        raftServer = raftBuilder.build().start();
 
         // On-demand spawn handler for regions this store doesn't yet host.
         dispatcher.setMissingHandler((regionId, firstMsg) -> {
@@ -192,8 +191,11 @@ public final class KvServer {
         var clientServerBuilder = GrpcChannelFactory.serverBuilder(
                         new InetSocketAddress(c.host(), c.port()), config.clientTls())
                 .addService(new TikvServiceImpl(rawKvService, txnService, copService, splitDriver, locator))
-                .addService(new DebugServiceImpl(metricsRegistry, store, engine, storeMeta, config.dataDir()))
                 .addService(cdcService);
+        if (config.enableDebugService()) {
+            clientServerBuilder.addService(
+                    new DebugServiceImpl(metricsRegistry, store, engine, storeMeta, config.dataDir()));
+        }
         // Interceptor order: last .intercept() is outermost (executed first).
         // Desired: drain → auth → rateLimit → mdc → metrics (innermost)
         clientServerBuilder.intercept(new GrpcServerMetricsInterceptor(metricsRegistry, config.slowLogThresholdMs()));
@@ -504,11 +506,11 @@ public final class KvServer {
                                          SnapshotEngineImpl snapshotEngine) {
         byte[] prefix = RaftCfKeys.allRegionKeysPrefix();
         byte[] end = RaftCfKeys.allRegionKeysEnd();
-        var ro = engine.newReadOptions()
+        int recovered = 0;
+        try (var ro = engine.newReadOptions()
                 .iterateLowerBound(prefix)
                 .iterateUpperBound(end);
-        int recovered = 0;
-        try (var it = engine.newIterator(StorageEngine.Cf.RAFT, ro)) {
+             var it = engine.newIterator(StorageEngine.Cf.RAFT, ro)) {
             for (it.seek(prefix); it.isValid(); it.next()) {
                 long regionId = RaftCfKeys.regionIdFromKey(it.key());
                 if (store.peerForRegion(regionId).isPresent()) continue;

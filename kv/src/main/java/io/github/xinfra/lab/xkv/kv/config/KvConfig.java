@@ -36,6 +36,7 @@ public final class KvConfig {
     private final WorkerConfig worker;
     private final long slowLogThresholdMs;
     private final long drainTimeoutMs;
+    private final boolean enableDebugService;
 
     private KvConfig(Builder b) {
         this.storeId = b.storeId;
@@ -54,6 +55,7 @@ public final class KvConfig {
         this.worker = b.worker == null ? WorkerConfig.defaults() : b.worker;
         this.slowLogThresholdMs = b.slowLogThresholdMs;
         this.drainTimeoutMs = b.drainTimeoutMs;
+        this.enableDebugService = b.enableDebugService;
     }
 
     public long storeId() { return storeId; }
@@ -72,6 +74,7 @@ public final class KvConfig {
     public WorkerConfig worker() { return worker; }
     public long slowLogThresholdMs() { return slowLogThresholdMs; }
     public long drainTimeoutMs() { return drainTimeoutMs; }
+    public boolean enableDebugService() { return enableDebugService; }
 
     public static Builder builder() { return new Builder(); }
 
@@ -147,6 +150,7 @@ public final class KvConfig {
         private WorkerConfig worker;
         private long slowLogThresholdMs = 1000;
         private long drainTimeoutMs = 10_000;
+        private boolean enableDebugService = false;
 
         public Builder storeId(long v)            { this.storeId = v; return this; }
         public Builder pdEndpoints(List<String> v){ this.pdEndpoints = v; return this; }
@@ -164,6 +168,7 @@ public final class KvConfig {
         public Builder worker(WorkerConfig v)     { this.worker = v; return this; }
         public Builder slowLogThresholdMs(long v) { this.slowLogThresholdMs = v; return this; }
         public Builder drainTimeoutMs(long v) { this.drainTimeoutMs = v; return this; }
+        public Builder enableDebugService(boolean v) { this.enableDebugService = v; return this; }
         public KvConfig build() { return new KvConfig(this); }
     }
 }

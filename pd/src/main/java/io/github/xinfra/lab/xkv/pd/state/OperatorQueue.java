@@ -58,6 +58,15 @@ public final class OperatorQueue {
         offer(regionId, resp);
     }
 
+    /** Schedule a region merge — the leader will absorb {@code target}. */
+    public void scheduleMerge(long regionId, Metapb.Region target) {
+        var resp = Pdpb.RegionHeartbeatResponse.newBuilder()
+                .setRegionId(regionId)
+                .setMerge(Pdpb.Merge.newBuilder().setTarget(target).build())
+                .build();
+        offer(regionId, resp);
+    }
+
     /** Schedule a region split at the provided user-keys. */
     public void scheduleSplit(long regionId, java.util.List<byte[]> splitKeys, Pdpb.SplitRegion.Policy policy) {
         var sr = Pdpb.SplitRegion.newBuilder().setPolicy(policy);
@@ -86,7 +95,7 @@ public final class OperatorQueue {
     /** Drop every queued operator (used on PD shutdown). */
     public void clear() { byRegion.clear(); }
 
-    private void offer(long regionId, Pdpb.RegionHeartbeatResponse op) {
+    void offer(long regionId, Pdpb.RegionHeartbeatResponse op) {
         byRegion.computeIfAbsent(regionId, k -> new ConcurrentLinkedQueue<>()).offer(op);
     }
 }
