@@ -291,7 +291,7 @@ public final class MvccTxn {
         Write writeRecord;
         if (wt == Write.Type.PUT) {
             // Try to inline a short value to save the secondary read on Get.
-            byte[] sv = readerEngine().get(StorageEngine.Cf.DEFAULT, MvccKey.encode(key, startTs));
+            byte[] sv = readerEngine().get(StorageEngine.Cf.DEFAULT, MvccKey.encode(key, startTs), reader.snapshotReadOpts());
             if (sv != null && sv.length <= Write.SHORT_VALUE_MAX_LEN) {
                 writeRecord = Write.put(startTs, sv);
                 // Drop the default CF entry to avoid duplication.
@@ -412,7 +412,10 @@ public final class MvccTxn {
 
     public void pessimisticRollback(byte[] key, long startTs, long forUpdateTs) {
         var lockOpt = reader.readLock(key);
-        if (lockOpt.isPresent() && lockOpt.get().startTs() == startTs && lockOpt.get().isPessimistic()) {
+        if (lockOpt.isPresent()
+                && lockOpt.get().startTs() == startTs
+                && lockOpt.get().isPessimistic()
+                && lockOpt.get().forUpdateTs() <= forUpdateTs) {
             batch.delete(StorageEngine.Cf.LOCK, MvccKey.lockKey(key));
         }
     }

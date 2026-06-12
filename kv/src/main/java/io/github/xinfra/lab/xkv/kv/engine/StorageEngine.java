@@ -126,12 +126,13 @@ public interface StorageEngine extends AutoCloseable {
         @Override void close();
     }
 
-    interface ReadOptions {
+    interface ReadOptions extends AutoCloseable {
         ReadOptions snapshot(Snapshot snap);
         ReadOptions iterateLowerBound(byte[] lower);
         ReadOptions iterateUpperBound(byte[] upper);
         ReadOptions fillCache(boolean fill);
         ReadOptions prefixSameAsStart(boolean v);
+        @Override void close();
     }
 
     /** Fresh ReadOptions; the engine binds defaults. */

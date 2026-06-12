@@ -66,6 +66,7 @@ public final class PdRaftNode implements AutoCloseable {
     private volatile long currentLeaderId;
     private volatile boolean running = true;
     private long appliedIndex;
+    private volatile java.util.function.Consumer<Boolean> externalLeaderObserver;
 
     private final Thread readyThread;
     private final ScheduledExecutorService tickTimer;
@@ -130,6 +131,11 @@ public final class PdRaftNode implements AutoCloseable {
                 } else {
                     stateMachine.onLoseLeader();
                 }
+                var cb = externalLeaderObserver;
+                if (cb != null) {
+                    try { cb.accept(isLeader); }
+                    catch (Throwable t) { log.warn("external leader observer failed", t); }
+                }
             }
         });
 
@@ -193,6 +199,10 @@ public final class PdRaftNode implements AutoCloseable {
             log.warn("pd-raft replay entry at index={} failed: {}",
                     entry.getIndex(), t.getMessage());
         }
+    }
+
+    public void setLeaderObserver(java.util.function.Consumer<Boolean> observer) {
+        this.externalLeaderObserver = observer;
     }
 
     public boolean isLeader() {

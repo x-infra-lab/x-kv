@@ -506,11 +506,11 @@ public final class KvServer {
                                          SnapshotEngineImpl snapshotEngine) {
         byte[] prefix = RaftCfKeys.allRegionKeysPrefix();
         byte[] end = RaftCfKeys.allRegionKeysEnd();
-        var ro = engine.newReadOptions()
+        int recovered = 0;
+        try (var ro = engine.newReadOptions()
                 .iterateLowerBound(prefix)
                 .iterateUpperBound(end);
-        int recovered = 0;
-        try (var it = engine.newIterator(StorageEngine.Cf.RAFT, ro)) {
+             var it = engine.newIterator(StorageEngine.Cf.RAFT, ro)) {
             for (it.seek(prefix); it.isValid(); it.next()) {
                 long regionId = RaftCfKeys.regionIdFromKey(it.key());
                 if (store.peerForRegion(regionId).isPresent()) continue;

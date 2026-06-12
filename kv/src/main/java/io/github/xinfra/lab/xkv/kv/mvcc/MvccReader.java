@@ -58,7 +58,7 @@ public final class MvccReader implements AutoCloseable {
     public StorageEngine engine() { return engine; }
 
     /** Snapshot-bound ReadOptions for use by MvccTxn helper methods. */
-    StorageEngine.ReadOptions snapshotReadOpts() { return cachedReadOpts; }
+    public StorageEngine.ReadOptions snapshotReadOpts() { return cachedReadOpts; }
 
     /** Get visible value at {@code readTs}. Empty => not found. */
     public Optional<byte[]> get(byte[] userKey, long readTs) {
@@ -114,7 +114,7 @@ public final class MvccReader implements AutoCloseable {
      * {@code end} (exclusive). Returns at most {@code limit} (k, v) pairs
      * visible to {@code readTs}.
      */
-    public List<KvPair> scan(byte[] start, byte[] end, int limit, long readTs) {
+    public ScanResult scan(byte[] start, byte[] end, int limit, long readTs) {
         var out = new ArrayList<KvPair>();
         try (var it = engine.newIterator(StorageEngine.Cf.WRITE, cachedReadOpts)) {
             byte[] cursor = MvccKey.encode(start, readTs);
@@ -126,7 +126,11 @@ public final class MvccReader implements AutoCloseable {
                     break;
                 }
                 if (!ignoreLocks) {
-                    checkLockBlocking(currentUser, readTs);
+                    try {
+                        checkLockBlocking(currentUser, readTs);
+                    } catch (KeyLockedException e) {
+                        return new ScanResult(out, e);
+                    }
                 }
                 Write visible = walkForVisible(it, currentUser, readTs);
                 if (visible != null && visible.type() == Write.Type.PUT) {
@@ -136,14 +140,14 @@ public final class MvccReader implements AutoCloseable {
                 cursor = MvccKey.afterAllVersionsOf(currentUser);
             }
         }
-        return out;
+        return new ScanResult(out, null);
     }
 
     /**
      * Reverse range scan starting at {@code start} (exclusive upper bound)
      * down to {@code end} (inclusive lower bound).
      */
-    public List<KvPair> reverseScan(byte[] start, byte[] end, int limit, long readTs) {
+    public ScanResult reverseScan(byte[] start, byte[] end, int limit, long readTs) {
         var out = new ArrayList<KvPair>();
         try (var it = engine.newIterator(StorageEngine.Cf.WRITE, cachedReadOpts)) {
             byte[] seekKey = MvccKey.encode(start, 0);
@@ -159,7 +163,11 @@ public final class MvccReader implements AutoCloseable {
                     break;
                 }
                 if (!ignoreLocks) {
-                    checkLockBlocking(currentUser, readTs);
+                    try {
+                        checkLockBlocking(currentUser, readTs);
+                    } catch (KeyLockedException e) {
+                        return new ScanResult(out, e);
+                    }
                 }
                 Write visible = findVisibleWrite(currentUser, readTs);
                 if (visible != null && visible.type() == Write.Type.PUT) {
@@ -170,7 +178,7 @@ public final class MvccReader implements AutoCloseable {
                 it.seekForPrev(decrement(firstVer));
             }
         }
-        return out;
+        return new ScanResult(out, null);
     }
 
     private static byte[] decrement(byte[] key) {
@@ -187,9 +195,11 @@ public final class MvccReader implements AutoCloseable {
 
     public record KvPair(byte[] key, byte[] value) {}
 
+    public record ScanResult(List<KvPair> pairs, KeyLockedException lockError) {}
+
     @Override
     public void close() {
-        // ReadOptions wraps native memory; release it.
+        cachedReadOpts.close();
     }
 
     // ============================================================

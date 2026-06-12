@@ -10,8 +10,8 @@
         <version>0.2.0</version>
     </parent>
 
-    <artifactId>x-proto</artifactId>
-    <name>x-proto</name>
+    <artifactId>x-kv-proto</artifactId>
+    <name>x-kv-proto</name>
     <description>
         Wire protocol for x-kv: protobuf message definitions + gRPC service stubs.
         Generated sources land in target/generated-sources/protobuf/ and are

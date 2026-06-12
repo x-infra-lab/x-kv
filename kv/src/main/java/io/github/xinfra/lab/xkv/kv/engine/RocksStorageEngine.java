@@ -378,17 +378,23 @@ public final class RocksStorageEngine implements StorageEngine {
 
     private static final class RocksReadOptions implements ReadOptions {
         private final org.rocksdb.ReadOptions inner = new org.rocksdb.ReadOptions();
+        private org.rocksdb.Slice lowerSlice;
+        private org.rocksdb.Slice upperSlice;
         org.rocksdb.ReadOptions inner() { return inner; }
         @Override public ReadOptions snapshot(Snapshot snap) {
             inner.setSnapshot(((RocksSnapshot) snap).inner);
             return this;
         }
         @Override public ReadOptions iterateLowerBound(byte[] lower) {
-            inner.setIterateLowerBound(new org.rocksdb.Slice(lower));
+            if (lowerSlice != null) lowerSlice.close();
+            lowerSlice = new org.rocksdb.Slice(lower);
+            inner.setIterateLowerBound(lowerSlice);
             return this;
         }
         @Override public ReadOptions iterateUpperBound(byte[] upper) {
-            inner.setIterateUpperBound(new org.rocksdb.Slice(upper));
+            if (upperSlice != null) upperSlice.close();
+            upperSlice = new org.rocksdb.Slice(upper);
+            inner.setIterateUpperBound(upperSlice);
             return this;
         }
         @Override public ReadOptions fillCache(boolean fill) {
@@ -396,6 +402,11 @@ public final class RocksStorageEngine implements StorageEngine {
         }
         @Override public ReadOptions prefixSameAsStart(boolean v) {
             inner.setPrefixSameAsStart(v); return this;
+        }
+        @Override public void close() {
+            inner.close();
+            if (lowerSlice != null) { lowerSlice.close(); lowerSlice = null; }
+            if (upperSlice != null) { upperSlice.close(); upperSlice = null; }
         }
     }
 

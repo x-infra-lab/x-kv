@@ -107,12 +107,12 @@ public final class SnapshotEngineImpl implements SnapshotEngine {
                           KvServerpb.SnapshotMeta.Builder meta,
                           boolean metaAlreadyEmitted,
                           Consumer<KvServerpb.SnapshotChunk> sink) {
-        var ro = storage.newReadOptions().snapshot(snap);
         long bytes = 0;
         int chunkIndex = 0;
         var buf = new java.io.ByteArrayOutputStream(CHUNK_BYTE_TARGET);
         boolean firstEmit = true;
-        try (var it = storage.newIterator(cf, ro)) {
+        try (var ro = storage.newReadOptions().snapshot(snap);
+             var it = storage.newIterator(cf, ro)) {
             byte[] from = (startKey == null || startKey.length == 0)
                     ? new byte[]{0}
                     : MvccKey.lockKey(startKey);

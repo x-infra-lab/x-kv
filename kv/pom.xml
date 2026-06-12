@@ -17,11 +17,11 @@
     <dependencies>
         <dependency>
             <groupId>io.github.x-infra-lab</groupId>
-            <artifactId>x-common</artifactId>
+            <artifactId>x-kv-common</artifactId>
         </dependency>
         <dependency>
             <groupId>io.github.x-infra-lab</groupId>
-            <artifactId>x-proto</artifactId>
+            <artifactId>x-kv-proto</artifactId>
         </dependency>
 
         <dependency>

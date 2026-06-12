@@ -98,8 +98,8 @@ public final class RawKvService {
         boolean keyOnly = req.getKeyOnly();
         int limit = req.getLimit() <= 0 ? Integer.MAX_VALUE : req.getLimit();
 
-        var ro = engine.newReadOptions();
-        try (var it = engine.newIterator(StorageEngine.Cf.DEFAULT, ro)) {
+        try (var ro = engine.newReadOptions();
+             var it = engine.newIterator(StorageEngine.Cf.DEFAULT, ro)) {
             if (req.getReverse()) {
                 // Reverse scan: start is exclusive upper bound, end is inclusive lower bound.
                 it.seekForPrev(start == null ? new byte[0] : start);

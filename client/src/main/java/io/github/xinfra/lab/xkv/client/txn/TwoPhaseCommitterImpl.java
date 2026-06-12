@@ -111,6 +111,7 @@ public final class TwoPhaseCommitterImpl implements TwoPhaseCommitter {
 
             var resp = doPrewriteGroup(ctx, primary, entry.getValue());
             if (resp.getErrorsCount() > 0) {
+                cleanupPrimary(ctx.startTs(), primary);
                 return CommitResult.rolledBack("prewrite errors: " + resp.getErrorsList());
             }
         }
@@ -246,6 +247,25 @@ public final class TwoPhaseCommitterImpl implements TwoPhaseCommitter {
                     return stub.kvPrewrite(b.build());
                 },
                 Kvrpcpb.PrewriteResponse::getRegionError);
+    }
+
+    private void cleanupPrimary(long startTs, byte[] primary) {
+        try {
+            sender.sendKeyed(primary, new BackofferImpl(backoffCfg),
+                    (stub, info) -> stub.kvBatchRollback(
+                            Kvrpcpb.BatchRollbackRequest.newBuilder()
+                                    .setContext(Kvrpcpb.Context.newBuilder()
+                                            .setRegionId(info.region().getId())
+                                            .setRegionEpoch(info.region().getRegionEpoch())
+                                            .setPeer(info.leader())
+                                            .build())
+                                    .setStartVersion(startTs)
+                                    .addKeys(ByteString.copyFrom(primary))
+                                    .build()),
+                    Kvrpcpb.BatchRollbackResponse::getRegionError);
+        } catch (Throwable t) {
+            log.debug("primary cleanup failed (lock resolver will handle): {}", t.getMessage());
+        }
     }
 
     private Map<byte[], List<Kvrpcpb.Mutation>> groupMutationsByRegion(List<Kvrpcpb.Mutation> sorted) {

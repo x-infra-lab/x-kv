@@ -133,6 +133,25 @@ public final class PdServer {
         operatorController = new io.github.xinfra.lab.xkv.pd.state.OperatorControllerImpl(
                 operators, config.scheduler().maxOperatorsPerStore(), OPERATOR_TIMEOUT_MS);
 
+        if (config.peers().isEmpty()) {
+            startSchedulers();
+        } else {
+            raftNode.setLeaderObserver(isLeader -> {
+                if (isLeader) {
+                    startSchedulers();
+                } else {
+                    stopSchedulers();
+                }
+            });
+        }
+    }
+
+    private volatile boolean schedulersRunning = false;
+
+    private synchronized void startSchedulers() {
+        if (schedulersRunning) return;
+        log.info("PD node {} starting schedulers (became leader)", config.nodeId());
+
         leaderBalance = new io.github.xinfra.lab.xkv.pd.state.LeaderBalanceScheduler(
                 state, operatorController, storeStatsCache, LEADER_BALANCE_INTERVAL_MS);
         leaderBalance.start();
@@ -158,6 +177,20 @@ public final class PdServer {
         ruleChecker = new io.github.xinfra.lab.xkv.pd.state.RuleCheckerScheduler(
                 state, operatorController, storeStatsCache, RULE_CHECKER_INTERVAL_MS);
         ruleChecker.start();
+
+        schedulersRunning = true;
+    }
+
+    private synchronized void stopSchedulers() {
+        if (!schedulersRunning) return;
+        log.info("PD node {} stopping schedulers (lost leadership)", config.nodeId());
+        if (ruleChecker != null) { ruleChecker.close(); ruleChecker = null; }
+        if (mergeChecker != null) { mergeChecker.close(); mergeChecker = null; }
+        if (hotRegion != null) { hotRegion.close(); hotRegion = null; }
+        if (splitChecker != null) { splitChecker.close(); splitChecker = null; }
+        if (regionBalance != null) { regionBalance.close(); regionBalance = null; }
+        if (leaderBalance != null) { leaderBalance.close(); leaderBalance = null; }
+        schedulersRunning = false;
     }
 
     /**
@@ -239,13 +272,8 @@ public final class PdServer {
         if (metricsHttpServer != null) {
             try { metricsHttpServer.close(); } catch (Exception ignored) {}
         }
-        if (ruleChecker != null) ruleChecker.close();
-        if (mergeChecker != null) mergeChecker.close();
-        if (hotRegion != null) hotRegion.close();
+        stopSchedulers();
         if (operatorController != null) operatorController.shutdown();
-        if (splitChecker != null) splitChecker.close();
-        if (regionBalance != null) regionBalance.close();
-        if (leaderBalance != null) leaderBalance.close();
         if (scheduler != null) scheduler.shutdownNow();
         if (grpcServer != null) {
             grpcServer.shutdown();

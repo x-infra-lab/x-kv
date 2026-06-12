@@ -47,8 +47,8 @@ public final class TableScanCoprocessor implements Coprocessor {
         long startTs = req.getStartTs();
         int limit = req.getPagingSize() > 0 ? (int) req.getPagingSize() : DEFAULT_SCAN_LIMIT;
 
-        try (var snapshot = engine.newSnapshot()) {
-            var reader = new MvccReader(engine, snapshot, false);
+        try (var snapshot = engine.newSnapshot();
+             var reader = new MvccReader(engine, snapshot, false)) {
             var dataBuilder = new KvPairEncoder();
 
             int total = 0;
@@ -57,20 +57,23 @@ public final class TableScanCoprocessor implements Coprocessor {
                 byte[] start = range.getStart().toByteArray();
                 byte[] end = range.getEnd().toByteArray();
                 int rangeLimit = limit - total;
-                var pairs = reader.scan(start, end, rangeLimit, startTs);
-                for (var pair : pairs) {
+                var result = reader.scan(start, end, rangeLimit, startTs);
+                for (var pair : result.pairs()) {
                     dataBuilder.add(pair.key(), pair.value());
                     total++;
+                }
+                if (result.lockError() != null) {
+                    var e = result.lockError();
+                    return Response.newBuilder()
+                            .setData(ByteString.copyFrom(dataBuilder.encode()))
+                            .setLocked(Kvrpcpb.KeyError.newBuilder()
+                                    .setLocked(toLockInfo(e.key(), e.lock())))
+                            .build();
                 }
             }
 
             return Response.newBuilder()
                     .setData(ByteString.copyFrom(dataBuilder.encode()))
-                    .build();
-        } catch (KeyLockedException e) {
-            return Response.newBuilder()
-                    .setLocked(Kvrpcpb.KeyError.newBuilder()
-                            .setLocked(toLockInfo(e.key(), e.lock())))
                     .build();
         } catch (Throwable t) {
             return Response.newBuilder()
@@ -84,8 +87,8 @@ public final class TableScanCoprocessor implements Coprocessor {
         long startTs = req.getStartTs();
         int pagingSize = req.getPagingSize() > 0 ? (int) req.getPagingSize() : Integer.MAX_VALUE;
 
-        try (var snapshot = engine.newSnapshot()) {
-            var reader = new MvccReader(engine, snapshot, false);
+        try (var snapshot = engine.newSnapshot();
+             var reader = new MvccReader(engine, snapshot, false)) {
             int total = 0;
 
             for (var range : req.getRangesList()) {
@@ -94,33 +97,36 @@ public final class TableScanCoprocessor implements Coprocessor {
                 byte[] end = range.getEnd().toByteArray();
 
                 byte[] cursor = start;
+                boolean hitLock = false;
                 while (total < pagingSize) {
                     int chunkLimit = Math.min(STREAM_CHUNK_SIZE, pagingSize - total);
-                    var pairs = reader.scan(cursor, end, chunkLimit, startTs);
-                    if (pairs.isEmpty()) break;
-
-                    var enc = new KvPairEncoder();
-                    for (var pair : pairs) {
-                        enc.add(pair.key(), pair.value());
+                    var result = reader.scan(cursor, end, chunkLimit, startTs);
+                    if (!result.pairs().isEmpty()) {
+                        var enc = new KvPairEncoder();
+                        for (var pair : result.pairs()) {
+                            enc.add(pair.key(), pair.value());
+                        }
+                        sink.accept(StreamResponse.newBuilder()
+                                .setData(ByteString.copyFrom(enc.encode()))
+                                .build());
+                        total += result.pairs().size();
                     }
+                    if (result.lockError() != null) {
+                        var e = result.lockError();
+                        sink.accept(StreamResponse.newBuilder()
+                                .setLocked(Kvrpcpb.KeyError.newBuilder()
+                                        .setLocked(toLockInfo(e.key(), e.lock())))
+                                .build());
+                        hitLock = true;
+                        break;
+                    }
+                    if (result.pairs().isEmpty() || result.pairs().size() < chunkLimit) break;
 
-                    sink.accept(StreamResponse.newBuilder()
-                            .setData(ByteString.copyFrom(enc.encode()))
-                            .build());
-
-                    total += pairs.size();
-                    if (pairs.size() < chunkLimit) break;
-
-                    // Advance cursor past the last key returned.
-                    byte[] lastKey = pairs.get(pairs.size() - 1).key();
+                    byte[] lastKey = result.pairs().get(result.pairs().size() - 1).key();
                     cursor = nextKey(lastKey);
                 }
+                if (hitLock) break;
             }
-        } catch (KeyLockedException e) {
-            sink.accept(StreamResponse.newBuilder()
-                    .setLocked(Kvrpcpb.KeyError.newBuilder()
-                            .setLocked(toLockInfo(e.key(), e.lock())))
-                    .build());
         } catch (Throwable t) {
             sink.accept(StreamResponse.newBuilder()
                     .setOtherError(t.getMessage())

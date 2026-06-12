@@ -10,18 +10,18 @@
         <version>0.2.0</version>
     </parent>
 
-    <artifactId>x-ctl</artifactId>
-    <name>x-ctl</name>
+    <artifactId>x-kv-ctl</artifactId>
+    <name>x-kv-ctl</name>
     <description>CLI admin tool for x-kv cluster management.</description>
 
     <dependencies>
         <dependency>
             <groupId>io.github.x-infra-lab</groupId>
-            <artifactId>x-common</artifactId>
+            <artifactId>x-kv-common</artifactId>
         </dependency>
         <dependency>
             <groupId>io.github.x-infra-lab</groupId>
-            <artifactId>x-proto</artifactId>
+            <artifactId>x-kv-proto</artifactId>
         </dependency>
 
         <dependency>

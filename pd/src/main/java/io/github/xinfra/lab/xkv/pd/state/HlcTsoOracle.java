@@ -4,6 +4,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
@@ -108,10 +109,13 @@ public final class HlcTsoOracle implements Tso {
         if (count > MAX_LOGICAL) throw new IllegalArgumentException("count exceeds 2^18: " + count);
         if (shutdown.get()) throw new IllegalStateException("oracle shut down");
 
+        int attempts = 0;
         while (true) {
             long firstTs = tryAllocLocked(count);
             if (firstTs >= 0) return firstTs;
-            // Extend then retry.
+            if (++attempts > 100) {
+                throw new IllegalStateException("TSO alloc failed after " + attempts + " extend attempts");
+            }
             extendBound();
         }
     }
@@ -177,7 +181,7 @@ public final class HlcTsoOracle implements Tso {
         }
 
         try {
-            long newBound = extender.apply(target).get();
+            long newBound = extender.apply(target).get(5, TimeUnit.SECONDS);
             lock.lock();
             try {
                 if (newBound > physicalBound) {

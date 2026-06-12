@@ -232,6 +232,16 @@ public final class RegionPeerImpl implements RegionPeer {
         node.registerLeaderObserver((oldLeader, newLeader) -> {
             boolean isLeader = newLeader == self.getId();
             boolean was = leader.getAndSet(isLeader);
+            if (was && !isLeader) {
+                for (var e : pendingProposals.entrySet()) {
+                    pendingProposals.remove(e.getKey());
+                    e.getValue().complete(ApplyResult.err("leader stepped down"));
+                }
+                CompletableFuture<ApplyResult> ccFut;
+                while ((ccFut = pendingConfChanges.poll()) != null) {
+                    ccFut.complete(ApplyResult.err("leader stepped down"));
+                }
+            }
             if (was != isLeader) {
                 log.info("region={} peer={} isLeader={} (newLeader={})",
                         regionId, self.getId(), isLeader, newLeader);
