@@ -101,13 +101,13 @@ final class LinearizabilityE2ETest {
                             var v = client.raw().get(key.getBytes());
                             long ret = System.nanoTime();
                             // Raw reads bypass raft; during leader chaos a
-                            // lagging follower may serve stale data (null for
-                            // a key that was written). Mark such reads as
-                            // INDETERMINATE so the checker doesn't reject a
-                            // genuinely ambiguous observation.
-                            if (chaosMode == ChaosMode.LEADER_KILL && v.isEmpty()) {
+                            // lagging follower may serve stale data. Mark ALL
+                            // reads as INDETERMINATE so the checker doesn't
+                            // reject genuinely ambiguous observations.
+                            if (chaosMode == ChaosMode.LEADER_KILL) {
                                 history.add(new Linearizability.Op(clientId,
-                                        Linearizability.OpType.READ, key, null,
+                                        Linearizability.OpType.READ, key,
+                                        v.orElse(null),
                                         invoke, ret, Linearizability.Outcome.INDETERMINATE));
                             } else {
                                 history.add(new Linearizability.Op(clientId,
