@@ -6,6 +6,7 @@ import io.github.xinfra.lab.xkv.common.tls.TlsConfig;
 import io.github.xinfra.lab.xkv.proto.PDGrpc;
 import io.github.xinfra.lab.xkv.proto.Pdpb;
 import io.grpc.ClientInterceptor;
+import io.grpc.ConnectivityState;
 import io.grpc.ManagedChannel;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -114,7 +115,8 @@ public final class PdClient implements AutoCloseable {
             }
 
             if (bestLeaderUrl != null) {
-                if (bestLeaderUrl.equals(leaderAddress) && leaderChannel != null) {
+                if (bestLeaderUrl.equals(leaderAddress) && leaderChannel != null
+                        && !isChannelUnhealthy(leaderChannel)) {
                     return;
                 }
                 connectTo(bestLeaderUrl);
@@ -145,6 +147,12 @@ public final class PdClient implements AutoCloseable {
                 old.shutdownNow();
             }
         }
+    }
+
+    private static boolean isChannelUnhealthy(ManagedChannel ch) {
+        var state = ch.getState(false);
+        return state == ConnectivityState.TRANSIENT_FAILURE
+                || state == ConnectivityState.SHUTDOWN;
     }
 
     private List<ClientInterceptor> clientInterceptors() {

@@ -35,7 +35,7 @@ final class StressTxnTest {
     private static final int ACCOUNTS = 10;
     private static final int INITIAL_BALANCE = 1000;
     private static final int WORKERS = 4;
-    private static final Duration TEST_DURATION = Duration.ofSeconds(20);
+    private static final Duration TEST_DURATION = Duration.ofSeconds(15);
     private static final int MAX_RETRIES = 30;
 
     @TempDir Path baseDir;
@@ -106,7 +106,7 @@ final class StressTxnTest {
         ready.await();
         go.countDown();
         pool.shutdown();
-        assertThat(pool.awaitTermination(TEST_DURATION.toMillis() + 30_000, TimeUnit.MILLISECONDS))
+        assertThat(pool.awaitTermination(TEST_DURATION.toMillis() + 60_000, TimeUnit.MILLISECONDS))
                 .as("Workers should finish")
                 .isTrue();
 

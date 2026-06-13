@@ -291,7 +291,8 @@ public final class MvccTxn {
         Write writeRecord;
         if (wt == Write.Type.PUT) {
             // Try to inline a short value to save the secondary read on Get.
-            byte[] sv = readerEngine().get(StorageEngine.Cf.DEFAULT, MvccKey.encode(key, startTs), reader.snapshotReadOpts());
+            byte[] sv = readerEngine().get(StorageEngine.Cf.DEFAULT,
+                    MvccKey.encode(key, startTs), reader.snapshotReadOpts());
             if (sv != null && sv.length <= Write.SHORT_VALUE_MAX_LEN) {
                 writeRecord = Write.put(startTs, sv);
                 // Drop the default CF entry to avoid duplication.

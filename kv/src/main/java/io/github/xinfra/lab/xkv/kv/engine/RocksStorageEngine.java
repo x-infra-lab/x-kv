@@ -272,13 +272,15 @@ public final class RocksStorageEngine implements StorageEngine {
 
     @Override
     public long approximateSize(Cf cf, byte[] start, byte[] end) {
-        try {
-            var ranges = new org.rocksdb.Range[] { new org.rocksdb.Range(
-                    new org.rocksdb.Slice(start), new org.rocksdb.Slice(end)) };
-            long[] result = db.getApproximateSizes(handle(cf), List.of(ranges[0]));
+        if (end == null || end.length == 0) {
+            return 0L;
+        }
+        try (var startSlice = new org.rocksdb.Slice(start);
+             var endSlice = new org.rocksdb.Slice(end)) {
+            long[] result = db.getApproximateSizes(handle(cf),
+                    List.of(new org.rocksdb.Range(startSlice, endSlice)));
             return result.length == 0 ? 0L : result[0];
         } catch (Throwable t) {
-            // approximate-sizes is best-effort
             return 0L;
         }
     }

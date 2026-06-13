@@ -81,7 +81,8 @@ public final class RegionCacheImpl implements RegionCache {
             update(info.region(), info.leader());
             return Optional.of(info);
         } catch (io.grpc.StatusRuntimeException e) {
-            log.debug("locateRegion id={} from PD failed: {}", regionId, e.getMessage());
+            log.warn("locateRegion id={} from PD failed, switching leader: {}", regionId, e.getMessage());
+            pdClient.switchLeader();
             return Optional.empty();
         } catch (Throwable t) {
             throw new RuntimeException("locateRegion PD call failed for id=" + regionId, t);
@@ -205,8 +206,12 @@ public final class RegionCacheImpl implements RegionCache {
             var leader = resp.hasLeader() ? resp.getLeader() : Metapb.Peer.getDefaultInstance();
             update(resp.getRegion(), leader);
             return Optional.of(new RegionInfo(resp.getRegion(), leader));
+        } catch (io.grpc.StatusRuntimeException e) {
+            log.warn("locateKey from PD failed, switching leader: {}", e.getMessage());
+            pdClient.switchLeader();
+            return Optional.empty();
         } catch (Throwable t) {
-            log.debug("locateKey from PD failed: {}", t.getMessage());
+            log.warn("locateKey from PD failed: {}", t.getMessage());
             return Optional.empty();
         }
     }

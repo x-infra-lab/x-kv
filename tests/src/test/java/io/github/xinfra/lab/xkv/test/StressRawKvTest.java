@@ -95,6 +95,9 @@ final class StressRawKvTest {
         assertThat(errors).as("No worker errors").isEmpty();
         assertThat(opsCompleted.get()).isEqualTo((long) WORKERS * OPS_PER_WORKER);
 
+        // Let region splits propagate to PD via heartbeats before verification.
+        Thread.sleep(3_000);
+
         // Verify: read back every written key.
         var raw = client.raw();
         var missing = new AtomicInteger();
@@ -149,8 +152,8 @@ final class StressRawKvTest {
             try {
                 return action.call();
             } catch (Exception e) {
-                if (attempt >= 10) throw e;
-                Thread.sleep(50 + attempt * 100L);
+                if (attempt >= 5) throw e;
+                Thread.sleep(50 + attempt * 50L);
             }
         }
     }

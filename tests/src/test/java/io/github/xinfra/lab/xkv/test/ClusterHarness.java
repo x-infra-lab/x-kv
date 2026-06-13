@@ -531,6 +531,17 @@ public final class ClusterHarness implements AutoCloseable {
         parentNode.dispatcher.register(childRegionId, childTransport);
         parentNode.store.registerPeer(childPeer);
         parentNode.childPeers.add(childPeer);
+
+        var pdAsyncForChild = PDGrpc.newStub(
+                NettyChannelBuilder.forAddress("127.0.0.1", pdPort).usePlaintext().build());
+        var pdBlockingForChild = PDGrpc.newBlockingStub(
+                NettyChannelBuilder.forAddress("127.0.0.1", pdPort).usePlaintext().build());
+        var childSplitDriver = new io.github.xinfra.lab.xkv.kv.store.SplitDriver(
+                pdBlockingForChild, 10_000);
+        var childHb = new RegionHeartbeater(pdAsyncForChild, childPeer, 100,
+                childSplitDriver::split, parentNode.engine);
+        childHb.start();
+        parentNode.childHeartbeaters.add(childHb);
     }
 
     private static final java.util.List<ServerSocket> reservedSockets =
@@ -602,6 +613,7 @@ public final class ClusterHarness implements AutoCloseable {
         public RaftMessageDispatcher dispatcher;
         public java.util.Map<Long, String> peerAddrs;
         public final java.util.List<RegionPeerImpl> childPeers = new java.util.ArrayList<>();
+        public final java.util.List<RegionHeartbeater> childHeartbeaters = new java.util.ArrayList<>();
         public final java.util.List<ManagedChannel> pdChannels = new java.util.ArrayList<>();
 
         private ManagedChannel cachedChannel;
@@ -631,6 +643,9 @@ public final class ClusterHarness implements AutoCloseable {
 
         void shutdown() {
             if (heartbeater != null) try { heartbeater.close(); } catch (Exception ignored) {}
+            for (var chb : childHeartbeaters) {
+                try { chb.close(); } catch (Exception ignored) {}
+            }
             if (cachedChannel != null) {
                 try { cachedChannel.shutdownNow().awaitTermination(2, TimeUnit.SECONDS); } catch (Exception ignored) {}
             }
