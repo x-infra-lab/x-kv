@@ -272,7 +272,11 @@ public final class RocksStorageEngine implements StorageEngine {
 
     @Override
     public long approximateSize(Cf cf, byte[] start, byte[] end) {
-        if (end == null || end.length == 0) {
+        // Slice(new byte[0]) produces undefined results via JNI on some
+        // platforms (Linux x86_64 returns garbage ~140 TB). Guard both
+        // boundaries: empty start/end means the region spans from/to the
+        // edge of the keyspace — no meaningful per-region estimate.
+        if (start == null || start.length == 0 || end == null || end.length == 0) {
             return 0L;
         }
         try (var startSlice = new org.rocksdb.Slice(start);

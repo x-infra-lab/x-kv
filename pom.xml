@@ -6,7 +6,7 @@
 
     <groupId>io.github.x-infra-lab</groupId>
     <artifactId>x-kv</artifactId>
-    <version>0.2.0-RC1</version>
+    <version>0.2.0-RC2</version>
     <packaging>pom</packaging>
 
     <name>x-kv (parent)</name>

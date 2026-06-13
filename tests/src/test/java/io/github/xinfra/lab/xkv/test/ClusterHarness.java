@@ -52,6 +52,7 @@ public final class ClusterHarness implements AutoCloseable {
 
     private final Path baseDir;
     private final int kvCount;
+    private final PdConfig.SchedulerConfig schedulerConfig;
     private PdServer pd;
 
     public PdServer pdServer() { return pd; }
@@ -60,8 +61,13 @@ public final class ClusterHarness implements AutoCloseable {
     private long bootstrapRegionId = 1;
 
     public ClusterHarness(Path baseDir, int kvCount) {
+        this(baseDir, kvCount, null);
+    }
+
+    public ClusterHarness(Path baseDir, int kvCount, PdConfig.SchedulerConfig schedulerConfig) {
         this.baseDir = baseDir;
         this.kvCount = kvCount;
+        this.schedulerConfig = schedulerConfig;
     }
 
     public int pdPort() { return pdPort; }
@@ -72,13 +78,14 @@ public final class ClusterHarness implements AutoCloseable {
         // 1) Boot PD on a free port.
         pdPort = freePort();
         int pdRaftPort = freePort();
-        var pdCfg = PdConfig.builder()
+        var pdCfgBuilder = PdConfig.builder()
                 .nodeId(1)
                 .clusterId(1)
                 .clientAddress("127.0.0.1:" + pdPort)
                 .raftAddress("127.0.0.1:" + pdRaftPort)
-                .dataDir(Files.createDirectories(baseDir.resolve("pd")))
-                .build();
+                .dataDir(Files.createDirectories(baseDir.resolve("pd")));
+        if (schedulerConfig != null) pdCfgBuilder.scheduler(schedulerConfig);
+        var pdCfg = pdCfgBuilder.build();
         releasePort(pdPort);
         releasePort(pdRaftPort);
         pd = new PdServer(pdCfg);
