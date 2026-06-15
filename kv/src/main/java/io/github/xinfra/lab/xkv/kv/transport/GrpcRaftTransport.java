@@ -267,7 +267,9 @@ public final class GrpcRaftTransport implements Transport {
             lock.lock();
             try {
                 if (outStream != null) {
-                    try { outStream.onCompleted(); } catch (Throwable ignored) {}
+                    try { outStream.onCompleted(); } catch (Throwable e) {
+                        log.warn("stream onCompleted failed: {}", e.getMessage());
+                    }
                     outStream = null;
                 }
                 if (channel != null) {

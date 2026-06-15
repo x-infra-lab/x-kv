@@ -118,12 +118,11 @@ final class MultiRegionRecoveryE2ETest {
         // Scan RAFT CF for all region descriptors.
         byte[] prefix = RaftCfKeys.allRegionKeysPrefix();
         byte[] end = RaftCfKeys.allRegionKeysEnd();
-        var ro = leader.engine.newReadOptions()
-                .iterateLowerBound(prefix)
-                .iterateUpperBound(end);
-
         var foundRegionIds = new ArrayList<Long>();
-        try (var it = leader.engine.newIterator(StorageEngine.Cf.RAFT, ro)) {
+        try (var ro = leader.engine.newReadOptions()
+                     .iterateLowerBound(prefix)
+                     .iterateUpperBound(end);
+             var it = leader.engine.newIterator(StorageEngine.Cf.RAFT, ro)) {
             for (it.seek(prefix); it.isValid(); it.next()) {
                 long regionId = RaftCfKeys.regionIdFromKey(it.key());
                 var region = Metapb.Region.parseFrom(it.value());

@@ -218,7 +218,9 @@ public final class PdRaftNode implements AutoCloseable {
         try {
             var st = node.basicStatus();
             if (st != null && st.lead != 0) return st.lead;
-        } catch (Throwable ignored) {}
+        } catch (Throwable e) {
+            log.debug("leaderNodeId: basicStatus failed: {}", e.getMessage());
+        }
         long id = currentLeaderId;
         return id != 0 ? id : (leader.get() ? nodeId : 0);
     }
@@ -387,11 +389,17 @@ public final class PdRaftNode implements AutoCloseable {
     @Override
     public void close() {
         running = false;
-        try { tickTimer.shutdownNow(); } catch (Throwable ignored) {}
+        try { tickTimer.shutdownNow(); } catch (Throwable e) {
+            log.warn("tickTimer shutdown failed: {}", e.getMessage(), e);
+        }
         try { node.stop(2, TimeUnit.SECONDS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
         try { readyThread.join(2_000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-        try { transport.close(); } catch (Throwable ignored) {}
-        try { storage.close(); } catch (Throwable ignored) {}
+        try { transport.close(); } catch (Throwable e) {
+            log.warn("transport close failed: {}", e.getMessage(), e);
+        }
+        try { storage.close(); } catch (Throwable e) {
+            log.warn("storage close failed: {}", e.getMessage(), e);
+        }
         var shutdownEx = RaftException.ErrStopped;
         for (var e : pendingProposals.values()) e.completeExceptionally(shutdownEx);
         pendingProposals.clear();

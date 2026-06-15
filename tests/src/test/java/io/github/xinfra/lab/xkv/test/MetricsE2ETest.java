@@ -72,7 +72,7 @@ final class MetricsE2ETest {
             try {
                 tikv.rawGet(Kvrpcpb.RawGetRequest.newBuilder()
                         .setKey(ByteString.copyFromUtf8("k" + i)).build());
-            } catch (Exception ignored) {}
+            } catch (Exception e) { e.printStackTrace(); }
         }
 
         // Verify HTTP /metrics endpoint

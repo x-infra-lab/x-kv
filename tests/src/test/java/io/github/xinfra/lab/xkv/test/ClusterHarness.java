@@ -57,7 +57,7 @@ public final class ClusterHarness implements AutoCloseable {
 
     public PdServer pdServer() { return pd; }
     private int pdPort;
-    private final List<KvNode> kvNodes = new ArrayList<>();
+    private final List<KvNode> kvNodes = new java.util.concurrent.CopyOnWriteArrayList<>();
     private long bootstrapRegionId = 1;
 
     public ClusterHarness(Path baseDir, int kvCount) {
@@ -142,16 +142,17 @@ public final class ClusterHarness implements AutoCloseable {
         // 6) Each KV node now has a real RegionHeartbeater wiring it to PD;
         //    the leader's heartbeat publishes the elected leader to PD's
         //    region table so clients route correctly.
-        var pdAsyncStub = io.github.xinfra.lab.xkv.proto.PDGrpc.newStub(
-                io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder
-                        .forAddress("127.0.0.1", pdPort).usePlaintext().build());
-        // Each node gets a SplitTrigger that delegates to its own SplitDriver
-        // (talks to the same PD for ID allocation). The trigger only fires on
-        // the leader peer (RegionHeartbeater checks isLeader before dispatch).
+        //    Each node gets its OWN PD channels so shutting down one node
+        //    doesn't break heartbeaters on surviving nodes.
         for (var n : kvNodes) {
-            var pdBlockingForSplit = io.github.xinfra.lab.xkv.proto.PDGrpc.newBlockingStub(
-                    io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder
-                            .forAddress("127.0.0.1", pdPort).usePlaintext().build());
+            var pdAsyncChannel = io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder
+                    .forAddress("127.0.0.1", pdPort).usePlaintext().build();
+            n.pdChannels.add(pdAsyncChannel);
+            var pdAsyncStub = io.github.xinfra.lab.xkv.proto.PDGrpc.newStub(pdAsyncChannel);
+            var pdSplitChannel = io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder
+                    .forAddress("127.0.0.1", pdPort).usePlaintext().build();
+            n.pdChannels.add(pdSplitChannel);
+            var pdBlockingForSplit = io.github.xinfra.lab.xkv.proto.PDGrpc.newBlockingStub(pdSplitChannel);
             var splitDriver = new io.github.xinfra.lab.xkv.kv.store.SplitDriver(
                     pdBlockingForSplit, 10_000);
             io.github.xinfra.lab.xkv.kv.store.RegionHeartbeater.SplitTrigger trigger =
@@ -240,12 +241,14 @@ public final class ClusterHarness implements AutoCloseable {
             var node = buildNode(peerId, region, clientPort, raftPort, raftAddrs);
 
             // Wire heartbeater.
-            var pdAsyncStub = PDGrpc.newStub(
-                    NettyChannelBuilder.forAddress("127.0.0.1", pdPort)
-                            .usePlaintext().build());
-            var splitPdStub = PDGrpc.newBlockingStub(
-                    NettyChannelBuilder.forAddress("127.0.0.1", pdPort)
-                            .usePlaintext().build());
+            var pdAsyncChannel = NettyChannelBuilder.forAddress("127.0.0.1", pdPort)
+                    .usePlaintext().build();
+            node.pdChannels.add(pdAsyncChannel);
+            var pdAsyncStub = PDGrpc.newStub(pdAsyncChannel);
+            var pdSplitChannel = NettyChannelBuilder.forAddress("127.0.0.1", pdPort)
+                    .usePlaintext().build();
+            node.pdChannels.add(pdSplitChannel);
+            var splitPdStub = PDGrpc.newBlockingStub(pdSplitChannel);
             var splitDriver = new io.github.xinfra.lab.xkv.kv.store.SplitDriver(splitPdStub, 10_000);
             var hb = new RegionHeartbeater(pdAsyncStub, node.peer, 100, splitDriver::split, node.engine);
             hb.start();
@@ -261,7 +264,9 @@ public final class ClusterHarness implements AutoCloseable {
     @Override
     public void close() {
         for (var n : kvNodes) {
-            try { n.shutdown(); } catch (Throwable ignored) {}
+            try { n.shutdown(); } catch (Throwable e) {
+                log.warn("node shutdown failed: {}", e.getMessage(), e);
+            }
         }
         kvNodes.clear();
         if (pd != null) pd.stop();
@@ -539,10 +544,14 @@ public final class ClusterHarness implements AutoCloseable {
         parentNode.store.registerPeer(childPeer);
         parentNode.childPeers.add(childPeer);
 
-        var pdAsyncForChild = PDGrpc.newStub(
-                NettyChannelBuilder.forAddress("127.0.0.1", pdPort).usePlaintext().build());
-        var pdBlockingForChild = PDGrpc.newBlockingStub(
-                NettyChannelBuilder.forAddress("127.0.0.1", pdPort).usePlaintext().build());
+        var pdAsyncChannelForChild = NettyChannelBuilder
+                .forAddress("127.0.0.1", pdPort).usePlaintext().build();
+        parentNode.pdChannels.add(pdAsyncChannelForChild);
+        var pdAsyncForChild = PDGrpc.newStub(pdAsyncChannelForChild);
+        var pdBlockingChannelForChild = NettyChannelBuilder
+                .forAddress("127.0.0.1", pdPort).usePlaintext().build();
+        parentNode.pdChannels.add(pdBlockingChannelForChild);
+        var pdBlockingForChild = PDGrpc.newBlockingStub(pdBlockingChannelForChild);
         var childSplitDriver = new io.github.xinfra.lab.xkv.kv.store.SplitDriver(
                 pdBlockingForChild, 10_000);
         var childHb = new RegionHeartbeater(pdAsyncForChild, childPeer, 100,
@@ -568,7 +577,9 @@ public final class ClusterHarness implements AutoCloseable {
     public static void releasePort(int port) {
         reservedSockets.removeIf(s -> {
             if (s.getLocalPort() == port) {
-                try { s.close(); } catch (Exception ignored) {}
+                try { s.close(); } catch (Exception e) {
+                    log.warn("socket close failed for port {}: {}", port, e.getMessage());
+                }
                 return true;
             }
             return false;
@@ -599,7 +610,9 @@ public final class ClusterHarness implements AutoCloseable {
     static void releaseAllPorts() {
         synchronized (reservedSockets) {
             for (var s : reservedSockets) {
-                try { s.close(); } catch (Exception ignored) {}
+                try { s.close(); } catch (Exception e) {
+                    log.warn("socket close failed: {}", e.getMessage());
+                }
             }
             reservedSockets.clear();
         }
@@ -619,9 +632,9 @@ public final class ClusterHarness implements AutoCloseable {
         public io.github.xinfra.lab.xkv.kv.store.StoreImpl store;
         public RaftMessageDispatcher dispatcher;
         public java.util.Map<Long, String> peerAddrs;
-        public final java.util.List<RegionPeerImpl> childPeers = new java.util.ArrayList<>();
-        public final java.util.List<RegionHeartbeater> childHeartbeaters = new java.util.ArrayList<>();
-        public final java.util.List<ManagedChannel> pdChannels = new java.util.ArrayList<>();
+        public final java.util.List<RegionPeerImpl> childPeers = new java.util.concurrent.CopyOnWriteArrayList<>();
+        public final java.util.List<RegionHeartbeater> childHeartbeaters = new java.util.concurrent.CopyOnWriteArrayList<>();
+        public final java.util.List<ManagedChannel> pdChannels = new java.util.concurrent.CopyOnWriteArrayList<>();
 
         private ManagedChannel cachedChannel;
 
@@ -649,36 +662,43 @@ public final class ClusterHarness implements AutoCloseable {
         }
 
         void shutdown() {
-            if (heartbeater != null) try { heartbeater.close(); } catch (Exception ignored) {}
+            if (heartbeater != null) {
+                try { heartbeater.close(); } catch (Exception e) {
+                    log.warn("heartbeater close failed: {}", e.getMessage(), e);
+                }
+            }
             for (var chb : childHeartbeaters) {
-                try { chb.close(); } catch (Exception ignored) {}
+                try { chb.close(); } catch (Exception e) {
+                    log.warn("child heartbeater close failed: {}", e.getMessage(), e);
+                }
             }
             if (cachedChannel != null) {
-                try { cachedChannel.shutdownNow().awaitTermination(2, TimeUnit.SECONDS); } catch (Exception ignored) {}
+                try { cachedChannel.shutdownNow().awaitTermination(2, TimeUnit.SECONDS); } catch (Exception e) {
+                    log.warn("cachedChannel shutdown failed: {}", e.getMessage(), e);
+                }
             }
-            // Stop the gRPC servers FIRST so no in-flight RPC tries to touch
-            // RocksDB while we're tearing down the engine.
-            try { clientServer.shutdownNow().awaitTermination(2, TimeUnit.SECONDS); } catch (Exception ignored) {}
-            try { raftServer.shutdownNow().awaitTermination(2, TimeUnit.SECONDS); } catch (Exception ignored) {}
-            // Stop the main peer FIRST — its ready thread is where split
-            // applies happen, so stopping it prevents new child peers from
-            // being created during shutdown.
-            try { peer.shutdown(); } catch (Exception ignored) {}
-            // Now stop all child peers (the list is final — no more
-            // children can be added because the main peer's ready thread
-            // has exited).
+            try { clientServer.shutdownNow().awaitTermination(2, TimeUnit.SECONDS); } catch (Exception e) {
+                log.warn("clientServer shutdown failed: {}", e.getMessage(), e);
+            }
+            try { raftServer.shutdownNow().awaitTermination(2, TimeUnit.SECONDS); } catch (Exception e) {
+                log.warn("raftServer shutdown failed: {}", e.getMessage(), e);
+            }
+            try { peer.shutdown(); } catch (Exception e) {
+                log.warn("peer shutdown failed: {}", e.getMessage(), e);
+            }
             for (var child : childPeers) {
-                try { child.shutdown(); } catch (Throwable ignored) {}
+                try { child.shutdown(); } catch (Throwable e) {
+                    log.warn("child peer shutdown failed: {}", e.getMessage(), e);
+                }
             }
-            try { transport.close(); } catch (Exception ignored) {}
-            // PD channels (split + deadlock) — shut down AFTER the peer is
-            // stopped so any in-flight call completes.
+            try { transport.close(); } catch (Exception e) {
+                log.warn("transport close failed: {}", e.getMessage(), e);
+            }
             for (var ch : pdChannels) {
-                try { ch.shutdownNow().awaitTermination(2, TimeUnit.SECONDS); } catch (Exception ignored) {}
+                try { ch.shutdownNow().awaitTermination(2, TimeUnit.SECONDS); } catch (Exception e) {
+                    log.warn("pd channel shutdown failed: {}", e.getMessage(), e);
+                }
             }
-            // Wait for ALL raft event-loop and ready threads to fully exit
-            // before closing the engine — a still-running thread would
-            // SIGSEGV on the freed RocksDB handle.
             long deadline = System.nanoTime() + 10_000_000_000L;
             while (System.nanoTime() < deadline) {
                 boolean anyAlive = peer.readyThreadAlive();
@@ -686,9 +706,17 @@ public final class ClusterHarness implements AutoCloseable {
                     anyAlive = childPeers.stream().anyMatch(RegionPeerImpl::readyThreadAlive);
                 }
                 if (!anyAlive) break;
-                try { Thread.sleep(50); } catch (InterruptedException ignored) { break; }
+                try { Thread.sleep(50); } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
             }
-            try { engine.close(); } catch (Exception ignored) {}
+            if (peer.readyThreadAlive() || childPeers.stream().anyMatch(RegionPeerImpl::readyThreadAlive)) {
+                log.warn("some peer ready-loop threads still alive after 10s; proceeding with engine close");
+            }
+            try { engine.close(); } catch (Exception e) {
+                log.warn("engine close failed: {}", e.getMessage(), e);
+            }
         }
     }
 

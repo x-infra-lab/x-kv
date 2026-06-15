@@ -94,9 +94,9 @@ final class DebugServiceE2ETest {
     void tearDown() throws Exception {
         if (channel != null) channel.shutdownNow().awaitTermination(2, TimeUnit.SECONDS);
         if (server != null) server.shutdownNow().awaitTermination(2, TimeUnit.SECONDS);
-        if (peer != null) try { peer.shutdown(); } catch (Throwable ignored) {}
-        if (transport != null) try { transport.close(); } catch (Throwable ignored) {}
-        if (engine != null) try { engine.close(); } catch (Throwable ignored) {}
+        if (peer != null) try { peer.shutdown(); } catch (Throwable e) { e.printStackTrace(); }
+        if (transport != null) try { transport.close(); } catch (Throwable e) { e.printStackTrace(); }
+        if (engine != null) try { engine.close(); } catch (Throwable e) { e.printStackTrace(); }
         ClusterHarness.releaseAllPorts();
     }
 

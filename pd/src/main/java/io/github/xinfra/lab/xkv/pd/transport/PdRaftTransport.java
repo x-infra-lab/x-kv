@@ -51,7 +51,9 @@ public final class PdRaftTransport implements Transport {
         peerAddresses.remove(peerId);
         var stream = outbounds.remove(peerId);
         if (stream != null) {
-            try { stream.onCompleted(); } catch (Throwable ignored) {}
+            try { stream.onCompleted(); } catch (Throwable e) {
+                log.warn("stream onCompleted failed: {}", e.getMessage());
+            }
         }
         var ch = channels.remove(peerId);
         if (ch != null) {
@@ -116,7 +118,9 @@ public final class PdRaftTransport implements Transport {
     @Override
     public void close() {
         for (var stream : outbounds.values()) {
-            try { stream.onCompleted(); } catch (Throwable ignored) {}
+            try { stream.onCompleted(); } catch (Throwable e) {
+                log.warn("stream onCompleted failed: {}", e.getMessage());
+            }
         }
         outbounds.clear();
         for (var ch : channels.values()) {

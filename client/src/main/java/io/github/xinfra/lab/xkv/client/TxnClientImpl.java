@@ -12,6 +12,8 @@ import io.github.xinfra.lab.xkv.client.txn.LockResolverImpl;
 import io.github.xinfra.lab.xkv.client.txn.Transaction;
 import io.github.xinfra.lab.xkv.client.txn.TransactionImpl;
 import io.github.xinfra.lab.xkv.client.txn.TwoPhaseCommitterImpl;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.concurrent.ThreadLocalRandom;
 
@@ -24,6 +26,7 @@ import java.util.concurrent.ThreadLocalRandom;
  * <p>Construct via {@link TxnClient#create(ClientConfig)}.
  */
 public final class TxnClientImpl implements TxnClient {
+    private static final Logger log = LoggerFactory.getLogger(TxnClientImpl.class);
 
     private final ClientConfig config;
     private final PdClient pdClient;
@@ -112,7 +115,9 @@ public final class TxnClientImpl implements TxnClient {
 
     @Override
     public void close() {
-        try { tso.close(); } catch (Throwable ignored) {}
+        try { tso.close(); } catch (Throwable e) {
+            log.warn("tso close failed: {}", e.getMessage(), e);
+        }
         regionCache.clear();
         storeCache.close();
         pdClient.close();

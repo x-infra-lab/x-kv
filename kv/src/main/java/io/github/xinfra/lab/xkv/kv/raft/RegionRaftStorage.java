@@ -113,10 +113,10 @@ public final class RegionRaftStorage implements Storage {
 
         var lower = RaftCfKeys.logKey(regionId(), lo);
         var upper = RaftCfKeys.logKey(regionId(), hi);
-        var ro = storage.newReadOptions().iterateLowerBound(lower).iterateUpperBound(upper);
         var out = new ArrayList<Eraftpb.Entry>((int) Math.min(hi - lo, 1024));
         long size = 0;
-        try (var it = storage.newIterator(StorageEngine.Cf.RAFT, ro)) {
+        try (var ro = storage.newReadOptions().iterateLowerBound(lower).iterateUpperBound(upper);
+             var it = storage.newIterator(StorageEngine.Cf.RAFT, ro)) {
             for (it.seek(lower); it.isValid(); it.next()) {
                 byte[] v = it.value();
                 size += v.length;

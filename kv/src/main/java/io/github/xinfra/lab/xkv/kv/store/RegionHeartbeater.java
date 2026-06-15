@@ -257,7 +257,9 @@ public final class RegionHeartbeater implements AutoCloseable {
         timer.shutdownNow();
         synchronized (this) {
             if (outbound != null) {
-                try { outbound.onCompleted(); } catch (Throwable ignored) {}
+                try { outbound.onCompleted(); } catch (Throwable e) {
+                    log.warn("outbound onCompleted failed: {}", e.getMessage());
+                }
                 outbound = null;
             }
         }

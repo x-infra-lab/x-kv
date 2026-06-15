@@ -414,10 +414,13 @@ public final class RegionPeerImpl implements RegionPeer {
 
     @Override
     public void shutdown() {
+        destroyed = true;
         running = false;
         try {
             tickTimer.shutdownNow();
-        } catch (Throwable ignored) {}
+        } catch (Throwable e) {
+            log.warn("region={} tickTimer shutdown failed: {}", regionId, e.getMessage(), e);
+        }
         try {
             if (!node.stop(10, TimeUnit.SECONDS)) {
                 log.warn("region={} raft node did not stop within 10s, forcing", regionId);
@@ -439,7 +442,9 @@ public final class RegionPeerImpl implements RegionPeer {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
-        try { transport.close(); } catch (Throwable ignored) {}
+        try { transport.close(); } catch (Throwable e) {
+            log.warn("region={} transport close failed: {}", regionId, e.getMessage(), e);
+        }
         // Pending proposals get aborted.
         for (var e : pendingProposals.entrySet()) {
             e.getValue().complete(ApplyResult.err("region peer shutdown"));

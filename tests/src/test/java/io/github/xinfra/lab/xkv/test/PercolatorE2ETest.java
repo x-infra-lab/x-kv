@@ -168,9 +168,9 @@ final class PercolatorE2ETest {
         // Synthesize a gRPC Context with a 200ms deadline and run the
         // propose inside it.
         var deadline = io.grpc.Deadline.after(200, TimeUnit.MILLISECONDS);
+        var deadlineExecutor = java.util.concurrent.Executors.newSingleThreadScheduledExecutor();
         long t0 = System.nanoTime();
-        var resp = io.grpc.Context.current().withDeadline(deadline,
-                java.util.concurrent.Executors.newSingleThreadScheduledExecutor()).call(() ->
+        var resp = io.grpc.Context.current().withDeadline(deadline, deadlineExecutor).call(() ->
                 txn.kvPrewrite(Kvrpcpb.PrewriteRequest.newBuilder()
                         .setStartVersion(100)
                         .setLockTtl(3000)
@@ -181,6 +181,7 @@ final class PercolatorE2ETest {
                                 .setValue(ByteString.copyFromUtf8("v")))
                         .build()));
         long elapsedMs = (System.nanoTime() - t0) / 1_000_000;
+        deadlineExecutor.shutdownNow();
 
         // Must have failed (timeout), not waited the full 60s.
         assertThat(elapsedMs)

@@ -37,10 +37,10 @@ final class PdLeaderFailoverE2ETest {
     @AfterEach
     void teardown() {
         if (pdClient != null) {
-            try { pdClient.close(); } catch (Throwable ignored) {}
+            try { pdClient.close(); } catch (Throwable e) { e.printStackTrace(); }
         }
         for (var s : servers) {
-            try { s.stop(); } catch (Exception ignored) {}
+            try { s.stop(); } catch (Exception e) { e.printStackTrace(); }
         }
         servers.clear();
         ClusterHarness.releaseAllPorts();

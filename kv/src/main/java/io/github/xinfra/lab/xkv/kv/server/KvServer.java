@@ -31,6 +31,7 @@ import io.github.xinfra.lab.xkv.common.metrics.MetricsHttpServer;
 import io.github.xinfra.lab.xkv.common.metrics.XKvMetrics;
 import io.github.xinfra.lab.xkv.common.ratelimit.ConcurrencyLimitInterceptor;
 import io.github.xinfra.lab.xkv.common.ratelimit.DrainingInterceptor;
+import io.github.xinfra.lab.xkv.common.util.CloseUtils;
 import io.github.xinfra.lab.xkv.common.tls.GrpcChannelFactory;
 import io.github.xinfra.lab.xkv.proto.Metapb;
 import io.github.xinfra.lab.xkv.proto.PDGrpc;
@@ -81,8 +82,8 @@ public final class KvServer {
     private RaftMessageDispatcher dispatcher;
     private Server clientServer;
     private Server raftServer;
-    private final List<RegionPeerImpl> peers = new ArrayList<>();
-    private final List<RegionHeartbeater> heartbeaters = new ArrayList<>();
+    private final List<RegionPeerImpl> peers = new java.util.concurrent.CopyOnWriteArrayList<>();
+    private final List<RegionHeartbeater> heartbeaters = new java.util.concurrent.CopyOnWriteArrayList<>();
     private PdEndpointManager pdManager;
     private TransactionService txnService;
     private RawKvService rawKvService;
@@ -637,26 +638,22 @@ public final class KvServer {
         drain();
 
         // 1) Stop heartbeaters.
-        if (storeHeartbeater != null) {
-            try { storeHeartbeater.close(); } catch (Exception ignored) {}
-        }
+        CloseUtils.closeQuietly(log, "storeHeartbeater", storeHeartbeater);
         for (var hb : heartbeaters) {
-            try { hb.close(); } catch (Exception ignored) {}
+            CloseUtils.closeQuietly(log, "regionHeartbeater", hb);
         }
         heartbeaters.clear();
 
         // 1b) Stop CDC service.
         if (cdcService != null) {
-            try { cdcService.close(); } catch (Exception ignored) {}
+            try { cdcService.close(); } catch (Exception e) {
+                log.warn("failed to close cdcService: {}", e.getMessage(), e);
+            }
         }
 
         // 1c) Stop background workers.
-        if (logCompactionWorker != null) {
-            try { logCompactionWorker.close(); } catch (Exception ignored) {}
-        }
-        if (gcWorker != null) {
-            try { gcWorker.close(); } catch (Exception ignored) {}
-        }
+        CloseUtils.closeQuietly(log, "logCompactionWorker", logCompactionWorker);
+        CloseUtils.closeQuietly(log, "gcWorker", gcWorker);
 
         // 2) Shut down gRPC servers.
         for (Server s : new Server[]{clientServer, raftServer}) {
@@ -674,25 +671,35 @@ public final class KvServer {
         // 3) Shut down all peers.
         for (var peer : peers) {
             try { peer.shutdown(); } catch (Throwable t) {
-                log.warn("peer shutdown failed: {}", t.getMessage());
+                log.warn("peer shutdown failed: {}", t.getMessage(), t);
             }
+        }
+
+        // 3b) Wait for all peer ready-loop threads to die before closing engine.
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (System.nanoTime() < deadline) {
+            boolean alive = peers.stream().anyMatch(RegionPeerImpl::readyThreadAlive);
+            if (!alive) break;
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        if (peers.stream().anyMatch(RegionPeerImpl::readyThreadAlive)) {
+            log.warn("some peer ready-loop threads still alive after 10s; proceeding with engine close");
         }
         peers.clear();
 
         // 4) Close PD connection.
-        if (pdManager != null) {
-            try { pdManager.close(); } catch (Throwable ignored) {}
-        }
+        CloseUtils.closeQuietly(log, "pdManager", pdManager);
 
         // 5) Close metrics HTTP server.
-        if (metricsHttpServer != null) {
-            try { metricsHttpServer.close(); } catch (Exception ignored) {}
-        }
+        CloseUtils.closeQuietly(log, "metricsHttpServer", metricsHttpServer);
 
         // 6) Close storage engine.
-        if (engine != null) {
-            try { engine.close(); } catch (Exception ignored) {}
-        }
+        CloseUtils.closeQuietly(log, "storageEngine", engine);
 
         log.info("KV store {} stopped", config.storeId());
     }

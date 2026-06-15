@@ -86,7 +86,9 @@ public final class TsoBatcherImpl implements TsoBatcher {
         try { dispatcher.join(2_000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
         var s = stream.get();
         if (s != null) {
-            try { s.outbound.onCompleted(); } catch (Throwable ignored) {}
+            try { s.outbound.onCompleted(); } catch (Throwable e) {
+                log.warn("tso stream onCompleted failed: {}", e.getMessage());
+            }
         }
     }
 
@@ -207,7 +209,9 @@ public final class TsoBatcherImpl implements TsoBatcher {
     private void resetStream() {
         var s = stream.get();
         if (s != null) {
-            try { s.outbound.onCompleted(); } catch (Throwable ignored) {}
+            try { s.outbound.onCompleted(); } catch (Throwable e) {
+                log.warn("tso stream onCompleted failed: {}", e.getMessage());
+            }
             s.broken = true;
         }
         stream.set(null);

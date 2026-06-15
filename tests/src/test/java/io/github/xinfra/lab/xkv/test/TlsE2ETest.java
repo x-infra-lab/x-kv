@@ -53,7 +53,7 @@ final class TlsE2ETest {
     @AfterEach
     void tearDown() throws Exception {
         for (var ch : channels) {
-            try { ch.shutdownNow().awaitTermination(2, TimeUnit.SECONDS); } catch (Exception ignored) {}
+            try { ch.shutdownNow().awaitTermination(2, TimeUnit.SECONDS); } catch (Exception e) { e.printStackTrace(); }
         }
         channels.clear();
         if (server != null) server.shutdownNow().awaitTermination(2, TimeUnit.SECONDS);

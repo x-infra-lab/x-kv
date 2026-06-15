@@ -71,6 +71,7 @@ public final class RocksStorageEngine implements StorageEngine {
     private final List<AutoCloseable> ownedResources = new ArrayList<>();
     private final WriteOptions syncWrite;
     private final WriteOptions noSyncWrite;
+    private volatile boolean closed = false;
 
     private RocksStorageEngine(RocksDB db, Map<String, ColumnFamilyHandle> handles,
                                List<AutoCloseable> ownedResources) {
@@ -197,10 +198,17 @@ public final class RocksStorageEngine implements StorageEngine {
         return opts;
     }
 
+    private void checkOpen() {
+        if (closed) {
+            throw new StorageException("engine closed");
+        }
+    }
+
     // ===== Reads =====
 
     @Override
     public byte[] get(Cf cf, byte[] key) {
+        checkOpen();
         try {
             return db.get(handle(cf), key);
         } catch (RocksDBException e) {
@@ -210,6 +218,7 @@ public final class RocksStorageEngine implements StorageEngine {
 
     @Override
     public byte[] get(Cf cf, byte[] key, ReadOptions opts) {
+        checkOpen();
         try {
             var ropts = ((RocksReadOptions) opts).inner();
             return db.get(handle(cf), ropts, key);
@@ -220,6 +229,7 @@ public final class RocksStorageEngine implements StorageEngine {
 
     @Override
     public List<byte[]> multiGet(Cf cf, List<byte[]> keys) {
+        checkOpen();
         if (keys.isEmpty()) return List.of();
         try {
             var handles = new ArrayList<ColumnFamilyHandle>(keys.size());
@@ -236,21 +246,29 @@ public final class RocksStorageEngine implements StorageEngine {
 
     @Override
     public Iterator newIterator(Cf cf, ReadOptions opts) {
+        checkOpen();
         var ropts = ((RocksReadOptions) opts).inner();
         RocksIterator it = db.newIterator(handle(cf), ropts);
         return new RocksIter(it);
     }
 
     @Override
-    public Snapshot newSnapshot() { return new RocksSnapshot(db.getSnapshot()); }
+    public Snapshot newSnapshot() {
+        checkOpen();
+        return new RocksSnapshot(db.getSnapshot());
+    }
 
     // ===== Writes =====
 
     @Override
-    public WriteBatch newWriteBatch() { return new RocksWriteBatch(); }
+    public WriteBatch newWriteBatch() {
+        checkOpen();
+        return new RocksWriteBatch();
+    }
 
     @Override
     public void flushWal(boolean sync) {
+        checkOpen();
         try {
             db.flushWal(sync);
         } catch (RocksDBException e) {
@@ -260,6 +278,7 @@ public final class RocksStorageEngine implements StorageEngine {
 
     @Override
     public void write(WriteBatch batch, boolean sync) {
+        checkOpen();
         var rb = (RocksWriteBatch) batch;
         try {
             db.write(sync ? syncWrite : noSyncWrite, rb.inner);
@@ -272,6 +291,7 @@ public final class RocksStorageEngine implements StorageEngine {
 
     @Override
     public long approximateSize(Cf cf, byte[] start, byte[] end) {
+        checkOpen();
         // Slice(new byte[0]) produces undefined results via JNI on some
         // platforms (Linux x86_64 returns garbage ~140 TB). Guard both
         // boundaries: empty start/end means the region spans from/to the
@@ -291,11 +311,13 @@ public final class RocksStorageEngine implements StorageEngine {
 
     @Override
     public void deleteRange(WriteBatch batch, Cf cf, byte[] start, byte[] end) {
+        checkOpen();
         ((RocksWriteBatch) batch).deleteRangeInternal(handle(cf), start, end);
     }
 
     @Override
     public void ingestSst(Cf cf, List<Path> sstFiles) {
+        checkOpen();
         try (var opts = new org.rocksdb.IngestExternalFileOptions()) {
             var paths = sstFiles.stream().map(Path::toString).toList();
             db.ingestExternalFile(handle(cf), paths, opts);
@@ -306,6 +328,7 @@ public final class RocksStorageEngine implements StorageEngine {
 
     @Override
     public void compactRange(Cf cf, byte[] start, byte[] end) {
+        checkOpen();
         try {
             db.compactRange(handle(cf), start, end);
         } catch (RocksDBException e) {
@@ -314,15 +337,23 @@ public final class RocksStorageEngine implements StorageEngine {
     }
 
     @Override
-    public ReadOptions newReadOptions() { return new RocksReadOptions(); }
+    public ReadOptions newReadOptions() {
+        checkOpen();
+        return new RocksReadOptions();
+    }
 
     @Override
-    public void close() {
-        // Close RocksDB before owned options/caches; reverse construction order.
+    public synchronized void close() {
+        if (closed) return;
+        closed = true;
         for (var h : cfHandles.values()) h.close();
         db.close();
         for (int i = ownedResources.size() - 1; i >= 0; i--) {
-            try { ownedResources.get(i).close(); } catch (Exception ignored) {}
+            try {
+                ownedResources.get(i).close();
+            } catch (Exception e) {
+                log.warn("failed to close owned resource [{}]: {}", i, e.getMessage(), e);
+            }
         }
     }
 
@@ -386,6 +417,7 @@ public final class RocksStorageEngine implements StorageEngine {
         private final org.rocksdb.ReadOptions inner = new org.rocksdb.ReadOptions();
         private org.rocksdb.Slice lowerSlice;
         private org.rocksdb.Slice upperSlice;
+        private boolean closed;
         org.rocksdb.ReadOptions inner() { return inner; }
         @Override public ReadOptions snapshot(Snapshot snap) {
             inner.setSnapshot(((RocksSnapshot) snap).inner);
@@ -410,6 +442,8 @@ public final class RocksStorageEngine implements StorageEngine {
             inner.setPrefixSameAsStart(v); return this;
         }
         @Override public void close() {
+            if (closed) return;
+            closed = true;
             inner.close();
             if (lowerSlice != null) { lowerSlice.close(); lowerSlice = null; }
             if (upperSlice != null) { upperSlice.close(); upperSlice = null; }
@@ -418,6 +452,7 @@ public final class RocksStorageEngine implements StorageEngine {
 
     private static final class RocksIter implements Iterator {
         private final RocksIterator inner;
+        private boolean closed;
         RocksIter(RocksIterator it) { this.inner = it; }
         @Override public boolean isValid() { return inner.isValid(); }
         @Override public byte[] key()      { return inner.key(); }
@@ -426,7 +461,11 @@ public final class RocksStorageEngine implements StorageEngine {
         @Override public void seekForPrev(byte[] key) { inner.seekForPrev(key); }
         @Override public void next()  { inner.next(); }
         @Override public void prev()  { inner.prev(); }
-        @Override public void close() { inner.close(); }
+        @Override public void close() {
+            if (closed) return;
+            closed = true;
+            inner.close();
+        }
     }
 
     /** Suppress an unused import warning while keeping the listener type imported for Phase 1+. */

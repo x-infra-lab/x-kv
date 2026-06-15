@@ -16,6 +16,7 @@ import io.github.xinfra.lab.xkv.common.ratelimit.ConcurrencyLimitInterceptor;
 import io.github.xinfra.lab.xkv.common.tls.GrpcChannelFactory;
 import io.github.xinfra.lab.xkv.pd.transport.PdRaftServiceImpl;
 import io.github.xinfra.lab.xkv.pd.transport.PdRaftTransport;
+import io.github.xinfra.lab.xkv.common.util.CloseUtils;
 import io.grpc.Server;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -269,9 +270,7 @@ public final class PdServer {
     }
 
     public void stop() {
-        if (metricsHttpServer != null) {
-            try { metricsHttpServer.close(); } catch (Exception ignored) {}
-        }
+        CloseUtils.closeQuietly(log, "metricsHttpServer", metricsHttpServer);
         stopSchedulers();
         if (operatorController != null) operatorController.shutdown();
         if (scheduler != null) scheduler.shutdownNow();
@@ -285,9 +284,7 @@ public final class PdServer {
                 Thread.currentThread().interrupt();
             }
         }
-        if (raftNode != null) {
-            try { raftNode.close(); } catch (Throwable ignored) {}
-        }
+        CloseUtils.closeQuietly(log, "raftNode", raftNode);
         if (raftGrpcServer != null) {
             raftGrpcServer.shutdown();
             try {
@@ -298,11 +295,11 @@ public final class PdServer {
                 Thread.currentThread().interrupt();
             }
         }
-        if (raftTransport != null) {
-            try { raftTransport.close(); } catch (Throwable ignored) {}
-        }
+        CloseUtils.closeQuietly(log, "raftTransport", raftTransport);
         if (state != null) {
-            try { state.close(); } catch (Throwable ignored) {}
+            try { state.close(); } catch (Throwable e) {
+                log.warn("failed to close pdStateMachine: {}", e.getMessage(), e);
+            }
         }
     }
 

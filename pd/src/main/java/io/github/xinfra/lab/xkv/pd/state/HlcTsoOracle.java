@@ -157,7 +157,9 @@ public final class HlcTsoOracle implements Tso {
         CompletableFuture<Long> existing = inFlightExtend.get();
         if (existing != null) {
             // Some other allocator is already extending; await its result.
-            try { existing.join(); } catch (Throwable ignored) {}
+            try { existing.join(); } catch (Throwable e) {
+                log.warn("extendBound: waiting for existing extend failed: {}", e.getMessage());
+            }
             return;
         }
         var ours = new CompletableFuture<Long>();
@@ -165,7 +167,9 @@ public final class HlcTsoOracle implements Tso {
             // Lost the race; someone else is now extending. Await theirs.
             CompletableFuture<Long> live = inFlightExtend.get();
             if (live != null) {
-                try { live.join(); } catch (Throwable ignored) {}
+                try { live.join(); } catch (Throwable e) {
+                    log.warn("extendBound: waiting for live extend failed: {}", e.getMessage());
+                }
             }
             return;
         }

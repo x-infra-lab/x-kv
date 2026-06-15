@@ -139,12 +139,12 @@ final class MaxTsPersistenceTest {
     }
 
     private void teardown() {
-        if (channel != null) try { channel.shutdownNow().awaitTermination(2, TimeUnit.SECONDS); } catch (Exception ignored) {}
+        if (channel != null) try { channel.shutdownNow().awaitTermination(2, TimeUnit.SECONDS); } catch (Exception e) { e.printStackTrace(); }
         if (grpcServer != null) {
             grpcServer.shutdownNow();
-            try { grpcServer.awaitTermination(2, TimeUnit.SECONDS); } catch (InterruptedException ignored) {}
+            try { grpcServer.awaitTermination(2, TimeUnit.SECONDS); } catch (InterruptedException e) { e.printStackTrace(); }
         }
-        if (peer != null) try { peer.shutdown(); } catch (Exception ignored) {}
-        if (engine != null) try { engine.close(); } catch (Exception ignored) {}
+        if (peer != null) try { peer.shutdown(); } catch (Exception e) { e.printStackTrace(); }
+        if (engine != null) try { engine.close(); } catch (Exception e) { e.printStackTrace(); }
     }
 }

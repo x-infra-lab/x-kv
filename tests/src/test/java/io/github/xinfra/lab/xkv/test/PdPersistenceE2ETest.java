@@ -38,11 +38,11 @@ final class PdPersistenceE2ETest {
     @AfterEach
     void teardown() {
         for (var ch : channels) {
-            try { ch.shutdownNow().awaitTermination(2, TimeUnit.SECONDS); } catch (Exception ignored) {}
+            try { ch.shutdownNow().awaitTermination(2, TimeUnit.SECONDS); } catch (Exception e) { e.printStackTrace(); }
         }
         channels.clear();
         for (var s : servers) {
-            try { s.stop(); } catch (Exception ignored) {}
+            try { s.stop(); } catch (Exception e) { e.printStackTrace(); }
         }
         servers.clear();
         ClusterHarness.releaseAllPorts();
@@ -121,7 +121,7 @@ final class PdPersistenceE2ETest {
 
         // ---- Phase 2: Stop all nodes ----
         for (var ch : channels) {
-            try { ch.shutdownNow().awaitTermination(2, TimeUnit.SECONDS); } catch (Exception ignored) {}
+            try { ch.shutdownNow().awaitTermination(2, TimeUnit.SECONDS); } catch (Exception e) { e.printStackTrace(); }
         }
         channels.clear();
         for (var s : servers) s.stop();

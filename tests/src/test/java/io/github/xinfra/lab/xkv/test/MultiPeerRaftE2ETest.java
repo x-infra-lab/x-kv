@@ -282,12 +282,12 @@ final class MultiPeerRaftE2ETest {
         }
 
         void shutdown() {
-            try { channel.shutdownNow().awaitTermination(2, TimeUnit.SECONDS); } catch (Exception ignored) {}
-            try { peer.shutdown(); } catch (Exception ignored) {}
-            try { transport.close(); } catch (Exception ignored) {}
-            try { clientServer.shutdownNow().awaitTermination(2, TimeUnit.SECONDS); } catch (Exception ignored) {}
-            try { raftServer.shutdownNow().awaitTermination(2, TimeUnit.SECONDS); } catch (Exception ignored) {}
-            try { engine.close(); } catch (Exception ignored) {}
+            try { channel.shutdownNow().awaitTermination(2, TimeUnit.SECONDS); } catch (Exception e) { e.printStackTrace(); }
+            try { peer.shutdown(); } catch (Exception e) { e.printStackTrace(); }
+            try { transport.close(); } catch (Exception e) { e.printStackTrace(); }
+            try { clientServer.shutdownNow().awaitTermination(2, TimeUnit.SECONDS); } catch (Exception e) { e.printStackTrace(); }
+            try { raftServer.shutdownNow().awaitTermination(2, TimeUnit.SECONDS); } catch (Exception e) { e.printStackTrace(); }
+            try { engine.close(); } catch (Exception e) { e.printStackTrace(); }
         }
     }
 }

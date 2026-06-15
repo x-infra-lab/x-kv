@@ -29,6 +29,7 @@ public final class PerRegionRaftEngine implements RaftEngine {
 
     private final StorageEngine storage;
     private final long regionId;
+    private volatile boolean closed;
 
     private volatile long currentTerm;
     private volatile long votedFor;
@@ -130,6 +131,12 @@ public final class PerRegionRaftEngine implements RaftEngine {
         log.debug("region={} reloaded dedup entries={}", regionId, dedupCache.size());
     }
 
+    private void checkOpen() {
+        if (closed) {
+            throw new StorageException("raft engine closed for region " + regionId);
+        }
+    }
+
     @Override public long regionId() { return regionId; }
 
     // ---- hard state ----
@@ -193,6 +200,7 @@ public final class PerRegionRaftEngine implements RaftEngine {
      * (compacted) or above lastIndex (does not exist yet).
      */
     public byte[] entryAt(long index) {
+        checkOpen();
         if (index < firstIndex || index > lastIndex) return null;
         return storage.get(StorageEngine.Cf.RAFT, logKey(regionId, index));
     }
@@ -275,6 +283,7 @@ public final class PerRegionRaftEngine implements RaftEngine {
     }
 
     public Metapb.Region region() {
+        checkOpen();
         byte[] v = storage.get(StorageEngine.Cf.RAFT, regionKey(regionId));
         if (v == null) return null;
         try {
@@ -286,6 +295,7 @@ public final class PerRegionRaftEngine implements RaftEngine {
 
     @Override
     public void destroy() {
+        checkOpen();
         // Drop everything under the region's RAFT-CF subtree, then mark the
         // applied range in the data CFs for later GC by the store.
         try (var b = storage.newWriteBatch()) {
@@ -310,7 +320,9 @@ public final class PerRegionRaftEngine implements RaftEngine {
         mergeState = null;
     }
 
-    @Override public void close() { /* storage is owned by Store */ }
+    @Override public void close() {
+        closed = true;
+    }
 
     // ---- helpers ----
 

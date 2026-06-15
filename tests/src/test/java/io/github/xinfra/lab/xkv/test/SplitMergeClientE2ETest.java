@@ -43,7 +43,7 @@ final class SplitMergeClientE2ETest {
 
     @AfterEach
     void teardown() {
-        if (client != null) try { client.close(); } catch (Exception ignored) {}
+        if (client != null) try { client.close(); } catch (Exception e) { e.printStackTrace(); }
         if (harness != null) harness.close();
     }
 
@@ -175,6 +175,22 @@ final class SplitMergeClientE2ETest {
                 .pollInterval(Duration.ofMillis(50))
                 .until(() -> harness.kvNodes().stream()
                         .noneMatch(n -> n.store.peerForRegion(childRegionId).isPresent()));
+
+        // Wait for PD to reflect the merged region — the parent's heartbeat
+        // must publish its expanded range to PD before the client can route
+        // correctly. Without this wait the client hits stale PD metadata and
+        // exhausts its backoff budget.
+        Awaitility.await().atMost(Duration.ofSeconds(15))
+                .pollInterval(Duration.ofMillis(200))
+                .until(() -> {
+                    var pd = harness.pdServer().state();
+                    var parentInfo = pd.getRegion(regionId);
+                    if (parentInfo.isEmpty() || !parentInfo.get().getEndKey().isEmpty()) {
+                        return false;
+                    }
+                    return pd.getLeader(regionId).isPresent();
+                });
+        log.info("PD metadata reflects merged region");
 
         // Read all keys via the client. The client's region cache may have
         // stale entries pointing to the now-gone child region. Reads must
