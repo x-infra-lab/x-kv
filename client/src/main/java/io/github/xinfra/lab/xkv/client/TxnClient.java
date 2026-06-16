@@ -3,6 +3,7 @@ package io.github.xinfra.lab.xkv.client;
 import io.github.xinfra.lab.xkv.client.config.ClientConfig;
 import io.github.xinfra.lab.xkv.client.config.ClientConfig.RetryConfig;
 import io.github.xinfra.lab.xkv.client.config.ClientConfigLoader;
+import io.github.xinfra.lab.xkv.client.cop.CopClient;
 import io.github.xinfra.lab.xkv.client.txn.Transaction;
 
 import java.io.IOException;
@@ -30,6 +31,8 @@ public interface TxnClient extends AutoCloseable {
     <T> T executeWithRetry(TxnAction<T> action);
 
     <T> T executeWithRetry(TxnAction<T> action, RetryConfig retryConfig);
+
+    CopClient copClient();
 
     /** Block until in-flight async commits finish, then close all channels. */
     @Override void close();

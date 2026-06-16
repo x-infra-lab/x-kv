@@ -2,6 +2,8 @@ package io.github.xinfra.lab.xkv.client;
 
 import io.github.xinfra.lab.xkv.client.config.ClientConfig;
 import io.github.xinfra.lab.xkv.client.config.ClientConfig.RetryConfig;
+import io.github.xinfra.lab.xkv.client.cop.CopClient;
+import io.github.xinfra.lab.xkv.client.cop.CopClientImpl;
 import io.github.xinfra.lab.xkv.client.error.KvClientException;
 import io.github.xinfra.lab.xkv.client.pd.PdClient;
 import io.github.xinfra.lab.xkv.client.region.RegionCacheImpl;
@@ -36,6 +38,7 @@ public final class TxnClientImpl implements TxnClient {
     private final TsoBatcherImpl tso;
     private final LockResolverImpl lockResolver;
     private final TwoPhaseCommitterImpl committer;
+    private final CopClientImpl copClient;
 
     public TxnClientImpl(ClientConfig config) {
         this.config = config;
@@ -47,6 +50,8 @@ public final class TxnClientImpl implements TxnClient {
         this.tso = new TsoBatcherImpl(pdClient, config.tso());
         this.lockResolver = new LockResolverImpl(sender, tso, config.txn());
         this.committer = new TwoPhaseCommitterImpl(sender, regionCache, tso, config.backoff());
+        this.copClient = new CopClientImpl(regionCache, storeCache,
+                Runtime.getRuntime().availableProcessors() * 2, config.backoff());
     }
 
     @Override
@@ -108,6 +113,9 @@ public final class TxnClientImpl implements TxnClient {
         }
     }
 
+    @Override
+    public CopClient copClient() { return copClient; }
+
     public RegionCacheImpl regionCache() { return regionCache; }
     public StoreChannelCache storeCache() { return storeCache; }
     public TsoBatcherImpl tso() { return tso; }
@@ -115,6 +123,9 @@ public final class TxnClientImpl implements TxnClient {
 
     @Override
     public void close() {
+        try { copClient.close(); } catch (Throwable e) {
+            log.warn("copClient close failed: {}", e.getMessage(), e);
+        }
         try { tso.close(); } catch (Throwable e) {
             log.warn("tso close failed: {}", e.getMessage(), e);
         }

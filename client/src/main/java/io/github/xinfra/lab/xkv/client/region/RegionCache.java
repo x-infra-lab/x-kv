@@ -63,8 +63,8 @@ public interface RegionCache {
     /** Drop everything overlapping [start, end). */
     void invalidateRange(byte[] start, byte[] end);
 
-    /** Order-preserving scan; used by BatchGet auto-grouping. */
-    List<RegionInfo> scan(byte[] startKey, byte[] endKey, int limit);
+    /** Order-preserving scan of all regions covering [startKey, endKey). */
+    List<RegionInfo> scan(byte[] startKey, byte[] endKey);
 
     int size();
 

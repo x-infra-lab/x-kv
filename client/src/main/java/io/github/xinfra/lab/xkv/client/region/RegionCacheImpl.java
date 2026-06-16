@@ -153,24 +153,19 @@ public final class RegionCacheImpl implements RegionCache {
     }
 
     @Override
-    public List<RegionInfo> scan(byte[] startKey, byte[] endKey, int limit) {
-        idxLock.readLock().lock();
-        try {
-            var out = new ArrayList<RegionInfo>();
-            byte[] cursor = startKey;
-            for (int i = 0; i < limit; i++) {
-                var info = lookupLocked(cursor);
-                if (info == null) break;
-                out.add(info);
-                byte[] next = info.region().getEndKey().toByteArray();
-                if (next.length == 0) break;     // +∞
-                if (endKey != null && Arrays.compareUnsigned(next, endKey) >= 0) break;
-                cursor = next;
-            }
-            return out;
-        } finally {
-            idxLock.readLock().unlock();
+    public List<RegionInfo> scan(byte[] startKey, byte[] endKey) {
+        var out = new ArrayList<RegionInfo>();
+        byte[] cursor = startKey;
+        while (true) {
+            var info = locateKey(cursor).orElse(null);
+            if (info == null) break;
+            out.add(info);
+            byte[] next = info.region().getEndKey().toByteArray();
+            if (next.length == 0) break;
+            if (endKey != null && Arrays.compareUnsigned(next, endKey) >= 0) break;
+            cursor = next;
         }
+        return out;
     }
 
     @Override public int size() { return byId.size(); }
