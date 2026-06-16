@@ -1,0 +1,92 @@
+syntax = "proto3";
+
+package tipb;
+
+option java_package = "io.github.xinfra.lab.xkv.proto";
+option java_outer_classname = "Tipb";
+option java_multiple_files = false;
+
+message Datum {
+    oneof value {
+        int64 int_val = 1;
+        double double_val = 2;
+        string decimal_val = 3;
+        string string_val = 4;
+        bytes bytes_val = 5;
+        string datetime_val = 6;
+        bool null_val = 7;
+    }
+}
+
+enum ExprType {
+    CONSTANT = 0;
+    COLUMN_REF = 1;
+    BINARY_OP = 2;
+    UNARY_OP = 3;
+    LIKE = 4;
+    IN = 5;
+    BETWEEN = 6;
+    CAST = 7;
+    CASE_WHEN = 8;
+    FUNCTION_CALL = 9;
+}
+
+message Expr {
+    ExprType tp = 1;
+    Datum val = 2;
+    string table_name = 3;
+    string column_name = 4;
+    int32 column_index = 5;
+    int32 data_type = 6;
+    int32 op = 7;
+    repeated Expr children = 8;
+    bool not = 9;
+    string func_name = 10;
+}
+
+message ColumnInfo {
+    int64 column_id = 1;
+    int32 data_type = 2;
+    bool auto_increment = 3;
+    int32 offset = 4;
+}
+
+message AggFuncDesc {
+    int32 agg_type = 1;
+    bool distinct = 2;
+    Expr arg = 3;
+}
+
+message ByItem {
+    Expr expr = 1;
+    bool desc = 2;
+}
+
+message DAGRequest {
+    int64 table_id = 1;
+    repeated ColumnInfo columns = 2;
+    repeated int32 output_column_indices = 3;
+    repeated Expr conditions = 4;
+    repeated Expr group_by_exprs = 5;
+    repeated AggFuncDesc agg_funcs = 6;
+    int64 topn_limit = 7;
+    int64 topn_offset = 8;
+    repeated ByItem order_by = 9;
+}
+
+message PartialAggState {
+    int32 agg_type = 1;
+    bool distinct = 2;
+    repeated Datum state = 3;
+}
+
+message AggGroupResult {
+    repeated Datum group_keys = 1;
+    repeated PartialAggState partial_states = 2;
+}
+
+message SelectResponse {
+    bytes kv_pair_data = 1;
+    repeated AggGroupResult agg_groups = 2;
+    bool is_agg = 3;
+}

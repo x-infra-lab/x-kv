@@ -183,6 +183,7 @@ public final class KvServer {
         // 8) Build CoprocessorService and start client-facing gRPC server.
         var copService = new CoprocessorService();
         copService.register(new TableScanCoprocessor(engine));
+        copService.register(new io.github.xinfra.lab.xkv.kv.coprocessor.SQLScanCoprocessor(engine));
 
         // CDC service — resolved TS uses the initial region's CM.
         cdcService = new ChangeDataServiceImpl(cdcEventBus, () -> cm.maxTs().current());
