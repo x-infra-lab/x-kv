@@ -90,3 +90,25 @@ message SelectResponse {
     repeated AggGroupResult agg_groups = 2;
     bool is_agg = 3;
 }
+
+message AnalyzeReq {
+    int64 table_id = 1;
+    repeated ColumnInfo columns = 2;
+    repeated int32 output_column_indices = 3;
+    int32 sample_size = 4;
+}
+
+message AnalyzeColumnResult {
+    int64 column_id = 1;
+    int64 ndv = 2;
+    int64 null_count = 3;
+    int64 total_count = 4;
+    Datum min_value = 5;
+    Datum max_value = 6;
+    repeated Datum sample_values = 7;
+}
+
+message AnalyzeResult {
+    int64 row_count = 1;
+    repeated AnalyzeColumnResult column_results = 2;
+}

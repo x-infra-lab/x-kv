@@ -184,6 +184,7 @@ public final class KvServer {
         var copService = new CoprocessorService();
         copService.register(new TableScanCoprocessor(engine));
         copService.register(new io.github.xinfra.lab.xkv.kv.coprocessor.SQLScanCoprocessor(engine));
+        copService.register(new io.github.xinfra.lab.xkv.kv.coprocessor.AnalyzeCoprocessor(engine));
 
         // CDC service — resolved TS uses the initial region's CM.
         cdcService = new ChangeDataServiceImpl(cdcEventBus, () -> cm.maxTs().current());
