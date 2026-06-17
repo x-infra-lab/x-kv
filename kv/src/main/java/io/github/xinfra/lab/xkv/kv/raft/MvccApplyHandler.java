@@ -747,11 +747,12 @@ public final class MvccApplyHandler implements ApplyHandler {
      * layer's DROP TABLE / TRUNCATE path that has already coordinated
      * with running transactions (e.g., via service safe-points).
      *
-     * <p>Implementation: a single {@code DeleteRange} over each CF.
-     * Lock CF spans the user-key range directly. Default and Write CFs
-     * span {@code [start, end || 0xFF*9)} since their keys are
-     * {@code userKey || 8B-ts-suffix} (the {@code afterAllVersionsOf}
-     * helper produces the right upper bound).
+     * <p>Implementation: {@code deleteRange(lockKey(start), lockKey(end))}
+     * on all three CFs. This works because {@link KeyCodec#encodeBytes}
+     * is prefix-free: {@code encodeBytes(x)} is never a prefix of
+     * {@code encodeBytes(y)} for {@code x != y}, so MVCC keys
+     * ({@code encodeBytes(userKey) || ts_suffix}) for any {@code userKey}
+     * in {@code [start, end)} fall within {@code [lockKey(start), lockKey(end))}.
      */
     private Result applyTxnDeleteRange(byte[] payload, StorageEngine.WriteBatch batch)
             throws InvalidProtocolBufferException {

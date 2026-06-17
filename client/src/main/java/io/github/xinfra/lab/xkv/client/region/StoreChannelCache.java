@@ -13,6 +13,7 @@ import io.grpc.ManagedChannel;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -32,22 +33,30 @@ public final class StoreChannelCache implements AutoCloseable {
     private final PdClient pdClient;
     private final TlsConfig tls;
     private final String authToken;
+    private final long grpcTimeoutMs;
     private final ConcurrentHashMap<Long, Entry> byStoreId = new ConcurrentHashMap<>();
 
     public StoreChannelCache(PdClient pdClient) {
-        this(pdClient, null, null);
+        this(pdClient, null, null, null);
     }
 
     public StoreChannelCache(PdClient pdClient, TlsConfig tls, String authToken) {
+        this(pdClient, tls, authToken, null);
+    }
+
+    public StoreChannelCache(PdClient pdClient, TlsConfig tls, String authToken,
+                             Duration grpcTimeout) {
         this.pdClient = pdClient;
         this.tls = tls;
         this.authToken = authToken;
+        this.grpcTimeoutMs = grpcTimeout != null ? grpcTimeout.toMillis() : 10_000L;
     }
 
     /** Resolve and dial — returns null if PD doesn't know the store. */
     public TikvGrpc.TikvBlockingStub stubFor(long storeId) {
         var e = byStoreId.computeIfAbsent(storeId, this::dial);
-        return e == null ? null : e.stub;
+        return e == null ? null
+                : e.stub.withDeadlineAfter(grpcTimeoutMs, TimeUnit.MILLISECONDS);
     }
 
     private Entry dial(long storeId) {

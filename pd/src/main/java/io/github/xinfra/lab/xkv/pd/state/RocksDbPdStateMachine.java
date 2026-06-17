@@ -62,6 +62,7 @@ public final class RocksDbPdStateMachine implements PdStateMachine {
     private static final byte PREFIX_BOOTSTRAPPED = 0x01;
     private static final byte PREFIX_CLUSTER = 0x02;
     private static final byte PREFIX_ID_ALLOC = 0x03;
+    private static final byte PREFIX_TSO_BOUND = 0x04;
     private static final byte PREFIX_STORE = 0x10;
     private static final byte PREFIX_REGION = 0x20;
     private static final byte PREFIX_REGION_START_KEY = 0x30;
@@ -77,6 +78,7 @@ public final class RocksDbPdStateMachine implements PdStateMachine {
     private final NavigableMap<ByteString, Metapb.Region> regionsByStart = new TreeMap<>(
             (a, b) -> ByteString.unsignedLexicographicalComparator().compare(a, b));
     private final AtomicLong idAllocator = new AtomicLong(1000);
+    private volatile long tsoBound;
 
     private final HashMap<Long, Metapb.Peer> leaders = new HashMap<>();
     private final ConcurrentHashMap<Long, RegionStats> regionStats = new ConcurrentHashMap<>();
@@ -122,6 +124,11 @@ public final class RocksDbPdStateMachine implements PdStateMachine {
             val = db.get(new byte[]{PREFIX_ID_ALLOC});
             if (val != null && val.length == 8) {
                 idAllocator.set(decodeLong(val));
+            }
+
+            val = db.get(new byte[]{PREFIX_TSO_BOUND});
+            if (val != null && val.length == 8) {
+                tsoBound = decodeLong(val);
             }
 
             try (RocksIterator it = db.newIterator()) {
@@ -379,7 +386,8 @@ public final class RocksDbPdStateMachine implements PdStateMachine {
         try {
             var snap = PdInternalpb.PdSnapshot.newBuilder()
                     .setBootstrapped(bootstrapped)
-                    .setIdAllocatorNext(idAllocator.get());
+                    .setIdAllocatorNext(idAllocator.get())
+                    .setTsoPhysicalBound(tsoBound);
             if (cluster != null) snap.setCluster(cluster);
             for (var s : stores.values()) snap.addStores(s);
             for (var r : regionsById.values()) snap.addRegions(r);
@@ -409,6 +417,9 @@ public final class RocksDbPdStateMachine implements PdStateMachine {
             if (snap.getIdAllocatorNext() > 0) {
                 idAllocator.set(snap.getIdAllocatorNext());
             }
+            if (snap.getTsoPhysicalBound() > 0) {
+                tsoBound = snap.getTsoPhysicalBound();
+            }
 
             clearAndWriteAll();
             log.info("PD snapshot installed: {} stores, {} regions, idAlloc={}",
@@ -437,6 +448,9 @@ public final class RocksDbPdStateMachine implements PdStateMachine {
                 batch.put(new byte[]{PREFIX_CLUSTER}, cluster.toByteArray());
             }
             batch.put(new byte[]{PREFIX_ID_ALLOC}, encodeLong(idAllocator.get()));
+            if (tsoBound > 0) {
+                batch.put(new byte[]{PREFIX_TSO_BOUND}, encodeLong(tsoBound));
+            }
             for (var s : stores.values()) {
                 batch.put(storeKey(s.getId()), s.toByteArray());
             }
@@ -478,6 +492,19 @@ public final class RocksDbPdStateMachine implements PdStateMachine {
         } catch (Exception e) {
             log.warn("applyCommand failed: {}", e.getMessage());
         }
+    }
+
+    public void saveTsoBound(long bound) {
+        try {
+            db.put(syncWrite, new byte[]{PREFIX_TSO_BOUND}, encodeLong(bound));
+            this.tsoBound = bound;
+        } catch (RocksDBException e) {
+            throw new RuntimeException("saveTsoBound write failed", e);
+        }
+    }
+
+    public long loadTsoBound() {
+        return tsoBound;
     }
 
     @Override public void onBecomeLeader() {}

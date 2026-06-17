@@ -149,14 +149,16 @@ public final class RocksStorageEngine implements StorageEngine {
                 .setCacheIndexAndFilterBlocks(true)
                 .setPinL0FilterAndIndexBlocksInCache(true)
                 .setBlockSize(16 * 1024);
+        // NOTE: do NOT call optimizeForPointLookup() — it replaces the
+        // table format config, discarding bloom filter + shared block cache.
         var opts = new ColumnFamilyOptions()
                 .setTableFormatConfig(table)
                 .setWriteBufferSize(writeBuffer)
                 .setMaxWriteBufferNumber(tinyHot ? 2 : 4)
                 .setCompactionStyle(CompactionStyle.LEVEL)
                 .setLevelCompactionDynamicLevelBytes(true)
-                .setCompressionType(CompressionType.LZ4_COMPRESSION);
-        opts.optimizeForPointLookup(cache.getUsage() == 0 ? 64L << 20 : 256L << 20);
+                .setCompressionType(CompressionType.LZ4_COMPRESSION)
+                .setMemtablePrefixBloomSizeRatio(0.02);
         return opts;
     }
 
@@ -457,10 +459,14 @@ public final class RocksStorageEngine implements StorageEngine {
         @Override public boolean isValid() { return inner.isValid(); }
         @Override public byte[] key()      { return inner.key(); }
         @Override public byte[] value()    { return inner.value(); }
-        @Override public void seek(byte[] key) { inner.seek(key); }
-        @Override public void seekForPrev(byte[] key) { inner.seekForPrev(key); }
-        @Override public void next()  { inner.next(); }
-        @Override public void prev()  { inner.prev(); }
+        @Override public void seek(byte[] key) { inner.seek(key); checkStatus(); }
+        @Override public void seekForPrev(byte[] key) { inner.seekForPrev(key); checkStatus(); }
+        @Override public void next()  { inner.next(); checkStatus(); }
+        @Override public void prev()  { inner.prev(); checkStatus(); }
+        @Override public void checkStatus() {
+            try { inner.status(); }
+            catch (RocksDBException e) { throw StorageException.from("iterator", e); }
+        }
         @Override public void close() {
             if (closed) return;
             closed = true;

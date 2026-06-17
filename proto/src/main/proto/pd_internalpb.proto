@@ -97,6 +97,8 @@ message PdSnapshot {
     repeated RegionStatsEntry region_stats = 8;
 
     reserved 9 to 30;
+
+    uint64 tso_physical_bound = 31;
 }
 
 message RegionStatsEntry {

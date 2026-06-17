@@ -82,7 +82,12 @@ public final class PdServer {
 
     public void start() throws IOException {
         state = new RocksDbPdStateMachine(config.dataDir().resolve("pd-state"));
-        tso = new HlcTsoOracle(0, target -> CompletableFuture.completedFuture(target),
+        long savedBound = state.loadTsoBound();
+        tso = new HlcTsoOracle(savedBound,
+                target -> {
+                    state.saveTsoBound(target);
+                    return CompletableFuture.completedFuture(target);
+                },
                 System::currentTimeMillis,
                 config.tso().savedIntervalMs());
         safePoint = new InMemorySafePointService();
@@ -139,6 +144,7 @@ public final class PdServer {
         } else {
             raftNode.setLeaderObserver(isLeader -> {
                 if (isLeader) {
+                    tso.reloadAfterLeaderChange();
                     startSchedulers();
                 } else {
                     stopSchedulers();

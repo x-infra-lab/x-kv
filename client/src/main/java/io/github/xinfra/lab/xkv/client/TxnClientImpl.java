@@ -44,7 +44,8 @@ public final class TxnClientImpl implements TxnClient {
         this.config = config;
         var tls = config.conn() != null ? config.conn().tls() : null;
         this.pdClient = new PdClient(config.pdEndpoints(), tls, config.authToken());
-        this.storeCache = new StoreChannelCache(pdClient, tls, config.authToken());
+        this.storeCache = new StoreChannelCache(pdClient, tls, config.authToken(),
+                config.grpcTimeout());
         this.regionCache = new RegionCacheImpl(pdClient, config.regionCache());
         this.sender = new RegionRequestSenderImpl(regionCache, storeCache);
         this.tso = new TsoBatcherImpl(pdClient, config.tso());

@@ -110,6 +110,8 @@ public interface StorageEngine extends AutoCloseable {
         void seekForPrev(byte[] key);
         void next();
         void prev();
+        /** Throws {@link StorageException} if the iterator encountered an I/O error. */
+        default void checkStatus() {}
         @Override void close();
     }
 
