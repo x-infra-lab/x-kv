@@ -116,11 +116,12 @@ public final class OperatorControllerImpl implements OperatorController {
         evictExpired();
 
         var record = inFlight.get(regionId);
-        if (record == null) return Optional.empty();
+        if (record == null) return queue.poll(regionId);
 
         var outcome = record.operator().observe(hb);
         if (outcome == Operator.Outcome.FINISHED || outcome == Operator.Outcome.FAILED) {
             removeOperator(regionId);
+            queue.poll(regionId);
         }
 
         return Optional.of(record.operator().next(hb));

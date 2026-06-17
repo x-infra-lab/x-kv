@@ -4,9 +4,7 @@ import io.github.xinfra.lab.xkv.proto.Metapb;
 import io.github.xinfra.lab.xkv.proto.Pdpb;
 
 import java.util.Optional;
-import java.util.Queue;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
 
 /**
  * Per-region FIFO of pending operators that PD wants the region's leader
@@ -36,7 +34,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  */
 public final class OperatorQueue {
 
-    private final ConcurrentHashMap<Long, Queue<Pdpb.RegionHeartbeatResponse>> byRegion = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Long, Pdpb.RegionHeartbeatResponse> byRegion = new ConcurrentHashMap<>();
 
     /** Schedule a leadership transfer to {@code target} on {@code regionId}. */
     public void scheduleTransferLeader(long regionId, Metapb.Peer target) {
@@ -78,24 +76,21 @@ public final class OperatorQueue {
         offer(regionId, resp);
     }
 
-    /** Pop the next operator for this region, if any. */
+    /** Pop the operator for this region, if any. */
     public Optional<Pdpb.RegionHeartbeatResponse> poll(long regionId) {
-        var q = byRegion.get(regionId);
-        if (q == null) return Optional.empty();
-        var op = q.poll();
+        var op = byRegion.remove(regionId);
         return Optional.ofNullable(op);
     }
 
-    /** Diagnostic: queued operator count for one region. */
+    /** Diagnostic: whether an operator is queued for this region. */
     public int size(long regionId) {
-        var q = byRegion.get(regionId);
-        return q == null ? 0 : q.size();
+        return byRegion.containsKey(regionId) ? 1 : 0;
     }
 
     /** Drop every queued operator (used on PD shutdown). */
     public void clear() { byRegion.clear(); }
 
     void offer(long regionId, Pdpb.RegionHeartbeatResponse op) {
-        byRegion.computeIfAbsent(regionId, k -> new ConcurrentLinkedQueue<>()).offer(op);
+        byRegion.put(regionId, op);
     }
 }

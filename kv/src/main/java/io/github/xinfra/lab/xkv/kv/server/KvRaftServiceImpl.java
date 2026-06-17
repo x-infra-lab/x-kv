@@ -33,8 +33,12 @@ import java.util.List;
 public final class KvRaftServiceImpl extends KvRaftGrpc.KvRaftImplBase {
     private static final Logger log = LoggerFactory.getLogger(KvRaftServiceImpl.class);
 
+    private static final int MAX_CONCURRENT_SNAPSHOTS = 2;
+
     private final RaftMessageDispatcher dispatcher;
     private final SnapshotEngine snapshotEngine;
+    private final java.util.concurrent.Semaphore snapshotPermits =
+            new java.util.concurrent.Semaphore(MAX_CONCURRENT_SNAPSHOTS);
     private final Counter raftParseErrors = XKvMetrics.errorCounter("kv_raft_service", "raft_parse");
     private final Counter snapshotInstallErrors = XKvMetrics.errorCounter("kv_raft_service", "snapshot_install");
 
@@ -82,8 +86,14 @@ public final class KvRaftServiceImpl extends KvRaftGrpc.KvRaftImplBase {
                     .asRuntimeException());
             return new NoopRequestObserver<>();
         }
+        if (!snapshotPermits.tryAcquire()) {
+            resp.onError(Status.RESOURCE_EXHAUSTED
+                    .withDescription("too many concurrent snapshot receives")
+                    .asRuntimeException());
+            return new NoopRequestObserver<>();
+        }
         return new StreamObserver<>() {
-            private static final long MAX_SNAPSHOT_BYTES = 256L * 1024 * 1024;
+            private static final long MAX_SNAPSHOT_BYTES = 64L * 1024 * 1024;
             private final List<SnapshotChunk> buffered = new ArrayList<>();
             private long regionId = 0;
             private long totalBytes = 0;
@@ -102,9 +112,9 @@ public final class KvRaftServiceImpl extends KvRaftGrpc.KvRaftImplBase {
 
             @Override
             public void onError(Throwable t) {
-                // Discard everything; sender will retry.
                 log.warn("sendSnapshot stream error region={}: {}", regionId, t.getMessage());
                 buffered.clear();
+                snapshotPermits.release();
             }
 
             @Override
@@ -121,6 +131,7 @@ public final class KvRaftServiceImpl extends KvRaftGrpc.KvRaftImplBase {
                             "snapshot install failed: " + t.getMessage()).asRuntimeException());
                 } finally {
                     buffered.clear();
+                    snapshotPermits.release();
                 }
             }
         };

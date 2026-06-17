@@ -138,6 +138,7 @@ public final class PdServer {
 
         operatorController = new io.github.xinfra.lab.xkv.pd.state.OperatorControllerImpl(
                 operators, config.scheduler().maxOperatorsPerStore(), OPERATOR_TIMEOUT_MS);
+        service.setOperatorController(operatorController);
 
         if (config.peers().isEmpty()) {
             startSchedulers();

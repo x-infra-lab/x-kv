@@ -51,6 +51,7 @@ public final class GrpcRaftTransport implements Transport {
     private volatile MessageReceiver receiver;
     private volatile boolean closed = false;
     private final Counter sendErrorCounter = XKvMetrics.errorCounter("raft_transport", "send");
+    private final java.util.concurrent.ExecutorService snapshotSender;
 
     public GrpcRaftTransport(long regionId, long selfPeerId) {
         this(regionId, selfPeerId, null);
@@ -60,6 +61,11 @@ public final class GrpcRaftTransport implements Transport {
         this.regionId = regionId;
         this.selfPeerId = selfPeerId;
         this.tls = tls;
+        this.snapshotSender = java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+            var t = new Thread(r, "snap-send-" + regionId);
+            t.setDaemon(true);
+            return t;
+        });
     }
 
     public long regionId() { return regionId; }
@@ -114,6 +120,7 @@ public final class GrpcRaftTransport implements Transport {
     @Override
     public void close() {
         closed = true;
+        snapshotSender.shutdownNow();
         for (var link : outbound.values()) link.close();
         outbound.clear();
         addresses.clear();
@@ -141,7 +148,7 @@ public final class GrpcRaftTransport implements Transport {
         void send(Eraftpb.Message msg) {
             if (closing) return;
             if (msg.getMsgType() == Eraftpb.MessageType.MsgSnapshot) {
-                sendViaSnapshotStream(msg);
+                snapshotSender.submit(() -> sendViaSnapshotStream(msg));
                 return;
             }
             ensureStream();

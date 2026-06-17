@@ -54,9 +54,17 @@ public final class StoreChannelCache implements AutoCloseable {
 
     /** Resolve and dial — returns null if PD doesn't know the store. */
     public TikvGrpc.TikvBlockingStub stubFor(long storeId) {
-        var e = byStoreId.computeIfAbsent(storeId, this::dial);
-        return e == null ? null
-                : e.stub.withDeadlineAfter(grpcTimeoutMs, TimeUnit.MILLISECONDS);
+        var e = byStoreId.get(storeId);
+        if (e == null) {
+            e = dial(storeId);
+            if (e == null) return null;
+            var prev = byStoreId.putIfAbsent(storeId, e);
+            if (prev != null) {
+                close(e);
+                e = prev;
+            }
+        }
+        return e.stub.withDeadlineAfter(grpcTimeoutMs, TimeUnit.MILLISECONDS);
     }
 
     private Entry dial(long storeId) {

@@ -111,6 +111,8 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
      */
     private volatile io.github.xinfra.lab.xkv.pd.raft.PdRaftNode raftNode;
 
+    private volatile io.github.xinfra.lab.xkv.pd.state.OperatorController operatorController;
+
     public record MemberInfo(long id, String name, String clientAddress) {}
 
     public PdServiceImpl(PdStateMachine state,
@@ -189,6 +191,10 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
     /** Wire the raft node for multi-PD replication. */
     public void setRaftNode(io.github.xinfra.lab.xkv.pd.raft.PdRaftNode node) {
         this.raftNode = node;
+    }
+
+    public void setOperatorController(io.github.xinfra.lab.xkv.pd.state.OperatorController oc) {
+        this.operatorController = oc;
     }
 
     /** Test / scheduler hook: enqueue operators visible to the next heartbeat. */
@@ -450,9 +456,7 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
         return new io.grpc.stub.StreamObserver<>() {
             @Override
             public void onNext(RegionHeartbeatRequest hb) {
-                if (hb.hasRegion()) {
-                    // Region metadata update goes through raft so all PD
-                    // nodes see the same region table.
+                if (hb.hasRegion() && shouldUpdateRegion(hb.getRegion())) {
                     var rn = raftNode;
                     if (rn != null && rn.isLeader()) {
                         var cmd = io.github.xinfra.lab.xkv.proto.PdInternalpb.PdCommand.newBuilder()
@@ -478,16 +482,15 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
                 if (hb.hasLeader() && hb.hasRegion()) {
                     state.updateLeader(hb.getRegion().getId(), hb.getLeader());
                 }
-                // Drain at most one operator per heartbeat — same shape as
-                // TiKV. If the scheduler queued multiple, the next heartbeat
-                // (typically within a few hundred ms) picks up the next one.
-                long regionId = hb.hasRegion() ? hb.getRegion().getId() : 0L;
-                var op = operators == null
-                        ? java.util.Optional.<RegionHeartbeatResponse>empty()
-                        : operators.poll(regionId);
-                if (op.isPresent()) {
-                    var b = op.get().toBuilder().setHeader(header());
-                    obs.onNext(b.build());
+                // Drive operator lifecycle via the controller — this evicts
+                // expired operators, calls observe() for step tracking, and
+                // decrements per-store in-flight counters on completion.
+                var oc = operatorController;
+                var opResp = oc != null
+                        ? oc.dispatch(hb)
+                        : java.util.Optional.<RegionHeartbeatResponse>empty();
+                if (opResp.isPresent()) {
+                    obs.onNext(opResp.get().toBuilder().setHeader(header()).build());
                 } else {
                     obs.onNext(RegionHeartbeatResponse.newBuilder().setHeader(header()).build());
                 }
@@ -760,6 +763,16 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
         }
         obs.onNext(CleanupWaitForResponse.newBuilder().setHeader(header()).build());
         obs.onCompleted();
+    }
+
+    private boolean shouldUpdateRegion(io.github.xinfra.lab.xkv.proto.Metapb.Region incoming) {
+        var existing = state.getRegion(incoming.getId());
+        if (existing.isEmpty()) return true;
+        var a = incoming.getRegionEpoch();
+        var b = existing.get().getRegionEpoch();
+        if (a.getConfVer() > b.getConfVer()) return true;
+        if (a.getConfVer() < b.getConfVer()) return false;
+        return a.getVersion() >= b.getVersion();
     }
 
     /** Stable 64-bit hash for the lock-key — matches TiKV's deadlock_key_hash. */

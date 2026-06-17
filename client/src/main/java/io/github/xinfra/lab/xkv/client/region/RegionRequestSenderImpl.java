@@ -81,6 +81,7 @@ public final class RegionRequestSenderImpl implements RegionRequestSender {
                 resp = call.apply(stub, info);
             } catch (StatusRuntimeException e) {
                 if (isNetworkError(e)) {
+                    stores.closeStore(leaderStore);
                     backoffer.backoff(Backoffer.Reason.NETWORK, e.getStatus().toString());
                     continue;
                 }

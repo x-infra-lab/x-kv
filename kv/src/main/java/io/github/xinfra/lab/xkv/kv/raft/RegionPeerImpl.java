@@ -241,6 +241,15 @@ public final class RegionPeerImpl implements RegionPeer {
                 while ((ccFut = pendingConfChanges.poll()) != null) {
                     ccFut.complete(ApplyResult.err("leader stepped down"));
                 }
+                var notLeader = RaftException.ErrStopped;
+                for (var e : pendingReadIndices.values()) {
+                    e.completeExceptionally(notLeader);
+                }
+                pendingReadIndices.clear();
+                for (var waiters : readIndexWaiters.values()) {
+                    for (var f : waiters) f.completeExceptionally(notLeader);
+                }
+                readIndexWaiters.clear();
             }
             if (was != isLeader) {
                 log.info("region={} peer={} isLeader={} (newLeader={})",
