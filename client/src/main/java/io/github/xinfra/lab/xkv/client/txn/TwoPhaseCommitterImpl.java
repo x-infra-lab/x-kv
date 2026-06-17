@@ -197,21 +197,56 @@ public final class TwoPhaseCommitterImpl implements TwoPhaseCommitter {
     }
 
     private Kvrpcpb.CommitResponse doCommitGroup(Backoffer bo, long startTs, long commitTs, List<ByteString> keys) {
-        byte[] sample = keys.get(0).toByteArray();
-        return sender.sendKeyed(sample, bo,
-                (stub, info) -> {
-                    var b = Kvrpcpb.CommitRequest.newBuilder()
-                            .setContext(Kvrpcpb.Context.newBuilder()
-                                    .setRegionId(info.region().getId())
-                                    .setRegionEpoch(info.region().getRegionEpoch())
-                                    .setPeer(info.leader())
-                                    .build())
-                            .setStartVersion(startTs)
-                            .setCommitVersion(commitTs);
-                    for (var k : keys) b.addKeys(k);
-                    return stub.kvCommit(b.build());
-                },
-                Kvrpcpb.CommitResponse::getRegionError);
+        var remaining = new ArrayList<>(keys);
+        Kvrpcpb.CommitResponse lastResp = null;
+        while (!remaining.isEmpty()) {
+            byte[] routeKey = remaining.get(0).toByteArray();
+            final var batch = List.copyOf(remaining);
+            lastResp = sender.sendKeyed(routeKey, bo,
+                    (stub, info) -> {
+                        var region = info.region();
+                        var b = Kvrpcpb.CommitRequest.newBuilder()
+                                .setContext(Kvrpcpb.Context.newBuilder()
+                                        .setRegionId(region.getId())
+                                        .setRegionEpoch(region.getRegionEpoch())
+                                        .setPeer(info.leader())
+                                        .build())
+                                .setStartVersion(startTs)
+                                .setCommitVersion(commitTs);
+                        for (var k : batch) {
+                            if (keyInRegion(k, region)) b.addKeys(k);
+                        }
+                        if (b.getKeysCount() == 0) {
+                            return Kvrpcpb.CommitResponse.newBuilder()
+                                    .setCommitVersion(commitTs).build();
+                        }
+                        return stub.kvCommit(b.build());
+                    },
+                    Kvrpcpb.CommitResponse::getRegionError);
+            if (lastResp.hasError()) return lastResp;
+
+            var loc = regionCache.locateKey(routeKey);
+            if (loc.isEmpty()) break;
+            var next = new ArrayList<ByteString>();
+            var region = loc.get().region();
+            for (var k : batch) {
+                if (!keyInRegion(k, region)) next.add(k);
+            }
+            if (next.size() == remaining.size()) break;
+            remaining = next;
+        }
+        return lastResp != null ? lastResp
+                : Kvrpcpb.CommitResponse.newBuilder().setCommitVersion(commitTs).build();
+    }
+
+    private static boolean keyInRegion(ByteString key,
+                                        io.github.xinfra.lab.xkv.proto.Metapb.Region region) {
+        byte[] kb = key.toByteArray();
+        byte[] startKey = region.getStartKey().toByteArray();
+        byte[] endKey = region.getEndKey().toByteArray();
+        if (startKey.length > 0 && java.util.Arrays.compareUnsigned(kb, startKey) < 0) return false;
+        if (endKey.length > 0 && java.util.Arrays.compareUnsigned(kb, endKey) >= 0) return false;
+        return true;
     }
 
     private Kvrpcpb.PrewriteResponse doPrewriteGroup(TxnContext ctx, byte[] primary,

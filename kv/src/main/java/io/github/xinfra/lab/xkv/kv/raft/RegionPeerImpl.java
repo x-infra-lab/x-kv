@@ -652,17 +652,18 @@ public final class RegionPeerImpl implements RegionPeer {
             if (fut != null) fut.complete(pd.result);
         }
 
-        // Conf-change apply (after the batch flush).
-        for (var cc : confChanges) {
-            applyConfChangeOne(cc);
-        }
-
-        // 5) Send out raft messages.
+        // Send raft messages before conf-change so the peer topology
+        // is stable while messages prepared by this Ready are dispatched.
         if (ready.messages() != null) {
             for (var msg : ready.messages()) {
                 if (msg.getTo() == self.getId()) continue;
                 transport.send(msg.getTo(), msg);
             }
+        }
+
+        // Conf-change apply (after messages are dispatched).
+        for (var cc : confChanges) {
+            applyConfChangeOne(cc);
         }
     }
 

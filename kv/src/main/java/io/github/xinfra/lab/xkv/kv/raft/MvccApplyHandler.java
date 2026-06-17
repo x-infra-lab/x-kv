@@ -127,7 +127,7 @@ public final class MvccApplyHandler implements ApplyHandler {
             }
         }
 
-        try (var reader = new MvccReader(engine, null, true /* ignoreLocks for inner reads */)) {
+        try (var snap = engine.newSnapshot(); var reader = new MvccReader(engine, snap, true)) {
         var txn = new MvccTxn(batch, reader);
 
         // Pass 1: check every mutation. Pessimistic-locked mutations skip
@@ -251,7 +251,7 @@ public final class MvccApplyHandler implements ApplyHandler {
     private Result applyCommit(byte[] payload, StorageEngine.WriteBatch batch)
             throws InvalidProtocolBufferException {
         var req = Kvrpcpb.CommitRequest.parseFrom(payload);
-        try (var reader = new MvccReader(engine, null, true)) {
+        try (var snap = engine.newSnapshot(); var reader = new MvccReader(engine, snap, true)) {
 
         // Pass 1: probe every key into a throwaway batch so failure on a
         // late key doesn't leak a partial commit through. The throwaway
@@ -356,7 +356,7 @@ public final class MvccApplyHandler implements ApplyHandler {
     private Result applyRollback(byte[] payload, StorageEngine.WriteBatch batch)
             throws InvalidProtocolBufferException {
         var req = Kvrpcpb.BatchRollbackRequest.parseFrom(payload);
-        try (var reader = new MvccReader(engine, null, true)) {
+        try (var snap = engine.newSnapshot(); var reader = new MvccReader(engine, snap, true)) {
         var txn = new MvccTxn(batch, reader);
 
         for (var k : req.getKeysList()) {
@@ -389,7 +389,7 @@ public final class MvccApplyHandler implements ApplyHandler {
     private Result applyPessimisticLock(byte[] payload, StorageEngine.WriteBatch batch)
             throws InvalidProtocolBufferException {
         var req = Kvrpcpb.PessimisticLockRequest.parseFrom(payload);
-        try (var reader = new MvccReader(engine, null, true)) {
+        try (var snap = engine.newSnapshot(); var reader = new MvccReader(engine, snap, true)) {
         var txn = new MvccTxn(batch, reader);
         // SI: bump max_ts to at least for_update_ts so that any subsequent
         // prewrite for THIS txn (or another) computes min_commit_ts ≥
@@ -431,7 +431,7 @@ public final class MvccApplyHandler implements ApplyHandler {
     private Result applyPessimisticRollback(byte[] payload, StorageEngine.WriteBatch batch)
             throws InvalidProtocolBufferException {
         var req = Kvrpcpb.PessimisticRollbackRequest.parseFrom(payload);
-        try (var reader = new MvccReader(engine, null, true)) {
+        try (var snap = engine.newSnapshot(); var reader = new MvccReader(engine, snap, true)) {
         var txn = new MvccTxn(batch, reader);
         for (var k : req.getKeysList()) {
             txn.pessimisticRollback(k.toByteArray(), req.getStartVersion(), req.getForUpdateTs());
@@ -471,7 +471,7 @@ public final class MvccApplyHandler implements ApplyHandler {
     private Result applyResolveLock(byte[] payload, StorageEngine.WriteBatch batch)
             throws InvalidProtocolBufferException {
         var req = Kvrpcpb.ResolveLockRequest.parseFrom(payload);
-        try (var reader = new MvccReader(engine, null, true)) {
+        try (var snap = engine.newSnapshot(); var reader = new MvccReader(engine, snap, true)) {
         var txn = new MvccTxn(batch, reader);
 
         // Path 1: explicit keys.
@@ -551,7 +551,7 @@ public final class MvccApplyHandler implements ApplyHandler {
     private Result applyCheckTxnStatus(byte[] payload, StorageEngine.WriteBatch batch)
             throws InvalidProtocolBufferException {
         var req = Kvrpcpb.CheckTxnStatusRequest.parseFrom(payload);
-        try (var reader = new MvccReader(engine, null, true)) {
+        try (var snap = engine.newSnapshot(); var reader = new MvccReader(engine, snap, true)) {
         var txn = new MvccTxn(batch, reader);
         var oc = txn.checkTxnStatus(req.getPrimaryKey().toByteArray(),
                 req.getLockTs(),
@@ -599,7 +599,7 @@ public final class MvccApplyHandler implements ApplyHandler {
     private Result applyTxnHeartBeat(byte[] payload, StorageEngine.WriteBatch batch)
             throws InvalidProtocolBufferException {
         var req = Kvrpcpb.TxnHeartBeatRequest.parseFrom(payload);
-        try (var reader = new MvccReader(engine, null, true)) {
+        try (var snap = engine.newSnapshot(); var reader = new MvccReader(engine, snap, true)) {
         var primary = req.getPrimaryLock().toByteArray();
         var lockOpt = reader.readLock(primary);
 
@@ -667,7 +667,7 @@ public final class MvccApplyHandler implements ApplyHandler {
     private Result applyCheckSecondaryLocks(byte[] payload, StorageEngine.WriteBatch batch)
             throws InvalidProtocolBufferException {
         var req = Kvrpcpb.CheckSecondaryLocksRequest.parseFrom(payload);
-        try (var reader = new MvccReader(engine, null, true)) {
+        try (var snap = engine.newSnapshot(); var reader = new MvccReader(engine, snap, true)) {
         long startTs = req.getStartVersion();
         var resp = Kvrpcpb.CheckSecondaryLocksResponse.newBuilder();
         long highestCommitTs = 0;

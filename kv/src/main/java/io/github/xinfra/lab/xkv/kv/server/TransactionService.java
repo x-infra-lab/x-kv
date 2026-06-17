@@ -320,8 +320,14 @@ public final class TransactionService {
 
     public Kvrpcpb.ScanLockResponse kvScanLock(Kvrpcpb.ScanLockRequest req) {
         cm.maxTs().observe(req.getMaxVersion());
+        byte[] routeKey = req.getStartKey().isEmpty() ? new byte[]{0} : req.getStartKey().toByteArray();
+        var le = ensureReadable(routeKey, req.getContext());
+        if (le != null) {
+            return Kvrpcpb.ScanLockResponse.newBuilder().setRegionError(le).build();
+        }
         var b = Kvrpcpb.ScanLockResponse.newBuilder();
-        try (var ro = engine.newReadOptions();
+        try (var snap = engine.newSnapshot();
+             var ro = engine.newReadOptions().snapshot(snap);
              var it = engine.newIterator(StorageEngine.Cf.LOCK, ro)) {
             byte[] start = req.getStartKey().isEmpty() ? new byte[]{0} : req.getStartKey().toByteArray();
             byte[] end = req.getEndKey().isEmpty() ? null : req.getEndKey().toByteArray();
