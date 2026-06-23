@@ -11,9 +11,13 @@ import io.github.xinfra.lab.xkv.kv.engine.SnapshotEngineImpl;
 import io.github.xinfra.lab.xkv.kv.engine.StorageEngine;
 import io.github.xinfra.lab.xkv.kv.mvcc.ConcurrencyManager;
 import io.github.xinfra.lab.xkv.kv.mvcc.MaxTsTracker;
+import io.github.xinfra.lab.xkv.kv.raft.BatchRegionPeer;
 import io.github.xinfra.lab.xkv.kv.raft.CompositeApplyHandler;
 import io.github.xinfra.lab.xkv.kv.raft.AdminApplyHandler;
+import io.github.xinfra.lab.xkv.kv.raft.RaftPoller;
+import io.github.xinfra.lab.xkv.kv.raft.RegionPeer;
 import io.github.xinfra.lab.xkv.kv.raft.RegionPeerImpl;
+import io.github.xinfra.lab.xkv.kv.raft.TickDriver;
 import io.github.xinfra.lab.xkv.kv.store.GcWorker;
 import io.github.xinfra.lab.xkv.kv.store.LogCompactionWorker;
 import io.github.xinfra.lab.xkv.kv.store.RegionHeartbeater;
@@ -82,7 +86,9 @@ public final class KvServer {
     private RaftMessageDispatcher dispatcher;
     private Server clientServer;
     private Server raftServer;
-    private final List<RegionPeerImpl> peers = new java.util.concurrent.CopyOnWriteArrayList<>();
+    private final List<RegionPeer> peers = new java.util.concurrent.CopyOnWriteArrayList<>();
+    private RaftPoller raftPoller;
+    private TickDriver tickDriver;
     private final List<RegionHeartbeater> heartbeaters = new java.util.concurrent.CopyOnWriteArrayList<>();
     private PdEndpointManager pdManager;
     private TransactionService txnService;
@@ -94,6 +100,8 @@ public final class KvServer {
     private DrainingInterceptor drainingInterceptor;
     private CdcEventBus cdcEventBus;
     private ChangeDataServiceImpl cdcService;
+    private final io.github.xinfra.lab.xkv.kv.mvcc.InMemoryLockTable inMemoryLockTable =
+            new io.github.xinfra.lab.xkv.kv.mvcc.InMemoryLockTable();
 
     private static final long STORE_HEARTBEAT_INTERVAL_MS = 10_000;
 
@@ -154,6 +162,10 @@ public final class KvServer {
             t.start();
         });
 
+        // 5b) Initialize BatchSystem: shared poller + tick driver.
+        raftPoller = new RaftPoller(config.raft().pollerThreads());
+        tickDriver = new TickDriver(config.raft().heartbeatTickMs());
+
         // 6) Create the initial region peer.
         long selfPeerId = findSelfPeerId(initialRegion);
         var raftEngine = new PerRegionRaftEngine(engine, initialRegion.getId());
@@ -171,7 +183,7 @@ public final class KvServer {
         RawKvService.PeerLocator locator = key ->
                 store.peerForKey(key).orElse(null);
         rawKvService = new RawKvService(engine, locator, PROPOSE_TIMEOUT_MS);
-        txnService = new TransactionService(engine, locator, PROPOSE_TIMEOUT_MS, cm);
+        txnService = new TransactionService(engine, locator, PROPOSE_TIMEOUT_MS, cm, inMemoryLockTable);
 
         // Deadlock detector via PD.
         var deadlockClient = new DeadlockClient(pdManager.blockingStub(), /* clusterId= */ 1L);
@@ -341,13 +353,14 @@ public final class KvServer {
     }
 
     /**
-     * Create a fully-wired {@link RegionPeerImpl} for a region.
+     * Create a fully-wired {@link BatchRegionPeer} for a region, backed by
+     * the shared {@link RaftPoller} and {@link TickDriver}.
      */
-    private RegionPeerImpl createRegionPeer(Metapb.Region region,
-                                             Map<Long, String> peerAddrs,
-                                             SnapshotEngineImpl snapshotEngine,
-                                             PerRegionRaftEngine raftEngine,
-                                             ConcurrencyManager cm) {
+    private BatchRegionPeer createRegionPeer(Metapb.Region region,
+                                              Map<Long, String> peerAddrs,
+                                              SnapshotEngineImpl snapshotEngine,
+                                              PerRegionRaftEngine raftEngine,
+                                              ConcurrencyManager cm) {
         long peerId = findSelfPeerId(region);
 
         var transport = new GrpcRaftTransport(region.getId(), peerId, config.raftTls());
@@ -364,7 +377,7 @@ public final class KvServer {
                 .filter(p -> p.getId() == peerId)
                 .findFirst().orElseThrow();
 
-        var peerHolder = new AtomicReference<RegionPeerImpl>();
+        var peerHolder = new AtomicReference<BatchRegionPeer>();
         var splitObserver = (AdminApplyHandler.SplitObserver)
                 (updatedParent, children) -> {
                     var p = peerHolder.get();
@@ -394,14 +407,16 @@ public final class KvServer {
                 config.raft().electionTickMs() > 0
                         ? (int) (config.raft().electionTickMs() / config.raft().heartbeatTickMs()) : 10,
                 1,
-                config.raft().heartbeatTickMs());
+                config.raft().heartbeatTickMs(),
+                config.raft().leaseBasedRead());
 
-        var peer = new RegionPeerImpl(
+        var peer = new BatchRegionPeer(
                 engine, raftEngine, region, self, raftPeers,
                 transport,
-                CompositeApplyHandler.defaultFor(engine, cm, region.getId(), cdcEventBus)
+                CompositeApplyHandler.defaultFor(engine, cm, region.getId(), cdcEventBus,
+                                inMemoryLockTable)
                         .withAdmin(raftEngine, engine, splitObserver, mergeObserver),
-                settings, cm, snapshotEngine);
+                settings, cm, snapshotEngine, raftPoller, tickDriver);
         peerHolder.set(peer);
         dispatcher.register(region.getId(), transport);
         return peer;
@@ -441,7 +456,7 @@ public final class KvServer {
         var childCm = new ConcurrencyManager(
                 new MaxTsTracker(childRaftEngine.persistedMaxTs()));
 
-        var childPeerHolder = new AtomicReference<RegionPeerImpl>();
+        var childPeerHolder = new AtomicReference<BatchRegionPeer>();
         var childMergeObserver = (AdminApplyHandler.MergeObserver)
                 (mergedTarget, sourceRegion) -> {
                     var cp = childPeerHolder.get();
@@ -450,14 +465,16 @@ public final class KvServer {
                     peers.removeIf(rp -> rp.regionId() == sourceRegion.getId());
                 };
 
-        var childHandler = CompositeApplyHandler.defaultFor(engine, childCm, childRegionId, cdcEventBus)
+        var childHandler = CompositeApplyHandler.defaultFor(engine, childCm, childRegionId, cdcEventBus,
+                        inMemoryLockTable)
                 .withAdmin(childRaftEngine, engine, (p, ch) -> {}, childMergeObserver);
 
-        var childPeer = new RegionPeerImpl(
+        var childPeer = new BatchRegionPeer(
                 engine, childRaftEngine, childRegion, childSelf, childPeers,
                 childTransport, childHandler,
-                new RegionPeerImpl.Settings(10, 1, config.raft().heartbeatTickMs()),
-                childCm, snapshotEngine);
+                new RegionPeerImpl.Settings(10, 1, config.raft().heartbeatTickMs(),
+                        config.raft().leaseBasedRead()),
+                childCm, snapshotEngine, raftPoller, tickDriver);
         childPeerHolder.set(childPeer);
         dispatcher.register(childRegionId, childTransport);
         store.registerPeer(childPeer);
@@ -553,7 +570,7 @@ public final class KvServer {
         }
     }
 
-    private void startHeartbeater(RegionPeerImpl peer) {
+    private void startHeartbeater(RegionPeer peer) {
         var pdAsyncStub = pdManager.asyncStub();
         var splitDriver = new SplitDriver(pdManager.blockingStub(), PROPOSE_TIMEOUT_MS);
         var hb = new RegionHeartbeater(pdAsyncStub, peer,
@@ -613,7 +630,7 @@ public final class KvServer {
         // Wait for leadership to migrate away.
         long deadline = System.currentTimeMillis() + config.drainTimeoutMs();
         while (System.currentTimeMillis() < deadline) {
-            boolean anyLeader = peers.stream().anyMatch(RegionPeerImpl::isLeader);
+            boolean anyLeader = peers.stream().anyMatch(RegionPeer::isLeader);
             if (!anyLeader) break;
             try { Thread.sleep(100); } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -621,7 +638,7 @@ public final class KvServer {
             }
         }
 
-        boolean remaining = peers.stream().anyMatch(RegionPeerImpl::isLeader);
+        boolean remaining = peers.stream().anyMatch(RegionPeer::isLeader);
         if (remaining) {
             log.warn("drain: timed out waiting for leader transfer ({}ms)", config.drainTimeoutMs());
         } else {
@@ -677,21 +694,9 @@ public final class KvServer {
             }
         }
 
-        // 3b) Wait for all peer ready-loop threads to die before closing engine.
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
-        while (System.nanoTime() < deadline) {
-            boolean alive = peers.stream().anyMatch(RegionPeerImpl::readyThreadAlive);
-            if (!alive) break;
-            try {
-                Thread.sleep(50);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
-            }
-        }
-        if (peers.stream().anyMatch(RegionPeerImpl::readyThreadAlive)) {
-            log.warn("some peer ready-loop threads still alive after 10s; proceeding with engine close");
-        }
+        // 3b) Shut down BatchSystem poller + tick driver.
+        if (tickDriver != null) tickDriver.shutdown();
+        if (raftPoller != null) raftPoller.shutdown();
         peers.clear();
 
         // 4) Close PD connection.

@@ -48,9 +48,18 @@ public final class CompositeApplyHandler implements ApplyHandler {
             io.github.xinfra.lab.xkv.kv.mvcc.ConcurrencyManager cm,
             long regionId,
             io.github.xinfra.lab.xkv.kv.cdc.CdcEventBus cdcEventBus) {
+        return defaultFor(engine, cm, regionId, cdcEventBus, null);
+    }
+
+    public static CompositeApplyHandler defaultFor(StorageEngine engine,
+            io.github.xinfra.lab.xkv.kv.mvcc.ConcurrencyManager cm,
+            long regionId,
+            io.github.xinfra.lab.xkv.kv.cdc.CdcEventBus cdcEventBus,
+            io.github.xinfra.lab.xkv.kv.mvcc.InMemoryLockTable inMemoryLockTable) {
         var c = new CompositeApplyHandler();
         var raw = new RawKvApplyHandler(engine);
         var mvcc = new MvccApplyHandler(engine, cm, regionId, cdcEventBus);
+        if (inMemoryLockTable != null) mvcc.setInMemoryLockTable(inMemoryLockTable);
         c.register(ProposalCodec.Kind.RAW_PUT, raw);
         c.register(ProposalCodec.Kind.RAW_DELETE, raw);
         c.register(ProposalCodec.Kind.RAW_DELETE_RANGE, raw);

@@ -44,10 +44,17 @@ public final class MvccTxn {
 
     private final StorageEngine.WriteBatch batch;
     private final MvccReader reader;
+    private final InMemoryLockTable inMemoryLockTable;
 
     public MvccTxn(StorageEngine.WriteBatch batch, MvccReader reader) {
+        this(batch, reader, null);
+    }
+
+    public MvccTxn(StorageEngine.WriteBatch batch, MvccReader reader,
+                   InMemoryLockTable inMemoryLockTable) {
         this.batch = batch;
         this.reader = reader;
+        this.inMemoryLockTable = inMemoryLockTable;
     }
 
     // =====================================================================
@@ -70,10 +77,22 @@ public final class MvccTxn {
      * startTs), the prewrite has already happened — return ok and skip.
      */
     public PrewriteOutcome checkPrewrite(byte[] key, long startTs, Op op) {
-        // 1) Same-txn ROLLBACK record.
+        // 1) Same-txn ROLLBACK record — either a standalone ROLLBACK or
+        //    an overlapping rollback collapsed into another txn's write at
+        //    MvccKey(key, startTs).
         var rb = reader.findWriteByStartTs(key, startTs);
         if (rb.isPresent() && rb.get().type() == Write.Type.ROLLBACK) {
             return PrewriteOutcome.selfRolledBack(key, startTs);
+        }
+        if (rb.isEmpty()) {
+            byte[] writeKey = MvccKey.encode(key, startTs);
+            byte[] raw = readerEngine().get(StorageEngine.Cf.WRITE, writeKey, reader.snapshotReadOpts());
+            if (raw != null) {
+                Write w = Write.decode(raw);
+                if (w.hasOverlappedRollback() && w.startTs() != startTs) {
+                    return PrewriteOutcome.selfRolledBack(key, startTs);
+                }
+            }
         }
 
         // 2) Write-conflict scan: look at the LATEST visible write at any ts.
@@ -137,14 +156,38 @@ public final class MvccTxn {
      * </ul>
      */
     public PrewriteOutcome checkPessimisticPrewrite(byte[] key, long startTs) {
-        // Same-txn ROLLBACK record short-circuits.
+        // Same-txn ROLLBACK record — standalone or overlapping-collapsed.
         var rb = reader.findWriteByStartTs(key, startTs);
         if (rb.isPresent() && rb.get().type() == Write.Type.ROLLBACK) {
             return PrewriteOutcome.selfRolledBack(key, startTs);
         }
+        if (rb.isEmpty()) {
+            byte[] writeKey = MvccKey.encode(key, startTs);
+            byte[] raw = readerEngine().get(StorageEngine.Cf.WRITE, writeKey, reader.snapshotReadOpts());
+            if (raw != null) {
+                Write w = Write.decode(raw);
+                if (w.hasOverlappedRollback() && w.startTs() != startTs) {
+                    return PrewriteOutcome.selfRolledBack(key, startTs);
+                }
+            }
+        }
 
         var lockOpt = reader.readLock(key);
         if (lockOpt.isEmpty()) {
+            // Pipelined path: lock may be in-memory but not yet persisted.
+            if (inMemoryLockTable != null) {
+                var memLock = inMemoryLockTable.get(key);
+                if (memLock.isPresent()) {
+                    var ml = memLock.get();
+                    if (ml.startTs() != startTs) {
+                        return PrewriteOutcome.keyLocked(key, ml);
+                    }
+                    if (ml.type() == Lock.Type.PESSIMISTIC) {
+                        return PrewriteOutcome.pessimisticUpgrade(key, ml);
+                    }
+                    return PrewriteOutcome.alreadyPrewritten(key, ml);
+                }
+            }
             return PrewriteOutcome.pessimisticLockNotFound(key, startTs);
         }
         var lock = lockOpt.get();
@@ -334,23 +377,41 @@ public final class MvccTxn {
             return RollbackOutcome.ok();
         }
 
-        // 2) Write the ROLLBACK record at (key, startTs). Same-startTs
-        //    record because there is no commit_ts for a rolled-back txn.
-        batch.put(StorageEngine.Cf.WRITE, MvccKey.encode(key, startTs),
-                Write.rollback(startTs).encode());
+        // 2) Overlapping rollback collapse: if another txn's non-ROLLBACK
+        //    write record sits at MvccKey(key, startTs) — i.e. some txn
+        //    committed at commitTs == this txn's startTs — piggyback onto
+        //    that record instead of creating a separate ROLLBACK entry.
+        byte[] writeKey = MvccKey.encode(key, startTs);
+        byte[] existingBytes = readerEngine().get(StorageEngine.Cf.WRITE, writeKey, reader.snapshotReadOpts());
+        if (existingBytes != null) {
+            Write existingWrite = Write.decode(existingBytes);
+            if (existingWrite.type() != Write.Type.ROLLBACK && !existingWrite.hasOverlappedRollback()) {
+                batch.put(StorageEngine.Cf.WRITE, writeKey, existingWrite.withOverlappedRollback().encode());
+                cleanupLockOnRollback(key, startTs);
+                return RollbackOutcome.ok();
+            }
+            if (existingWrite.type() == Write.Type.ROLLBACK || existingWrite.hasOverlappedRollback()) {
+                cleanupLockOnRollback(key, startTs);
+                return RollbackOutcome.ok();
+            }
+        }
 
-        // 3) If our lock still sits on this key, drop it + any default CF.
+        // 3) No overlapping write — write a standalone ROLLBACK record.
+        batch.put(StorageEngine.Cf.WRITE, writeKey, Write.rollback(startTs).encode());
+
+        cleanupLockOnRollback(key, startTs);
+        return RollbackOutcome.ok();
+    }
+
+    private void cleanupLockOnRollback(byte[] key, long startTs) {
         var lockOpt = reader.readLock(key);
         if (lockOpt.isPresent() && lockOpt.get().startTs() == startTs) {
             batch.delete(StorageEngine.Cf.LOCK, MvccKey.lockKey(key));
-            // Remove default CF entry only for PUT/PESSIMISTIC types where
-            // we may have written one.
             var t = lockOpt.get().type();
             if (t == Lock.Type.PUT || t == Lock.Type.PESSIMISTIC) {
                 batch.delete(StorageEngine.Cf.DEFAULT, MvccKey.encode(key, startTs));
             }
         }
-        return RollbackOutcome.ok();
     }
 
     /** Find the commitTs for a given startTs by linear scan of the userKey block. */
@@ -447,9 +508,19 @@ public final class MvccTxn {
                 long ct = findCommitTsForStartTs(primaryKey, lockTs);
                 return CheckTxnStatusOutcome.committed(ct);
             }
-            // No lock, no write — txn was never seen. Optimistically ROLLBACK.
-            batch.put(StorageEngine.Cf.WRITE, MvccKey.encode(primaryKey, lockTs),
-                    Write.rollback(lockTs).encode());
+            // Check overlapping rollback: another txn committed at commitTs==lockTs
+            // and our rollback was collapsed into it.
+            byte[] writeKey = MvccKey.encode(primaryKey, lockTs);
+            byte[] raw = readerEngine().get(StorageEngine.Cf.WRITE, writeKey, reader.snapshotReadOpts());
+            if (raw != null) {
+                Write wr = Write.decode(raw);
+                if (wr.hasOverlappedRollback() && wr.startTs() != lockTs) {
+                    return CheckTxnStatusOutcome.rolledBack();
+                }
+            }
+            // No lock, no write — txn was never seen. Use overlapping rollback
+            // collapse for the optimistic ROLLBACK stamp.
+            writeRollbackCollapsed(primaryKey, lockTs);
             return CheckTxnStatusOutcome.lockNotExistRollback();
         }
 
@@ -475,10 +546,9 @@ public final class MvccTxn {
                 return CheckTxnStatusOutcome.asyncCommitPrimary(lock);
             }
 
-            // Optimistic / pessimistic primary, expired: stamp ROLLBACK and
-            // drop the lock (and the inline DEFAULT-CF backing if any).
-            batch.put(StorageEngine.Cf.WRITE, MvccKey.encode(primaryKey, lockTs),
-                    Write.rollback(lockTs).encode());
+            // Optimistic / pessimistic primary, expired: stamp ROLLBACK
+            // (collapsed if possible) and drop the lock.
+            writeRollbackCollapsed(primaryKey, lockTs);
             batch.delete(StorageEngine.Cf.LOCK, MvccKey.lockKey(primaryKey));
             if (lock.type() == Lock.Type.PUT || lock.type() == Lock.Type.PESSIMISTIC) {
                 batch.delete(StorageEngine.Cf.DEFAULT, MvccKey.encode(primaryKey, lockTs));
@@ -518,6 +588,28 @@ public final class MvccTxn {
     /** Tunnel to the reader's underlying engine. Internal. */
     private StorageEngine readerEngine() {
         return reader.engine();
+    }
+
+    /**
+     * Write a ROLLBACK stamp at {@code (key, startTs)}, collapsing it into
+     * an existing non-ROLLBACK write record if one sits at the same MvccKey
+     * position. This prevents ROLLBACK records from accumulating in the write
+     * CF and degrading conflict-check performance on hot keys.
+     */
+    private void writeRollbackCollapsed(byte[] key, long startTs) {
+        byte[] writeKey = MvccKey.encode(key, startTs);
+        byte[] existing = readerEngine().get(StorageEngine.Cf.WRITE, writeKey, reader.snapshotReadOpts());
+        if (existing != null) {
+            Write w = Write.decode(existing);
+            if (w.type() != Write.Type.ROLLBACK && !w.hasOverlappedRollback()) {
+                batch.put(StorageEngine.Cf.WRITE, writeKey, w.withOverlappedRollback().encode());
+                return;
+            }
+            if (w.type() == Write.Type.ROLLBACK || w.hasOverlappedRollback()) {
+                return;
+            }
+        }
+        batch.put(StorageEngine.Cf.WRITE, writeKey, Write.rollback(startTs).encode());
     }
 
     // =====================================================================

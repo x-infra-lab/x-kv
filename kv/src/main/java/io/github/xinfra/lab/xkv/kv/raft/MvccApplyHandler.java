@@ -53,6 +53,7 @@ public final class MvccApplyHandler implements ApplyHandler {
     private final ConcurrencyManager cm;
     private final long regionId;
     private final CdcEventBus cdcEventBus;
+    private volatile io.github.xinfra.lab.xkv.kv.mvcc.InMemoryLockTable inMemoryLockTable;
 
     public MvccApplyHandler(StorageEngine engine) {
         this(engine, new ConcurrencyManager(new MaxTsTracker()));
@@ -77,6 +78,7 @@ public final class MvccApplyHandler implements ApplyHandler {
 
     public MaxTsTracker maxTs() { return cm.maxTs(); }
     public ConcurrencyManager concurrencyManager() { return cm; }
+    public void setInMemoryLockTable(io.github.xinfra.lab.xkv.kv.mvcc.InMemoryLockTable t) { this.inMemoryLockTable = t; }
 
     @Override
     public Result apply(ProposalCodec.Decoded decoded, StorageEngine.WriteBatch batch) {
@@ -128,7 +130,7 @@ public final class MvccApplyHandler implements ApplyHandler {
         }
 
         try (var snap = engine.newSnapshot(); var reader = new MvccReader(engine, snap, true)) {
-        var txn = new MvccTxn(batch, reader);
+        var txn = new MvccTxn(batch, reader, inMemoryLockTable);
 
         // Pass 1: check every mutation. Pessimistic-locked mutations skip
         // the write-conflict scan and instead validate the existing
@@ -234,6 +236,12 @@ public final class MvccApplyHandler implements ApplyHandler {
 
             if (useAsync) {
                 minCommitTs = Math.max(minCommitTs, lockMinCommitTs);
+            }
+
+            // Prewrite upgrades pessimistic lock to PUT/DELETE — remove in-memory entry.
+            if (checks.get(i) instanceof MvccTxn.PrewritePessimisticUpgrade) {
+                var lt = inMemoryLockTable;
+                if (lt != null) lt.onPersisted(key, req.getStartVersion());
             }
         }
 
@@ -422,6 +430,10 @@ public final class MvccApplyHandler implements ApplyHandler {
                 resp.addErrors(Kvrpcpb.KeyError.newBuilder()
                         .setLocked(toLockInfo(m.getKey().toByteArray(), kl.lock()))
                         .build());
+            } else if (oc instanceof MvccTxn.PessimisticAcquired) {
+                // Lock persisted to LOCK CF — remove from in-memory table.
+                var lt = inMemoryLockTable;
+                if (lt != null) lt.onPersisted(m.getKey().toByteArray(), req.getStartVersion());
             }
         }
         return Result.ok(resp.build().toByteArray());
@@ -695,10 +707,19 @@ public final class MvccApplyHandler implements ApplyHandler {
                 continue;
             }
 
-            // Path 4: no lock, no write — protective rollback.
+            // Path 4: no lock, no write — protective rollback (collapsed if possible).
             byte[] writeKey = io.github.xinfra.lab.xkv.kv.mvcc.MvccKey.encode(key, startTs);
-            batch.put(StorageEngine.Cf.WRITE, writeKey,
-                    io.github.xinfra.lab.xkv.kv.mvcc.Write.rollback(startTs).encode());
+            byte[] existingBytes = engine.get(StorageEngine.Cf.WRITE, writeKey);
+            if (existingBytes != null) {
+                var ew = io.github.xinfra.lab.xkv.kv.mvcc.Write.decode(existingBytes);
+                if (ew.type() != io.github.xinfra.lab.xkv.kv.mvcc.Write.Type.ROLLBACK
+                        && !ew.hasOverlappedRollback()) {
+                    batch.put(StorageEngine.Cf.WRITE, writeKey, ew.withOverlappedRollback().encode());
+                }
+            } else {
+                batch.put(StorageEngine.Cf.WRITE, writeKey,
+                        io.github.xinfra.lab.xkv.kv.mvcc.Write.rollback(startTs).encode());
+            }
             rolledBack = true;
         }
 

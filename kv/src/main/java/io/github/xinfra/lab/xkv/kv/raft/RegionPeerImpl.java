@@ -197,7 +197,7 @@ public final class RegionPeerImpl implements RegionPeer {
 
         // Build raft Config + Node first; the transport receiver below
         // captures `node`, which must be initialised by then.
-        var config = Config.builder()
+        var configBuilder = Config.builder()
                 .id(self.getId())
                 .electionTick(settings.electionTick)
                 .heartbeatTick(settings.heartbeatTick)
@@ -207,8 +207,11 @@ public final class RegionPeerImpl implements RegionPeer {
                 .maxInflightMsgs(256)
                 .maxUncommittedEntriesSize(1L << 26)   // 64 MiB
                 .checkQuorum(true)
-                .preVote(true)
-                .build();
+                .preVote(true);
+        if (settings.leaseBasedRead) {
+            configBuilder.readOnlyOption(io.github.xinfra.lab.raft.ReadOnlyOption.ReadOnlyLeaseBased);
+        }
+        var config = configBuilder.build();
 
         boolean fresh = raftEngine.lastIndex() == 0
                 && raftEngine.appliedIndex() == 0
@@ -935,7 +938,10 @@ public final class RegionPeerImpl implements RegionPeer {
     private record PendingDispatch(long proposeSeq, ApplyResult result) {}
 
     /** Per-region runtime tunables. Defaults align with KvConfig.RaftConfig. */
-    public record Settings(int electionTick, int heartbeatTick, long heartbeatTickMs) {
-        public static Settings defaults() { return new Settings(10, 1, 100); }
+    public record Settings(int electionTick, int heartbeatTick, long heartbeatTickMs, boolean leaseBasedRead) {
+        public Settings(int electionTick, int heartbeatTick, long heartbeatTickMs) {
+            this(electionTick, heartbeatTick, heartbeatTickMs, true);
+        }
+        public static Settings defaults() { return new Settings(10, 1, 100, true); }
     }
 }

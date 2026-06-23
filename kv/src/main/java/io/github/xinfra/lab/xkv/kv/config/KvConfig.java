@@ -107,9 +107,27 @@ public final class KvConfig {
             int maxSizePerMsg,
             int maxInflightMsgs,
             long snapshotIntervalEntries,
-            long applyBatchEntries) {
+            long applyBatchEntries,
+            boolean leaseBasedRead,
+            int pollerThreads) {
+        public RaftConfig(long electionTickMs, long heartbeatTickMs,
+                          int maxSizePerMsg, int maxInflightMsgs,
+                          long snapshotIntervalEntries, long applyBatchEntries) {
+            this(electionTickMs, heartbeatTickMs, maxSizePerMsg, maxInflightMsgs,
+                    snapshotIntervalEntries, applyBatchEntries, true,
+                    Math.max(4, Runtime.getRuntime().availableProcessors()));
+        }
+        public RaftConfig(long electionTickMs, long heartbeatTickMs,
+                          int maxSizePerMsg, int maxInflightMsgs,
+                          long snapshotIntervalEntries, long applyBatchEntries,
+                          boolean leaseBasedRead) {
+            this(electionTickMs, heartbeatTickMs, maxSizePerMsg, maxInflightMsgs,
+                    snapshotIntervalEntries, applyBatchEntries, leaseBasedRead,
+                    Math.max(4, Runtime.getRuntime().availableProcessors()));
+        }
         public static RaftConfig defaults() {
-            return new RaftConfig(1000, 100, 1024 * 1024, 256, 10_000, 64);
+            return new RaftConfig(1000, 100, 1024 * 1024, 256, 10_000, 64, true,
+                    Math.max(4, Runtime.getRuntime().availableProcessors()));
         }
     }
 

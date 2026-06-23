@@ -105,4 +105,8 @@ public final class Write {
     public static Write rollback(long startTs)       { return new Write(Type.ROLLBACK, startTs, null, false); }
     public static Write rollbackOverlapping(long startTs) { return new Write(Type.ROLLBACK, startTs, null, true); }
     public static Write lock(long startTs)           { return new Write(Type.LOCK, startTs, null, false); }
+
+    public Write withOverlappedRollback() {
+        return new Write(type, startTs, shortValue, true);
+    }
 }

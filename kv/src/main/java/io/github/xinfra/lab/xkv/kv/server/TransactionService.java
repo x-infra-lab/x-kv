@@ -45,33 +45,45 @@ public final class TransactionService {
     private final long proposeTimeoutMs;
     private final ConcurrencyManager cm;
     private final TxnSnapshotCache snapshotCache;
+    private final io.github.xinfra.lab.xkv.kv.mvcc.InMemoryLockTable inMemoryLockTable;
     /** Optional distributed deadlock-detector hook; null when running without PD. */
     private volatile DeadlockClient deadlockClient;
 
     public TransactionService(StorageEngine engine, PeerLocator locator, long proposeTimeoutMs) {
         this(engine, locator, proposeTimeoutMs,
                 new ConcurrencyManager(new MaxTsTracker()),
-                new TxnSnapshotCache(engine));
+                new TxnSnapshotCache(engine),
+                new io.github.xinfra.lab.xkv.kv.mvcc.InMemoryLockTable());
     }
 
     public TransactionService(StorageEngine engine, PeerLocator locator,
                               long proposeTimeoutMs, ConcurrencyManager cm) {
-        this(engine, locator, proposeTimeoutMs, cm, new TxnSnapshotCache(engine));
+        this(engine, locator, proposeTimeoutMs, cm, new TxnSnapshotCache(engine),
+                new io.github.xinfra.lab.xkv.kv.mvcc.InMemoryLockTable());
     }
 
     public TransactionService(StorageEngine engine, PeerLocator locator,
                               long proposeTimeoutMs, ConcurrencyManager cm,
-                              TxnSnapshotCache snapshotCache) {
+                              io.github.xinfra.lab.xkv.kv.mvcc.InMemoryLockTable inMemoryLockTable) {
+        this(engine, locator, proposeTimeoutMs, cm, new TxnSnapshotCache(engine), inMemoryLockTable);
+    }
+
+    public TransactionService(StorageEngine engine, PeerLocator locator,
+                              long proposeTimeoutMs, ConcurrencyManager cm,
+                              TxnSnapshotCache snapshotCache,
+                              io.github.xinfra.lab.xkv.kv.mvcc.InMemoryLockTable inMemoryLockTable) {
         this.engine = engine;
         this.locator = locator;
         this.proposeTimeoutMs = proposeTimeoutMs;
         this.cm = cm;
         this.snapshotCache = snapshotCache;
+        this.inMemoryLockTable = inMemoryLockTable;
     }
 
     public MaxTsTracker maxTs() { return cm.maxTs(); }
     public ConcurrencyManager concurrencyManager() { return cm; }
     public TxnSnapshotCache snapshotCache() { return snapshotCache; }
+    public io.github.xinfra.lab.xkv.kv.mvcc.InMemoryLockTable inMemoryLockTable() { return inMemoryLockTable; }
     /** Inject the deadlock-detector client. Pass {@code null} to disable. */
     public void setDeadlockClient(DeadlockClient client) { this.deadlockClient = client; }
     public DeadlockClient deadlockClient() { return deadlockClient; }
@@ -405,55 +417,157 @@ public final class TransactionService {
         return resp;
     }
 
+    /**
+     * Pipelined pessimistic lock: do the write-conflict check locally using
+     * a snapshot, insert into InMemoryLockTable, return success immediately,
+     * then fire-and-forget the Raft proposal for durability.
+     *
+     * <p>On crash before Raft persists, the in-memory lock is lost; prewrite
+     * detects {@code PessimisticLockNotFound} and the client retries. This
+     * matches TiKV's pipelined pessimistic lock design.
+     */
     public Kvrpcpb.PessimisticLockResponse kvPessimisticLock(Kvrpcpb.PessimisticLockRequest req) {
         if (req.getMutationsCount() == 0) return Kvrpcpb.PessimisticLockResponse.newBuilder().build();
         byte[] sample = req.getMutations(0).getKey().toByteArray();
-        var raw = propose(ProposalCodec.Kind.MVCC_PESSIMISTIC_LOCK, req.toByteArray(), sample, req.getContext(),
-                bytes -> {
-                    try { return Kvrpcpb.PessimisticLockResponse.parseFrom(bytes); }
-                    catch (Exception e) { throw new RuntimeException(e); }
-                },
-                err -> Kvrpcpb.PessimisticLockResponse.newBuilder()
-                        .addErrors(Kvrpcpb.KeyError.newBuilder().setAbort(err))
-                        .build(),
-                re -> Kvrpcpb.PessimisticLockResponse.newBuilder().setRegionError(re).build());
-        // Region-level or hard error — no point asking PD about deadlock.
-        if (raw.hasRegionError()) return raw;
 
-        // Distributed deadlock detection: for every KeyError.locked surfaced
-        // by the apply path, build a wait-for edge and consult PD. If any
-        // edge would close a cycle, replace that error with KeyError.deadlock
-        // so the SQL layer can immediately pick a victim instead of waiting
-        // out the pessimistic-lock TTL.
-        var dc = deadlockClient;
-        if (dc == null || raw.getErrorsCount() == 0) return raw;
-        var enhanced = Kvrpcpb.PessimisticLockResponse.newBuilder();
-        enhanced.mergeFrom(raw);
-        // Replace errors[i] in-place when a cycle is found.
-        for (int i = 0; i < raw.getErrorsCount(); i++) {
-            var err = raw.getErrors(i);
-            if (!err.hasLocked()) continue;
-            var lock = err.getLocked();
-            long waiter = req.getStartVersion();
-            long holder = lock.getLockVersion();
-            if (waiter == 0L || holder == 0L || waiter == holder) continue;
-            var res = dc.detect(waiter, holder, lock.getKey().toByteArray());
-            if (!res.isDeadlock()) continue;
-            var dl = Kvrpcpb.Deadlock.newBuilder()
-                    .setLockTs(holder)
-                    .setLockKey(lock.getKey())
-                    .setDeadlockKeyHash(res.deadlockKeyHash())
-                    .addAllWaitChain(res.waitChain())
-                    .build();
-            enhanced.setErrors(i, Kvrpcpb.KeyError.newBuilder().setDeadlock(dl).build());
-            log.info("deadlock detected: waiter={} holder={} chain_len={}",
-                    waiter, holder, res.waitChain().size());
+        var peer = locator.peerForKey(sample);
+        if (peer == null) return Kvrpcpb.PessimisticLockResponse.newBuilder()
+                .setRegionError(regionNotFound(sample)).build();
+        if (!peer.isLeader()) return Kvrpcpb.PessimisticLockResponse.newBuilder()
+                .setRegionError(notLeader(peer)).build();
+
+        var regionErr = validateRegion(peer, sample, req.getContext());
+        if (regionErr != null) return Kvrpcpb.PessimisticLockResponse.newBuilder()
+                .setRegionError(regionErr).build();
+
+        // Bump max_ts to at least for_update_ts for SI correctness.
+        if (req.getForUpdateTs() != 0) {
+            cm.maxTs().observe(req.getForUpdateTs());
         }
-        return enhanced.build();
+
+        // Fast path: local write-conflict check + in-memory lock insertion.
+        var resp = Kvrpcpb.PessimisticLockResponse.newBuilder();
+        boolean allAcquired = true;
+        try (var snap = engine.newSnapshot();
+             var reader = new MvccReader(engine, snap, true)) {
+            var txn = new io.github.xinfra.lab.xkv.kv.mvcc.MvccTxn(
+                    engine.newWriteBatch(), reader);
+
+            for (var m : req.getMutationsList()) {
+                byte[] key = m.getKey().toByteArray();
+
+                // Check existing in-memory lock from other txn.
+                var memLock = inMemoryLockTable.get(key);
+                if (memLock.isPresent() && memLock.get().startTs() != req.getStartVersion()) {
+                    resp.addErrors(Kvrpcpb.KeyError.newBuilder()
+                            .setLocked(toLockInfo(key, memLock.get())).build());
+                    allAcquired = false;
+                    continue;
+                }
+
+                // Check existing lock in LOCK CF.
+                var lockOpt = reader.readLock(key);
+                if (lockOpt.isPresent() && lockOpt.get().startTs() != req.getStartVersion()) {
+                    resp.addErrors(Kvrpcpb.KeyError.newBuilder()
+                            .setLocked(toLockInfo(key, lockOpt.get())).build());
+                    allAcquired = false;
+                    continue;
+                }
+
+                // Write conflict: any commit at commitTs >= forUpdateTs?
+                long latestCommit = txn.findLatestNonRollbackCommitTs(key);
+                if (latestCommit >= req.getForUpdateTs()) {
+                    resp.addErrors(Kvrpcpb.KeyError.newBuilder()
+                            .setConflict(Kvrpcpb.WriteConflict.newBuilder()
+                                    .setStartTs(req.getStartVersion())
+                                    .setConflictTs(latestCommit)
+                                    .setConflictCommitTs(latestCommit)
+                                    .setKey(m.getKey())
+                                    .setPrimary(req.getPrimaryLock())
+                                    .setReason(Kvrpcpb.WriteConflict.Reason.PessimisticRetry))
+                            .build());
+                    allAcquired = false;
+                    continue;
+                }
+
+                // Check self-rollback.
+                var rb = reader.findWriteByStartTs(key, req.getStartVersion());
+                if (rb.isPresent() && rb.get().type() == io.github.xinfra.lab.xkv.kv.mvcc.Write.Type.ROLLBACK) {
+                    resp.addErrors(Kvrpcpb.KeyError.newBuilder()
+                            .setConflict(Kvrpcpb.WriteConflict.newBuilder()
+                                    .setStartTs(req.getStartVersion())
+                                    .setConflictTs(0)
+                                    .setConflictCommitTs(0)
+                                    .setKey(m.getKey())
+                                    .setPrimary(req.getPrimaryLock())
+                                    .setReason(Kvrpcpb.WriteConflict.Reason.PessimisticRetry))
+                            .build());
+                    allAcquired = false;
+                    continue;
+                }
+
+                // Insert into in-memory lock table.
+                var lock = Lock.builder()
+                        .type(Lock.Type.PESSIMISTIC)
+                        .primary(req.getPrimaryLock().toByteArray())
+                        .startTs(req.getStartVersion())
+                        .forUpdateTs(req.getForUpdateTs())
+                        .ttlMs(req.getLockTtl())
+                        .build();
+                var conflict = inMemoryLockTable.put(key, lock);
+                if (conflict.isPresent()) {
+                    resp.addErrors(Kvrpcpb.KeyError.newBuilder()
+                            .setLocked(toLockInfo(key, conflict.get())).build());
+                    allAcquired = false;
+                    continue;
+                }
+            }
+        }
+
+        // Deadlock detection on locked errors.
+        var dc = deadlockClient;
+        if (dc != null && resp.getErrorsCount() > 0) {
+            for (int i = 0; i < resp.getErrorsCount(); i++) {
+                var err = resp.getErrors(i);
+                if (!err.hasLocked()) continue;
+                var lock = err.getLocked();
+                long waiter = req.getStartVersion();
+                long holder = lock.getLockVersion();
+                if (waiter == 0L || holder == 0L || waiter == holder) continue;
+                var res = dc.detect(waiter, holder, lock.getKey().toByteArray());
+                if (!res.isDeadlock()) continue;
+                var dl = Kvrpcpb.Deadlock.newBuilder()
+                        .setLockTs(holder)
+                        .setLockKey(lock.getKey())
+                        .setDeadlockKeyHash(res.deadlockKeyHash())
+                        .addAllWaitChain(res.waitChain())
+                        .build();
+                resp.setErrors(i, Kvrpcpb.KeyError.newBuilder().setDeadlock(dl).build());
+                log.info("deadlock detected: waiter={} holder={} chain_len={}",
+                        waiter, holder, res.waitChain().size());
+            }
+        }
+
+        // Fire-and-forget: propose through Raft for durability.
+        if (allAcquired) {
+            try {
+                var envelope = ProposalCodec.encode(ProposalCodec.Kind.MVCC_PESSIMISTIC_LOCK,
+                        0, req.toByteArray());
+                peer.propose(new RegionPeer.Proposal(envelope, 0, 0));
+            } catch (Exception e) {
+                log.warn("pipelined pessimistic lock async propose failed: {}", e.getMessage());
+            }
+        }
+
+        return resp.build();
     }
 
     public Kvrpcpb.PessimisticRollbackResponse kvPessimisticRollback(Kvrpcpb.PessimisticRollbackRequest req) {
         if (req.getKeysCount() == 0) return Kvrpcpb.PessimisticRollbackResponse.newBuilder().build();
+        // Clean in-memory locks before proposing the Raft rollback.
+        for (var k : req.getKeysList()) {
+            inMemoryLockTable.remove(k.toByteArray(), req.getStartVersion());
+        }
         byte[] sample = req.getKeys(0).toByteArray();
         var resp = propose(ProposalCodec.Kind.MVCC_PESSIMISTIC_ROLLBACK, req.toByteArray(), sample, req.getContext(),
                 bytes -> {
@@ -467,9 +581,6 @@ public final class TransactionService {
         if (!resp.hasRegionError() && resp.getErrorsCount() == 0) {
             var dc = deadlockClient;
             if (dc != null) {
-                // Pessimistic rollback drops both sides: the txn is no longer
-                // holding (other waiters unblock) and no longer waiting
-                // (whatever it was queued behind no longer matters).
                 dc.cleanupHolder(req.getStartVersion());
                 dc.cleanupWaiter(req.getStartVersion());
             }
@@ -771,7 +882,4 @@ public final class TransactionService {
         return b.build();
     }
 
-    /** Suppress an unused import warning. */
-    @SuppressWarnings("unused")
-    private static ArrayList<Object> nonNull() { return null; }
 }

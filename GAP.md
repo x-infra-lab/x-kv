@@ -27,9 +27,9 @@ model, leader lease, in-memory lock) and advanced features (backup, multi-tenanc
 | 1PC short-circuit | ✅ | ✅ | ✅ |
 | GC (PD safe-point + per-region propose) | ✅ | ✅ | ✅ |
 | Write conflict detection via seek | ✅ | Linear scan | ⚠️ Perf |
-| Overlapping rollback collapse | ✅ | Independent records | ⚠️ Write CF bloat |
-| Pipelined pessimistic lock | ✅ | ❌ | ❌ |
-| In-memory lock (write intent) | ✅ (v7+) | ❌ | ❌ |
+| Overlapping rollback collapse | ✅ | ✅ | ✅ |
+| Pipelined pessimistic lock | ✅ | ✅ | ✅ |
+| In-memory lock (write intent) | ✅ (v7+) | ✅ | ✅ |
 
 ---
 
@@ -48,8 +48,8 @@ model, leader lease, in-memory lock) and advanced features (backup, multi-tenanc
 | Merge quiescence (freeze writes) | ✅ | ✅ | ✅ |
 | Unified-CF atomic (applied_index + data in one batch) | ✅ | ✅ | ✅ |
 | Log compaction | ✅ | ✅ | ✅ |
-| Leader Lease (local read without RTT) | ✅ | ❌ | ❌ |
-| BatchSystem (fixed poll threads + mailbox) | ✅ | ❌ Per-region thread | ❌ |
+| Leader Lease (local read without RTT) | ✅ | ✅ | ✅ |
+| BatchSystem (fixed poll threads + mailbox) | ✅ | ✅ | ✅ |
 | Async Apply | ✅ | ❌ Sync in ready loop | ⚠️ |
 
 ---
@@ -162,12 +162,12 @@ model, leader lease, in-memory lock) and advanced features (backup, multi-tenanc
 
 ### P0 — Production Blockers
 
-| # | Gap | Impact | TiKV Solution |
-|---|-----|--------|---------------|
-| 1 | Per-region thread model | Thread/memory explosion beyond ~200 regions | BatchSystem: fixed poll threads + mailbox |
-| 2 | No Leader Lease | Every read requires ReadIndex RTT | Lease-based local read while lease valid |
-| 3 | No in-memory lock | Every prewrite pays lock CF write + fsync | In-memory lock table + async persist |
-| 4 | No pipelined pessimistic lock | Large txn lock phase bottleneck | Return success, async Raft propose |
+| # | Gap | Impact | TiKV Solution | Status |
+|---|-----|--------|---------------|--------|
+| 1 | ~~Per-region thread model~~ | ~~Thread/memory explosion beyond ~200 regions~~ | ~~BatchSystem: fixed poll threads + mailbox~~ | ✅ |
+| 2 | ~~No Leader Lease~~ | ~~Every read requires ReadIndex RTT~~ | ~~Lease-based local read while lease valid~~ | ✅ |
+| 3 | ~~No in-memory lock~~ | ~~Every prewrite pays lock CF write + fsync~~ | ~~In-memory lock table + async persist~~ | ✅ |
+| 4 | ~~No pipelined pessimistic lock~~ | ~~Large txn lock phase bottleneck~~ | ~~Return success, async Raft propose~~ | ✅ |
 
 ### P1 — Performance
 
@@ -188,7 +188,7 @@ model, leader lease, in-memory lock) and advanced features (backup, multi-tenanc
 | 12 | Full placement rules (label constraints) |
 | 13 | CDC incremental scan + resolved TS aggregation |
 | 14 | Online config change |
-| 15 | Rollback record aggregation (prevent write CF bloat) |
+| ~~15~~ | ~~Rollback record aggregation (prevent write CF bloat)~~ ✅ |
 
 ---
 
@@ -209,7 +209,6 @@ model, leader lease, in-memory lock) and advanced features (backup, multi-tenanc
 
 ## Suggested Next Steps
 
-1. **BatchSystem refactor** — abstract ready loop into mailbox + fixed worker pool
-2. **Leader Lease** — biggest user-visible latency improvement
-3. **Write conflict seek optimization** — reverse seek from `encode(key, MAX_TS)` to first non-rollback
-4. **Client BatchCommands** — single stream, multiple RPCs, amortized fsync
+1. **Write conflict seek optimization** — reverse seek from `encode(key, MAX_TS)` to first non-rollback
+2. **Client BatchCommands** — single stream, multiple RPCs, amortized fsync
+3. **Async Apply** — decouple apply from the poller ready loop into a dedicated apply pool
