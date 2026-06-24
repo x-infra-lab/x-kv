@@ -1,6 +1,7 @@
 package io.github.xinfra.lab.xkv.ctl;
 
 import io.github.xinfra.lab.xkv.ctl.cmd.ClusterCommand;
+import io.github.xinfra.lab.xkv.ctl.cmd.ConfigCommand;
 import io.github.xinfra.lab.xkv.ctl.cmd.GcCommand;
 import io.github.xinfra.lab.xkv.ctl.cmd.RegionCommand;
 import io.github.xinfra.lab.xkv.ctl.cmd.StoreCommand;
@@ -35,6 +36,10 @@ public final class XKvCtl {
               region info <region-id>     Show region details
 
               gc safepoint                Show current GC safe-point
+
+              config show --store <h:p>   Show runtime config of a KV store
+              config set --store <h:p> <key> <value>
+                                          Update a runtime config entry
             """;
 
     public static void main(String[] args) {
@@ -85,6 +90,7 @@ public final class XKvCtl {
                 case "store" -> StoreCommand.run(stub, action, rest);
                 case "region" -> RegionCommand.run(stub, action, rest);
                 case "gc" -> GcCommand.run(stub, action, rest);
+                case "config" -> ConfigCommand.run(action, rest);
                 default -> {
                     System.err.println("Unknown command group: " + group);
                     System.out.println(USAGE);

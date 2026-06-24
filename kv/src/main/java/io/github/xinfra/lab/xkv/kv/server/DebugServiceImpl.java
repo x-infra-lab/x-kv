@@ -2,6 +2,7 @@ package io.github.xinfra.lab.xkv.kv.server;
 
 import com.google.protobuf.ByteString;
 import io.github.xinfra.lab.xkv.common.metrics.XKvMetrics;
+import io.github.xinfra.lab.xkv.kv.config.ConfigManager;
 import io.github.xinfra.lab.xkv.kv.engine.StorageEngine;
 import io.github.xinfra.lab.xkv.kv.store.Store;
 import io.github.xinfra.lab.xkv.proto.DebugGrpc;
@@ -22,6 +23,7 @@ public final class DebugServiceImpl extends DebugGrpc.DebugImplBase {
     private final StorageEngine engine;
     private final Metapb.Store storeMetadata;
     private final Path dataDir;
+    private final ConfigManager configManager;
 
     public DebugServiceImpl() {
         this(null);
@@ -34,11 +36,18 @@ public final class DebugServiceImpl extends DebugGrpc.DebugImplBase {
     public DebugServiceImpl(PrometheusMeterRegistry registry, Store store,
                             StorageEngine engine, Metapb.Store storeMetadata,
                             Path dataDir) {
+        this(registry, store, engine, storeMetadata, dataDir, null);
+    }
+
+    public DebugServiceImpl(PrometheusMeterRegistry registry, Store store,
+                            StorageEngine engine, Metapb.Store storeMetadata,
+                            Path dataDir, ConfigManager configManager) {
         this.registry = registry;
         this.store = store;
         this.engine = engine;
         this.storeMetadata = storeMetadata;
         this.dataDir = dataDir;
+        this.configManager = configManager;
     }
 
     @Override
@@ -208,5 +217,45 @@ public final class DebugServiceImpl extends DebugGrpc.DebugImplBase {
                                   StreamObserver<Debugpb.UnsafeForceLeaderResponse> responseObserver) {
         responseObserver.onError(Status.UNIMPLEMENTED
                 .withDescription("UnsafeForceLeader is not yet supported").asRuntimeException());
+    }
+
+    @Override
+    public void getConfig(Debugpb.GetConfigRequest request,
+                           StreamObserver<Debugpb.GetConfigResponse> responseObserver) {
+        if (configManager == null) {
+            responseObserver.onError(Status.UNAVAILABLE
+                    .withDescription("config manager not initialized").asRuntimeException());
+            return;
+        }
+        var builder = Debugpb.GetConfigResponse.newBuilder();
+        for (var e : configManager.getAll().entrySet()) {
+            builder.addEntries(Debugpb.ConfigEntry.newBuilder()
+                    .setKey(e.getKey())
+                    .setValue(e.getValue()));
+        }
+        responseObserver.onNext(builder.build());
+        responseObserver.onCompleted();
+    }
+
+    @Override
+    public void modifyConfig(Debugpb.ModifyConfigRequest request,
+                              StreamObserver<Debugpb.ModifyConfigResponse> responseObserver) {
+        if (configManager == null) {
+            responseObserver.onError(Status.UNAVAILABLE
+                    .withDescription("config manager not initialized").asRuntimeException());
+            return;
+        }
+        var errors = new StringBuilder();
+        for (var entry : request.getEntriesList()) {
+            String err = configManager.set(entry.getKey(), entry.getValue());
+            if (err != null) {
+                if (!errors.isEmpty()) errors.append("; ");
+                errors.append(err);
+            }
+        }
+        var resp = Debugpb.ModifyConfigResponse.newBuilder();
+        if (!errors.isEmpty()) resp.setError(errors.toString());
+        responseObserver.onNext(resp.build());
+        responseObserver.onCompleted();
     }
 }

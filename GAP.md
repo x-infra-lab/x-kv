@@ -153,7 +153,7 @@ model, leader lease, in-memory lock) and advanced features (backup, multi-tenanc
 | TLS/mTLS | ✅ | ✅ | ✅ |
 | Rate limiting | ✅ | ✅ | ✅ |
 | Graceful drain | ✅ | ✅ | ✅ |
-| Online config change | ✅ | ❌ | ❌ |
+| Online config change | ✅ | ✅ | ✅ |
 | Backup / Restore (BR) | ✅ | ❌ (roadmap) | ❌ |
 
 ---
@@ -187,7 +187,7 @@ model, leader lease, in-memory lock) and advanced features (backup, multi-tenanc
 | 11 | Keyspace / Resource Group (multi-tenancy) |
 | 12 | Full placement rules (label constraints) |
 | ~~13~~ | ~~CDC incremental scan + resolved TS aggregation~~ ✅ |
-| 14 | Online config change |
+| ~~14~~ | ~~Online config change~~ ✅ |
 | ~~15~~ | ~~Rollback record aggregation (prevent write CF bloat)~~ ✅ |
 
 ---

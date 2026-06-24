@@ -24,6 +24,10 @@ service Debug {
     // Force a region into local-only mode, e.g. to recover from quorum loss.
     // Refused unless `unsafe_recovery` flag in store config is true.
     rpc UnsafeForceLeader(UnsafeForceLeaderRequest) returns (UnsafeForceLeaderResponse);
+
+    // Online config: get/set mutable parameters at runtime.
+    rpc GetConfig(GetConfigRequest) returns (GetConfigResponse);
+    rpc ModifyConfig(ModifyConfigRequest) returns (ModifyConfigResponse);
 }
 
 message GetRegionInfoRequest { uint64 region_id = 1; }
@@ -99,4 +103,19 @@ message UnsafeForceLeaderRequest {
 message UnsafeForceLeaderResponse {
     bool ok = 1;
     string message = 2;
+}
+
+message ConfigEntry {
+    string key = 1;
+    string value = 2;
+}
+message GetConfigRequest {}
+message GetConfigResponse {
+    repeated ConfigEntry entries = 1;
+}
+message ModifyConfigRequest {
+    repeated ConfigEntry entries = 1;
+}
+message ModifyConfigResponse {
+    string error = 1;
 }

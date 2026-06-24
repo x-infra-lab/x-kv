@@ -105,6 +105,7 @@ public final class KvServer {
             new io.github.xinfra.lab.xkv.kv.mvcc.InMemoryLockTable();
     private final io.github.xinfra.lab.xkv.kv.cdc.RegionResolvedTsTracker resolvedTsTracker =
             new io.github.xinfra.lab.xkv.kv.cdc.RegionResolvedTsTracker();
+    private io.github.xinfra.lab.xkv.kv.config.ConfigManager configManager;
 
     private static final long STORE_HEARTBEAT_INTERVAL_MS = 10_000;
 
@@ -134,10 +135,11 @@ public final class KvServer {
 
         Metapb.Region initialRegion = bootstrapOrJoin(pdStub, storeMeta);
 
-        // 3) Build store container + CDC event bus.
+        // 3) Build store container + CDC event bus + config manager.
         store = new StoreImpl(config.storeId(), storeMeta);
         dispatcher = new RaftMessageDispatcher();
         cdcEventBus = new CdcEventBus();
+        configManager = new io.github.xinfra.lab.xkv.kv.config.ConfigManager(config);
 
         // 4) Resolve peer addresses from PD for raft transport.
         Map<Long, String> peerAddrs = resolvePeerAddresses(pdStub, initialRegion);
@@ -215,7 +217,7 @@ public final class KvServer {
                 .addService(cdcService);
         if (config.enableDebugService()) {
             clientServerBuilder.addService(
-                    new DebugServiceImpl(metricsRegistry, store, engine, storeMeta, config.dataDir()));
+                    new DebugServiceImpl(metricsRegistry, store, engine, storeMeta, config.dataDir(), configManager));
         }
         // Interceptor order: last .intercept() is outermost (executed first).
         // Desired: drain → auth → rateLimit → mdc → metrics (innermost)
