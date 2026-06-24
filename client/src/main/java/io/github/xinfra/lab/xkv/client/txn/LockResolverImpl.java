@@ -4,6 +4,7 @@ import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import io.github.xinfra.lab.xkv.client.backoff.Backoffer;
 import io.github.xinfra.lab.xkv.client.config.ClientConfig;
+import io.github.xinfra.lab.xkv.client.region.RegionCache;
 import io.github.xinfra.lab.xkv.client.region.RegionRequestSenderImpl;
 import io.github.xinfra.lab.xkv.client.tso.TsoBatcher;
 import io.github.xinfra.lab.xkv.proto.Errorpb;
@@ -11,6 +12,8 @@ import io.github.xinfra.lab.xkv.proto.Kvrpcpb;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -37,6 +40,7 @@ public final class LockResolverImpl implements LockResolver {
     private static final Logger log = LoggerFactory.getLogger(LockResolverImpl.class);
 
     private final RegionRequestSenderImpl sender;
+    private final RegionCache regionCache;
     private final TsoBatcher tso;
     private final ClientConfig.TxnConfig cfg;
 
@@ -47,9 +51,11 @@ public final class LockResolverImpl implements LockResolver {
     private final ConcurrentMap<Long, CompletableFuture<Verdict>> inFlight = new ConcurrentHashMap<>();
 
     public LockResolverImpl(RegionRequestSenderImpl sender,
+                             RegionCache regionCache,
                              TsoBatcher tso,
                              ClientConfig.TxnConfig cfg) {
         this.sender = sender;
+        this.regionCache = regionCache;
         this.tso = tso;
         this.cfg = cfg;
         this.verdictCache = Caffeine.newBuilder()
@@ -88,11 +94,60 @@ public final class LockResolverImpl implements LockResolver {
 
     @Override
     public boolean resolveLocks(Backoffer bo, long callerStartTs, List<Kvrpcpb.LockInfo> locks) {
-        boolean allResolved = true;
-        for (var lock : locks) {
-            if (!resolveLock(bo, callerStartTs, lock)) allResolved = false;
+        if (locks.size() == 1) {
+            return resolveLock(bo, callerStartTs, locks.get(0));
         }
-        return allResolved;
+
+        // 1. Deduplicate CheckTxnStatus by startTs (single-flighted).
+        var verdicts = new HashMap<Long, Verdict>();
+        boolean anyAlive = false;
+        for (var lock : locks) {
+            long lockTs = lock.getLockVersion();
+            if (verdicts.containsKey(lockTs)) continue;
+            var v = checkOrAwaitVerdict(bo, callerStartTs, lock);
+            verdicts.put(lockTs, v);
+            if (v == null || v.kind() == Verdict.Kind.ALIVE) anyAlive = true;
+        }
+
+        // 2. Build txn_infos from terminal verdicts.
+        var txnInfos = new ArrayList<Kvrpcpb.TxnInfo>();
+        for (var e : verdicts.entrySet()) {
+            var v = e.getValue();
+            if (v == null || v.kind() == Verdict.Kind.ALIVE) continue;
+            long commitTs = v.kind() == Verdict.Kind.COMMITTED ? v.commitTs() : 0L;
+            txnInfos.add(Kvrpcpb.TxnInfo.newBuilder()
+                    .setTxn(e.getKey()).setStatus(commitTs).build());
+        }
+        if (txnInfos.isEmpty()) return !anyAlive;
+
+        // 3. Group lock keys by region, send one ResolveLock per region.
+        var byRegion = new HashMap<Long, byte[]>();
+        for (var lock : locks) {
+            long lockTs = lock.getLockVersion();
+            var v = verdicts.get(lockTs);
+            if (v == null || v.kind() == Verdict.Kind.ALIVE) continue;
+            byte[] key = lock.getKey().toByteArray();
+            var info = regionCache.locateKey(key).orElse(null);
+            long rid = info == null ? 0L : info.region().getId();
+            byRegion.putIfAbsent(rid, key);
+        }
+
+        for (var routeKey : byRegion.values()) {
+            var resolveResp = sender.sendKeyed(routeKey, bo,
+                    (stub, info) -> stub.kvResolveLock(Kvrpcpb.ResolveLockRequest.newBuilder()
+                            .setContext(Kvrpcpb.Context.newBuilder()
+                                    .setRegionId(info.region().getId())
+                                    .setRegionEpoch(info.region().getRegionEpoch())
+                                    .setPeer(info.leader())
+                                    .build())
+                            .addAllTxnInfos(txnInfos)
+                            .build()),
+                    Kvrpcpb.ResolveLockResponse::getRegionError);
+            if (resolveResp.hasError()) {
+                log.warn("batch ResolveLock returned KeyError: {}", resolveResp.getError());
+            }
+        }
+        return !anyAlive;
     }
 
     @Override public void clearCache() { verdictCache.invalidateAll(); inFlight.clear(); }

@@ -85,13 +85,24 @@ public final class MvccReader implements AutoCloseable {
         return v == null ? Optional.empty() : Optional.of(Lock.decode(v));
     }
 
+    public record WriteWithTs(Write write, long commitTs) {}
+
     /**
      * Read the latest write record for {@code userKey} (any commitTs >= 0).
      * Used by CheckTxnStatus / Cleanup to inspect prior commit history.
      */
     public Optional<Write> readLatestWrite(byte[] userKey) {
-        var write = findVisibleWrite(userKey, Long.MAX_VALUE);
-        return Optional.ofNullable(write);
+        var wt = findVisibleWriteWithTs(userKey, Long.MAX_VALUE);
+        return wt == null ? Optional.empty() : Optional.of(wt.write());
+    }
+
+    /**
+     * Read the latest non-ROLLBACK write and its commitTs in a single seek.
+     * Avoids the double-scan that separate readLatestWrite + commitTs lookup
+     * would require.
+     */
+    public Optional<WriteWithTs> readLatestWriteWithTs(byte[] userKey) {
+        return Optional.ofNullable(findVisibleWriteWithTs(userKey, Long.MAX_VALUE));
     }
 
     /**
@@ -218,14 +229,19 @@ public final class MvccReader implements AutoCloseable {
     }
 
     private Write findVisibleWrite(byte[] userKey, long readTs) {
+        var wt = findVisibleWriteWithTs(userKey, readTs);
+        return wt == null ? null : wt.write();
+    }
+
+    private WriteWithTs findVisibleWriteWithTs(byte[] userKey, long readTs) {
         var lower = MvccKey.encode(userKey, readTs);
         try (var it = engine.newIterator(StorageEngine.Cf.WRITE, cachedReadOpts)) {
             it.seek(lower);
-            return walkForVisible(it, userKey, readTs);
+            return walkForVisibleWithTs(it, userKey, readTs);
         }
     }
 
-    private Write walkForVisible(StorageEngine.Iterator it, byte[] userKey, long readTs) {
+    WriteWithTs walkForVisibleWithTs(StorageEngine.Iterator it, byte[] userKey, long readTs) {
         while (it.isValid()) {
             byte[] k = it.key();
             if (!MvccKey.userKeyEquals(k, userKey)) return null;
@@ -240,10 +256,15 @@ public final class MvccReader implements AutoCloseable {
                     it.next();
                     continue;
                 }
-                case PUT, DELETE -> { return w; }
+                case PUT, DELETE -> { return new WriteWithTs(w, commitTs); }
             }
         }
         return null;
+    }
+
+    private Write walkForVisible(StorageEngine.Iterator it, byte[] userKey, long readTs) {
+        var wt = walkForVisibleWithTs(it, userKey, readTs);
+        return wt == null ? null : wt.write();
     }
 
     private Optional<byte[]> resolveValue(byte[] userKey, Write w) {

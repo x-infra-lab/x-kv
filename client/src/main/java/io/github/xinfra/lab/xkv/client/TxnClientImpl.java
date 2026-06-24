@@ -6,6 +6,7 @@ import io.github.xinfra.lab.xkv.client.cop.CopClient;
 import io.github.xinfra.lab.xkv.client.cop.CopClientImpl;
 import io.github.xinfra.lab.xkv.client.error.KvClientException;
 import io.github.xinfra.lab.xkv.client.pd.PdClient;
+import io.github.xinfra.lab.xkv.client.region.BatchCommandsClient;
 import io.github.xinfra.lab.xkv.client.region.RegionCacheImpl;
 import io.github.xinfra.lab.xkv.client.region.RegionRequestSenderImpl;
 import io.github.xinfra.lab.xkv.client.region.StoreChannelCache;
@@ -39,17 +40,20 @@ public final class TxnClientImpl implements TxnClient {
     private final LockResolverImpl lockResolver;
     private final TwoPhaseCommitterImpl committer;
     private final CopClientImpl copClient;
+    private final BatchCommandsClient batchClient;
 
     public TxnClientImpl(ClientConfig config) {
         this.config = config;
         var tls = config.conn() != null ? config.conn().tls() : null;
         this.pdClient = new PdClient(config.pdEndpoints(), tls, config.authToken());
+        int poolSize = config.conn() != null ? config.conn().maxStoreConnections() : 1;
         this.storeCache = new StoreChannelCache(pdClient, tls, config.authToken(),
-                config.grpcTimeout());
+                config.grpcTimeout(), poolSize);
+        this.batchClient = new BatchCommandsClient(storeCache);
         this.regionCache = new RegionCacheImpl(pdClient, config.regionCache());
-        this.sender = new RegionRequestSenderImpl(regionCache, storeCache);
+        this.sender = new RegionRequestSenderImpl(regionCache, storeCache, batchClient);
         this.tso = new TsoBatcherImpl(pdClient, config.tso());
-        this.lockResolver = new LockResolverImpl(sender, tso, config.txn());
+        this.lockResolver = new LockResolverImpl(sender, regionCache, tso, config.txn());
         this.committer = new TwoPhaseCommitterImpl(sender, regionCache, tso, config.backoff());
         this.copClient = new CopClientImpl(regionCache, storeCache,
                 Runtime.getRuntime().availableProcessors() * 2, config.backoff());
@@ -126,6 +130,9 @@ public final class TxnClientImpl implements TxnClient {
     public void close() {
         try { copClient.close(); } catch (Throwable e) {
             log.warn("copClient close failed: {}", e.getMessage(), e);
+        }
+        try { batchClient.close(); } catch (Throwable e) {
+            log.warn("batchClient close failed: {}", e.getMessage(), e);
         }
         try { tso.close(); } catch (Throwable e) {
             log.warn("tso close failed: {}", e.getMessage(), e);

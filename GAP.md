@@ -26,7 +26,7 @@ model, leader lease, in-memory lock) and advanced features (backup, multi-tenanc
 | Async Commit (min_commit_ts + secondaries list) | ✅ | ✅ | ✅ |
 | 1PC short-circuit | ✅ | ✅ | ✅ |
 | GC (PD safe-point + per-region propose) | ✅ | ✅ | ✅ |
-| Write conflict detection via seek | ✅ | Linear scan | ⚠️ Perf |
+| Write conflict detection via seek | ✅ | ✅ | ✅ |
 | Overlapping rollback collapse | ✅ | ✅ | ✅ |
 | Pipelined pessimistic lock | ✅ | ✅ | ✅ |
 | In-memory lock (write intent) | ✅ (v7+) | ✅ | ✅ |
@@ -50,7 +50,7 @@ model, leader lease, in-memory lock) and advanced features (backup, multi-tenanc
 | Log compaction | ✅ | ✅ | ✅ |
 | Leader Lease (local read without RTT) | ✅ | ✅ | ✅ |
 | BatchSystem (fixed poll threads + mailbox) | ✅ | ✅ | ✅ |
-| Async Apply | ✅ | ❌ Sync in ready loop | ⚠️ |
+| Async Apply | ✅ | ✅ | ✅ |
 
 ---
 
@@ -93,9 +93,9 @@ model, leader lease, in-memory lock) and advanced features (backup, multi-tenanc
 | Raw KV API (get/put/delete/scan/batch/CAS/TTL/deleteRange) | ✅ | ✅ | ✅ |
 | Txn executeWithRetry | ✅ | ✅ | ✅ |
 | Coprocessor client + streaming | ✅ | ✅ | ✅ |
-| Store connection pool (per-store multi-channel) | ✅ | Single channel/store | ⚠️ |
-| BatchCommands client multiplexing | ✅ | ❌ Not used | ❌ |
-| Batch ResolveLock (Green GC) | ✅ | Per-key resolve | ⚠️ |
+| Store connection pool (per-store multi-channel) | ✅ | ✅ | ✅ |
+| BatchCommands client multiplexing | ✅ | ✅ | ✅ |
+| Batch ResolveLock (Green GC) | ✅ | ✅ | ✅ |
 
 ---
 
@@ -171,13 +171,13 @@ model, leader lease, in-memory lock) and advanced features (backup, multi-tenanc
 
 ### P1 — Performance
 
-| # | Gap | Impact |
-|---|-----|--------|
-| 5 | Write conflict scan is linear (not seek-based) | Hot keys with many versions slow prewrite |
-| 6 | Client not using BatchCommands multiplexing | One gRPC call per RPC, no fsync amortization |
-| 7 | No Index Scan in coprocessor | SQL workloads require full table scan |
-| 8 | Row-at-a-time coprocessor (not vectorized) | Low CPU utilization |
-| 9 | Single channel per store | Concurrency limited |
+| # | Gap | Impact | Status |
+|---|-----|--------|--------|
+| ~~5~~ | ~~Write conflict scan is linear (not seek-based)~~ | ~~Hot keys with many versions slow prewrite~~ | ✅ |
+| ~~6~~ | ~~Client not using BatchCommands multiplexing~~ | ~~One gRPC call per RPC, no fsync amortization~~ | ✅ |
+| 7 | No Index Scan in coprocessor | SQL workloads require full table scan | |
+| 8 | Row-at-a-time coprocessor (not vectorized) | Low CPU utilization | |
+| ~~9~~ | ~~Single channel per store~~ | ~~Concurrency limited~~ | ✅ |
 
 ### P2 — Features
 
@@ -209,6 +209,6 @@ model, leader lease, in-memory lock) and advanced features (backup, multi-tenanc
 
 ## Suggested Next Steps
 
-1. **Write conflict seek optimization** — reverse seek from `encode(key, MAX_TS)` to first non-rollback
-2. **Client BatchCommands** — single stream, multiple RPCs, amortized fsync
-3. **Async Apply** — decouple apply from the poller ready loop into a dedicated apply pool
+1. ~~**Write conflict seek optimization** — reverse seek from `encode(key, MAX_TS)` to first non-rollback~~ ✅
+2. ~~**Client BatchCommands** — single stream, multiple RPCs, amortized fsync~~ ✅
+3. ~~**Async Apply** — decouple apply from the poller ready loop into a dedicated apply pool~~ ✅

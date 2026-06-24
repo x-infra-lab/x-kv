@@ -145,9 +145,11 @@ public final class KvConfig {
             long logCompactionIntervalMs,
             long logCompactionGapThreshold,
             long logCompactionSafetyMargin,
-            long gcIntervalMs) {
+            long gcIntervalMs,
+            int applyPoolThreads) {
         public static WorkerConfig defaults() {
-            return new WorkerConfig(60_000, 10_000, 1_000, 60_000);
+            return new WorkerConfig(60_000, 10_000, 1_000, 60_000,
+                    Math.max(2, Runtime.getRuntime().availableProcessors() / 2));
         }
     }
 

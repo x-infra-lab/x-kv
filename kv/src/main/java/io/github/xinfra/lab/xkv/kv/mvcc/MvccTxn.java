@@ -95,22 +95,17 @@ public final class MvccTxn {
             }
         }
 
-        // 2) Write-conflict scan: look at the LATEST visible write at any ts.
-        //    If commitTs >= startTs and not ROLLBACK, this is a conflict.
-        var latest = reader.readLatestWrite(key);
+        // 2) Write-conflict scan: single seek for latest non-ROLLBACK write + commitTs.
+        var latest = reader.readLatestWriteWithTs(key);
         if (latest.isPresent()) {
-            // We need its commit_ts. readLatestWrite returns Write payload;
-            // commitTs is encoded in the write CF key, not the value. To get
-            // it we re-iterate. Cheap enough: write CF is point-lookup-tuned.
-            long latestCommitTs = findLatestNonRollbackCommitTs(key);
-            if (latestCommitTs >= startTs) {
-                return PrewriteOutcome.writeConflict(key, startTs, latestCommitTs);
+            if (latest.get().commitTs() >= startTs) {
+                return PrewriteOutcome.writeConflict(key, startTs, latest.get().commitTs());
             }
         }
 
         // 3) INSERT / CHECK_NOT_EXISTS: reject if a committed PUT already exists.
         if (op == Op.INSERT || op == Op.CHECK_NOT_EXISTS) {
-            if (latest.isPresent() && latest.get().type() == Write.Type.PUT) {
+            if (latest.isPresent() && latest.get().write().type() == Write.Type.PUT) {
                 return PrewriteOutcome.alreadyExist(key);
             }
         }
@@ -202,25 +197,6 @@ public final class MvccTxn {
         return PrewriteOutcome.alreadyPrewritten(key, lock);
     }
 
-    /**
-     * Find the largest commit_ts on key whose write record is NOT a ROLLBACK.
-     * Returns 0 if none exists.
-     */
-    public long findLatestNonRollbackCommitTs(byte[] key) {
-        var iter = readerEngine().newIterator(StorageEngine.Cf.WRITE, reader.snapshotReadOpts());
-        try (iter) {
-            iter.seek(MvccKey.firstVersionFor(key));
-            while (iter.isValid()) {
-                if (!MvccKey.userKeyEquals(iter.key(), key)) break;
-                Write w = Write.decode(iter.value());
-                if (w.type() != Write.Type.ROLLBACK) {
-                    return MvccKey.ts(iter.key());
-                }
-                iter.next();
-            }
-            return 0L;
-        }
-    }
 
     // =====================================================================
     // Prewrite (pass 2: write to batch)
@@ -447,9 +423,9 @@ public final class MvccTxn {
         }
 
         // Write conflict: any commit at commitTs >= forUpdateTs ?
-        long latestCommit = findLatestNonRollbackCommitTs(key);
-        if (latestCommit >= forUpdateTs) {
-            return PessimisticLockOutcome.writeConflict(key, startTs, latestCommit);
+        var latestOpt = reader.readLatestWriteWithTs(key);
+        if (latestOpt.isPresent() && latestOpt.get().commitTs() >= forUpdateTs) {
+            return PessimisticLockOutcome.writeConflict(key, startTs, latestOpt.get().commitTs());
         }
 
         var lockOpt = reader.readLock(key);

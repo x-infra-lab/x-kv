@@ -30,8 +30,9 @@ public final class XKvClientImpl implements XKvClient {
         this.config = config;
         var tls = config.conn() != null ? config.conn().tls() : null;
         this.pdClient = new PdClient(config.pdEndpoints(), tls, config.authToken());
+        int poolSize = config.conn() != null ? config.conn().maxStoreConnections() : 1;
         this.storeCache = new StoreChannelCache(pdClient, tls, config.authToken(),
-                config.grpcTimeout());
+                config.grpcTimeout(), poolSize);
         this.regionCache = new RegionCacheImpl(pdClient, config.regionCache());
         this.sender = new RegionRequestSenderImpl(regionCache, storeCache);
         this.rawKv = new RawKvClientImpl(sender, regionCache, config.backoff());

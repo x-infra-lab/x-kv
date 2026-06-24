@@ -69,7 +69,9 @@ public final class KvConfigLoader {
                 getLong(m, "worker.log-compaction-interval-ms", 60_000),
                 getLong(m, "worker.log-compaction-gap-threshold", 10_000),
                 getLong(m, "worker.log-compaction-safety-margin", 1_000),
-                getLong(m, "worker.gc-interval-ms", 60_000)));
+                getLong(m, "worker.gc-interval-ms", 60_000),
+                getInt(m, "worker.apply-pool-threads",
+                        Math.max(2, Runtime.getRuntime().availableProcessors() / 2))));
 
         return builder.build();
     }

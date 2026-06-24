@@ -71,6 +71,9 @@ public final class RegionMailbox {
     // --- Scheduling ---
     private final AtomicBoolean scheduled = new AtomicBoolean(false);
     private volatile RaftPoller poller;
+    private volatile ApplyWorker applyWorker;
+    private volatile boolean applyBusy = false;
+    private final java.util.ArrayDeque<List<Eraftpb.Entry>> bufferedApply = new java.util.ArrayDeque<>();
     volatile boolean running = true;
     volatile boolean destroyed = false;
 
@@ -168,6 +171,8 @@ public final class RegionMailbox {
 
     void setPoller(RaftPoller poller) { this.poller = poller; }
 
+    void setApplyWorker(ApplyWorker worker) { this.applyWorker = worker; }
+
     void wakeup() {
         if (scheduled.compareAndSet(false, true)) {
             var p = poller;
@@ -233,11 +238,6 @@ public final class RegionMailbox {
     // ================================================================
 
     private void applyReady(Ready ready) throws Exception {
-        var pending = new ArrayList<PendingDispatch>();
-        var confChanges = new ArrayList<Eraftpb.ConfChangeV2>();
-        var postFlushCallbacks = new ArrayList<Runnable>();
-        boolean wroteAnything = false;
-
         // Leader-change detection via SoftState.
         if (ready.softState() != null) {
             var ss = ready.softState();
@@ -253,6 +253,8 @@ public final class RegionMailbox {
                         regionId, selfPeerId, isLeader, ss.lead());
             }
         }
+
+        boolean wroteAnything = false;
 
         // Phase 0: install snapshot.
         if (ready.snapshot() != null && ready.snapshot().hasMetadata()
@@ -276,19 +278,22 @@ public final class RegionMailbox {
             }
         }
 
-        // Phase B: apply committed entries — one batch PER entry.
-        if (ready.committedEntries() != null) {
-            for (var entry : ready.committedEntries()) {
-                long idx = entry.getIndex();
-                if (idx <= raftEngine.appliedIndex()) continue;
+        // Fsync for log entries (Phase 0 + A) before sending messages.
+        if (wroteAnything) {
+            storage.flushWal(true);
+        }
 
-                if (applyOneEntry(entry, pending, confChanges, postFlushCallbacks, idx)) {
-                    wroteAnything = true;
-                }
+        raftStorage.postApply(ready.hardState());
+
+        // Send raft messages promptly — don't wait for apply.
+        if (ready.messages() != null) {
+            for (var msg : ready.messages()) {
+                if (msg.getTo() == selfPeerId) continue;
+                transport.send(msg.getTo(), msg);
             }
         }
 
-        // ReadIndex processing.
+        // Register ReadIndex waiters (they will be drained after apply completes).
         if (ready.readStates() != null) {
             for (var rs : ready.readStates()) {
                 var key = ByteBuffer.wrap(rs.requestCtx());
@@ -305,7 +310,84 @@ public final class RegionMailbox {
         }
         drainReadIndexWaiters();
 
-        // Max_ts persistence.
+        // Phase B: apply committed entries — async if ApplyWorker is available.
+        if (ready.committedEntries() != null && !ready.committedEntries().isEmpty()) {
+            var entries = ready.committedEntries();
+            var worker = this.applyWorker;
+            if (worker != null) {
+                submitAsyncApply(entries);
+            } else {
+                applySynchronously(entries);
+            }
+        }
+    }
+
+    private void submitAsyncApply(List<Eraftpb.Entry> entries) {
+        var worker = this.applyWorker;
+        if (worker == null) {
+            applySynchronously(entries);
+            return;
+        }
+        var task = new ApplyWorker.ApplyTask(
+                regionId, entries, applyHandler, raftEngine, storage, cm,
+                new ApplyWorker.ApplyCallback() {
+                    @Override
+                    public void onApplied(List<PendingDispatch> pending,
+                                          List<Eraftpb.ConfChangeV2> confChanges) {
+                        for (var pd : pending) {
+                            var fut = pendingProposals.remove(pd.proposeSeq);
+                            if (fut != null) fut.complete(pd.result);
+                        }
+                        drainReadIndexWaiters();
+                        for (var cc : confChanges) {
+                            applyConfChangeOne(cc);
+                        }
+                    }
+
+                    @Override
+                    public void onError(Throwable t) {
+                        log.error("region={} async apply error", regionId, t);
+                    }
+
+                    @Override
+                    public void onComplete() {
+                        applyBusy = false;
+                        synchronized (bufferedApply) {
+                            var next = bufferedApply.poll();
+                            if (next != null) {
+                                submitAsyncApply(next);
+                            }
+                        }
+                    }
+                });
+
+        if (applyBusy) {
+            synchronized (bufferedApply) {
+                bufferedApply.offer(entries);
+            }
+            return;
+        }
+        applyBusy = true;
+        if (!worker.submit(task)) {
+            applyBusy = false;
+            applySynchronously(entries);
+        }
+    }
+
+    private void applySynchronously(List<Eraftpb.Entry> entries) {
+        var pending = new ArrayList<PendingDispatch>();
+        var confChanges = new ArrayList<Eraftpb.ConfChangeV2>();
+        var postFlushCallbacks = new ArrayList<Runnable>();
+        boolean wroteAnything = false;
+
+        for (var entry : entries) {
+            long idx = entry.getIndex();
+            if (idx <= raftEngine.appliedIndex()) continue;
+            if (applyOneEntry(entry, pending, confChanges, postFlushCallbacks, idx)) {
+                wroteAnything = true;
+            }
+        }
+
         if (cm != null) {
             long inMemory = cm.maxTs().current();
             if (inMemory > raftEngine.persistedMaxTs()) {
@@ -317,7 +399,6 @@ public final class RegionMailbox {
             }
         }
 
-        // Single fsync for the entire Ready round.
         if (wroteAnything) {
             storage.flushWal(true);
         }
@@ -327,23 +408,11 @@ public final class RegionMailbox {
             catch (Throwable t) { log.warn("region={} postFlush callback failed", regionId, t); }
         }
 
-        raftStorage.postApply(ready.hardState());
-
-        // Fan-out proposal results.
         for (var pd : pending) {
             var fut = pendingProposals.remove(pd.proposeSeq);
             if (fut != null) fut.complete(pd.result);
         }
 
-        // Send raft messages.
-        if (ready.messages() != null) {
-            for (var msg : ready.messages()) {
-                if (msg.getTo() == selfPeerId) continue;
-                transport.send(msg.getTo(), msg);
-            }
-        }
-
-        // Conf-change apply.
         for (var cc : confChanges) {
             applyConfChangeOne(cc);
         }
@@ -353,15 +422,19 @@ public final class RegionMailbox {
                                    List<PendingDispatch> pending,
                                    List<Eraftpb.ConfChangeV2> confChanges,
                                    List<Runnable> postFlushCallbacks,
-                                   long idx) throws Exception {
+                                   long idx) {
         if (entry.getEntryType() == Eraftpb.EntryType.EntryConfChange) {
-            var cc = Eraftpb.ConfChange.parseFrom(entry.getData());
-            var ccv2 = Eraftpb.ConfChangeV2.newBuilder()
-                    .addChanges(Eraftpb.ConfChangeSingle.newBuilder()
-                            .setType(cc.getChangeType())
-                            .setNodeId(cc.getNodeId()))
-                    .build();
-            confChanges.add(ccv2);
+            try {
+                var cc = Eraftpb.ConfChange.parseFrom(entry.getData());
+                var ccv2 = Eraftpb.ConfChangeV2.newBuilder()
+                        .addChanges(Eraftpb.ConfChangeSingle.newBuilder()
+                                .setType(cc.getChangeType())
+                                .setNodeId(cc.getNodeId()))
+                        .build();
+                confChanges.add(ccv2);
+            } catch (Throwable t) {
+                log.warn("region={} conf-change parse failed: {}", regionId, t.getMessage());
+            }
             try (var batch = storage.newWriteBatch()) {
                 raftEngine.saveAppliedIndex(idx, batch);
                 storage.write(batch, false);
@@ -369,7 +442,11 @@ public final class RegionMailbox {
             return true;
         }
         if (entry.getEntryType() == Eraftpb.EntryType.EntryConfChangeV2) {
-            confChanges.add(Eraftpb.ConfChangeV2.parseFrom(entry.getData()));
+            try {
+                confChanges.add(Eraftpb.ConfChangeV2.parseFrom(entry.getData()));
+            } catch (Throwable t) {
+                log.warn("region={} conf-change-v2 parse failed: {}", regionId, t.getMessage());
+            }
             try (var batch = storage.newWriteBatch()) {
                 raftEngine.saveAppliedIndex(idx, batch);
                 storage.write(batch, false);

@@ -100,6 +100,7 @@ public final class KvServer {
     private DrainingInterceptor drainingInterceptor;
     private CdcEventBus cdcEventBus;
     private ChangeDataServiceImpl cdcService;
+    private io.github.xinfra.lab.xkv.kv.raft.ApplyWorker applyWorker;
     private final io.github.xinfra.lab.xkv.kv.mvcc.InMemoryLockTable inMemoryLockTable =
             new io.github.xinfra.lab.xkv.kv.mvcc.InMemoryLockTable();
 
@@ -162,9 +163,11 @@ public final class KvServer {
             t.start();
         });
 
-        // 5b) Initialize BatchSystem: shared poller + tick driver.
+        // 5b) Initialize BatchSystem: shared poller + tick driver + apply pool.
         raftPoller = new RaftPoller(config.raft().pollerThreads());
         tickDriver = new TickDriver(config.raft().heartbeatTickMs());
+        applyWorker = new io.github.xinfra.lab.xkv.kv.raft.ApplyWorker(
+                config.worker().applyPoolThreads());
 
         // 6) Create the initial region peer.
         long selfPeerId = findSelfPeerId(initialRegion);
@@ -416,7 +419,7 @@ public final class KvServer {
                 CompositeApplyHandler.defaultFor(engine, cm, region.getId(), cdcEventBus,
                                 inMemoryLockTable)
                         .withAdmin(raftEngine, engine, splitObserver, mergeObserver),
-                settings, cm, snapshotEngine, raftPoller, tickDriver);
+                settings, cm, snapshotEngine, raftPoller, tickDriver, applyWorker);
         peerHolder.set(peer);
         dispatcher.register(region.getId(), transport);
         return peer;
@@ -474,7 +477,7 @@ public final class KvServer {
                 childTransport, childHandler,
                 new RegionPeerImpl.Settings(10, 1, config.raft().heartbeatTickMs(),
                         config.raft().leaseBasedRead()),
-                childCm, snapshotEngine, raftPoller, tickDriver);
+                childCm, snapshotEngine, raftPoller, tickDriver, applyWorker);
         childPeerHolder.set(childPeer);
         dispatcher.register(childRegionId, childTransport);
         store.registerPeer(childPeer);
@@ -694,7 +697,8 @@ public final class KvServer {
             }
         }
 
-        // 3b) Shut down BatchSystem poller + tick driver.
+        // 3b) Shut down BatchSystem: apply pool → poller → tick driver.
+        if (applyWorker != null) applyWorker.shutdown();
         if (tickDriver != null) tickDriver.shutdown();
         if (raftPoller != null) raftPoller.shutdown();
         peers.clear();

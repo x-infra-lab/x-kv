@@ -8,6 +8,7 @@ import io.github.xinfra.lab.xkv.client.region.RegionCache;
 import io.github.xinfra.lab.xkv.client.region.RegionRequestSenderImpl;
 import io.github.xinfra.lab.xkv.client.tso.TsoBatcher;
 import io.github.xinfra.lab.xkv.proto.Kvrpcpb;
+import io.github.xinfra.lab.xkv.proto.Tikvpb;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -202,27 +203,28 @@ public final class TwoPhaseCommitterImpl implements TwoPhaseCommitter {
         while (!remaining.isEmpty()) {
             byte[] routeKey = remaining.get(0).toByteArray();
             final var batch = List.copyOf(remaining);
-            lastResp = sender.sendKeyed(routeKey, bo,
-                    (stub, info) -> {
-                        var region = info.region();
-                        var b = Kvrpcpb.CommitRequest.newBuilder()
-                                .setContext(Kvrpcpb.Context.newBuilder()
-                                        .setRegionId(region.getId())
-                                        .setRegionEpoch(region.getRegionEpoch())
-                                        .setPeer(info.leader())
-                                        .build())
-                                .setStartVersion(startTs)
-                                .setCommitVersion(commitTs);
-                        for (var k : batch) {
-                            if (keyInRegion(k, region)) b.addKeys(k);
-                        }
-                        if (b.getKeysCount() == 0) {
-                            return Kvrpcpb.CommitResponse.newBuilder()
-                                    .setCommitVersion(commitTs).build();
-                        }
-                        return stub.kvCommit(b.build());
-                    },
-                    Kvrpcpb.CommitResponse::getRegionError);
+
+            if (sender.batchClient() != null) {
+                lastResp = sender.sendKeyedBatched(routeKey, bo,
+                        info -> {
+                            var req = buildCommitRequest(info, startTs, commitTs, batch);
+                            return Tikvpb.BatchCommandsRequest.Request.newBuilder()
+                                    .setCommit(req).build();
+                        },
+                        Tikvpb.BatchCommandsResponse.Response::getCommit,
+                        Kvrpcpb.CommitResponse::getRegionError);
+            } else {
+                lastResp = sender.sendKeyed(routeKey, bo,
+                        (stub, info) -> {
+                            var req = buildCommitRequest(info, startTs, commitTs, batch);
+                            if (req.getKeysCount() == 0) {
+                                return Kvrpcpb.CommitResponse.newBuilder()
+                                        .setCommitVersion(commitTs).build();
+                            }
+                            return stub.kvCommit(req);
+                        },
+                        Kvrpcpb.CommitResponse::getRegionError);
+            }
             if (lastResp.hasError()) return lastResp;
 
             var loc = regionCache.locateKey(routeKey);
@@ -239,6 +241,24 @@ public final class TwoPhaseCommitterImpl implements TwoPhaseCommitter {
                 : Kvrpcpb.CommitResponse.newBuilder().setCommitVersion(commitTs).build();
     }
 
+    private Kvrpcpb.CommitRequest buildCommitRequest(RegionCache.RegionInfo info,
+                                                      long startTs, long commitTs,
+                                                      List<ByteString> batch) {
+        var region = info.region();
+        var b = Kvrpcpb.CommitRequest.newBuilder()
+                .setContext(Kvrpcpb.Context.newBuilder()
+                        .setRegionId(region.getId())
+                        .setRegionEpoch(region.getRegionEpoch())
+                        .setPeer(info.leader())
+                        .build())
+                .setStartVersion(startTs)
+                .setCommitVersion(commitTs);
+        for (var k : batch) {
+            if (keyInRegion(k, region)) b.addKeys(k);
+        }
+        return b.build();
+    }
+
     private static boolean keyInRegion(ByteString key,
                                         io.github.xinfra.lab.xkv.proto.Metapb.Region region) {
         byte[] kb = key.toByteArray();
@@ -253,35 +273,47 @@ public final class TwoPhaseCommitterImpl implements TwoPhaseCommitter {
                                                       List<Kvrpcpb.Mutation> muts) {
         byte[] routeKey = muts.get(0).getKey().toByteArray();
         var bo = new BackofferImpl(backoffCfg);
+
+        if (sender.batchClient() != null) {
+            return sender.sendKeyedBatched(routeKey, bo,
+                    info -> Tikvpb.BatchCommandsRequest.Request.newBuilder()
+                            .setPrewrite(buildPrewriteRequest(ctx, primary, muts, info))
+                            .build(),
+                    Tikvpb.BatchCommandsResponse.Response::getPrewrite,
+                    Kvrpcpb.PrewriteResponse::getRegionError);
+        }
+
         return sender.sendKeyed(routeKey, bo,
-                (stub, info) -> {
-                    var b = Kvrpcpb.PrewriteRequest.newBuilder()
-                            .setContext(Kvrpcpb.Context.newBuilder()
-                                    .setRegionId(info.region().getId())
-                                    .setRegionEpoch(info.region().getRegionEpoch())
-                                    .setPeer(info.leader())
-                                    .build())
-                            .setStartVersion(ctx.startTs())
-                            .setLockTtl(ctx.lockTtlMs())
-                            .setPrimaryLock(ByteString.copyFrom(primary))
-                            .setTxnSize(ctx.txnSize())
-                            .setForUpdateTs(ctx.forUpdateTs())
-                            .setUseAsyncCommit(ctx.useAsyncCommit())
-                            .setTryOnePc(ctx.tryOnePc())
-                            .setMaxCommitTs(ctx.maxCommitTs());
-                    for (var m : muts) b.addMutations(m);
-                    // Set is_pessimistic_lock parallel array: non-zero forUpdateTs
-                    // for mutations that hold a pessimistic lock.
-                    var pessKeys = ctx.pessimisticLockedKeys();
-                    if (pessKeys != null && !pessKeys.isEmpty()) {
-                        for (var m : muts) {
-                            b.addIsPessimisticLock(
-                                    pessKeys.contains(m.getKey()) ? ctx.forUpdateTs() : 0L);
-                        }
-                    }
-                    return stub.kvPrewrite(b.build());
-                },
+                (stub, info) -> stub.kvPrewrite(buildPrewriteRequest(ctx, primary, muts, info)),
                 Kvrpcpb.PrewriteResponse::getRegionError);
+    }
+
+    private Kvrpcpb.PrewriteRequest buildPrewriteRequest(TxnContext ctx, byte[] primary,
+                                                          List<Kvrpcpb.Mutation> muts,
+                                                          RegionCache.RegionInfo info) {
+        var b = Kvrpcpb.PrewriteRequest.newBuilder()
+                .setContext(Kvrpcpb.Context.newBuilder()
+                        .setRegionId(info.region().getId())
+                        .setRegionEpoch(info.region().getRegionEpoch())
+                        .setPeer(info.leader())
+                        .build())
+                .setStartVersion(ctx.startTs())
+                .setLockTtl(ctx.lockTtlMs())
+                .setPrimaryLock(ByteString.copyFrom(primary))
+                .setTxnSize(ctx.txnSize())
+                .setForUpdateTs(ctx.forUpdateTs())
+                .setUseAsyncCommit(ctx.useAsyncCommit())
+                .setTryOnePc(ctx.tryOnePc())
+                .setMaxCommitTs(ctx.maxCommitTs());
+        for (var m : muts) b.addMutations(m);
+        var pessKeys = ctx.pessimisticLockedKeys();
+        if (pessKeys != null && !pessKeys.isEmpty()) {
+            for (var m : muts) {
+                b.addIsPessimisticLock(
+                        pessKeys.contains(m.getKey()) ? ctx.forUpdateTs() : 0L);
+            }
+        }
+        return b.build();
     }
 
     private void cleanupPrimary(long startTs, byte[] primary) {

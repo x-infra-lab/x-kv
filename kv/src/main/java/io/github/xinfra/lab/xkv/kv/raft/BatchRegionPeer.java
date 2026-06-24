@@ -39,11 +39,13 @@ public final class BatchRegionPeer implements RegionPeer {
                            ConcurrencyManager cm,
                            io.github.xinfra.lab.xkv.kv.engine.SnapshotEngine snapshotEngine,
                            RaftPoller poller,
-                           TickDriver tickDriver) {
+                           TickDriver tickDriver,
+                           ApplyWorker applyWorker) {
         this.raftEngine = raftEngine;
         this.mailbox = new RegionMailbox(storage, raftEngine, region, self, peers,
                 transport, applyHandler, settings, cm, snapshotEngine);
         this.mailbox.setPoller(poller);
+        if (applyWorker != null) this.mailbox.setApplyWorker(applyWorker);
         tickDriver.register(mailbox);
         // Initial wakeup to process any bootstrap Ready.
         mailbox.wakeup();

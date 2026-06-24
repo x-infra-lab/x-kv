@@ -3,10 +3,12 @@ package io.github.xinfra.lab.xkv.client.region;
 import io.github.xinfra.lab.xkv.client.backoff.Backoffer;
 import io.github.xinfra.lab.xkv.proto.Errorpb;
 import io.github.xinfra.lab.xkv.proto.TikvGrpc;
+import io.github.xinfra.lab.xkv.proto.Tikvpb;
 import io.grpc.StatusRuntimeException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.concurrent.CompletionException;
 import java.util.function.BiFunction;
 import java.util.function.Function;
 
@@ -45,11 +47,20 @@ public final class RegionRequestSenderImpl implements RegionRequestSender {
 
     private final RegionCache cache;
     private final StoreChannelCache stores;
+    private final BatchCommandsClient batchClient;
 
     public RegionRequestSenderImpl(RegionCache cache, StoreChannelCache stores) {
+        this(cache, stores, null);
+    }
+
+    public RegionRequestSenderImpl(RegionCache cache, StoreChannelCache stores,
+                                   BatchCommandsClient batchClient) {
         this.cache = cache;
         this.stores = stores;
+        this.batchClient = batchClient;
     }
+
+    public BatchCommandsClient batchClient() { return batchClient; }
 
     /**
      * The actual call you'd want most of the time: takes the locator key,
@@ -86,6 +97,67 @@ public final class RegionRequestSenderImpl implements RegionRequestSender {
                     continue;
                 }
                 throw e;
+            }
+            var err = regionErrorOf.apply(resp);
+            if (err == null || isEmptyError(err)) {
+                return resp;
+            }
+            handleRegionError(info, err, backoffer);
+        }
+    }
+
+    /**
+     * Send a request through the {@link BatchCommandsClient} bidi stream.
+     *
+     * @param wrap          builds the {@code BatchCommandsRequest.Request} from region info
+     * @param unwrap        extracts the typed response from the batch response
+     * @param regionErrorOf extracts region error from the typed response
+     */
+    public <T> T sendKeyedBatched(byte[] key,
+                                   Backoffer backoffer,
+                                   Function<RegionCache.RegionInfo, Tikvpb.BatchCommandsRequest.Request> wrap,
+                                   Function<Tikvpb.BatchCommandsResponse.Response, T> unwrap,
+                                   Function<T, Errorpb.Error> regionErrorOf) {
+        if (batchClient == null) {
+            throw new IllegalStateException("BatchCommandsClient not configured");
+        }
+        while (true) {
+            var info = cache.locateKey(key).orElse(null);
+            if (info == null) {
+                backoffer.backoff(Backoffer.Reason.REGION_MISS, "no region for key");
+                continue;
+            }
+            long leaderStore = leaderStoreOf(info);
+            if (leaderStore == 0) {
+                backoffer.backoff(Backoffer.Reason.NOT_LEADER, "leader unknown");
+                continue;
+            }
+            Tikvpb.BatchCommandsResponse.Response batchResp;
+            try {
+                var req = wrap.apply(info);
+                batchResp = batchClient.send(leaderStore, req).join();
+            } catch (CompletionException e) {
+                Throwable cause = e.getCause();
+                if (cause instanceof StatusRuntimeException sre && isNetworkError(sre)) {
+                    stores.closeStore(leaderStore);
+                    batchClient.closeStore(leaderStore);
+                    backoffer.backoff(Backoffer.Reason.NETWORK, sre.getStatus().toString());
+                    continue;
+                }
+                stores.closeStore(leaderStore);
+                batchClient.closeStore(leaderStore);
+                backoffer.backoff(Backoffer.Reason.NETWORK, cause != null ? cause.getMessage() : e.getMessage());
+                continue;
+            } catch (Throwable t) {
+                stores.closeStore(leaderStore);
+                batchClient.closeStore(leaderStore);
+                backoffer.backoff(Backoffer.Reason.NETWORK, t.getMessage());
+                continue;
+            }
+            T resp = unwrap.apply(batchResp);
+            if (resp == null) {
+                backoffer.backoff(Backoffer.Reason.OTHER, "empty batch response");
+                continue;
             }
             var err = regionErrorOf.apply(resp);
             if (err == null || isEmptyError(err)) {

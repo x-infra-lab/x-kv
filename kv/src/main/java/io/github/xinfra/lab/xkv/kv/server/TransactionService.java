@@ -475,13 +475,14 @@ public final class TransactionService {
                 }
 
                 // Write conflict: any commit at commitTs >= forUpdateTs?
-                long latestCommit = txn.findLatestNonRollbackCommitTs(key);
-                if (latestCommit >= req.getForUpdateTs()) {
+                var latestW = reader.readLatestWriteWithTs(key);
+                if (latestW.isPresent() && latestW.get().commitTs() >= req.getForUpdateTs()) {
+                    long conflictTs = latestW.get().commitTs();
                     resp.addErrors(Kvrpcpb.KeyError.newBuilder()
                             .setConflict(Kvrpcpb.WriteConflict.newBuilder()
                                     .setStartTs(req.getStartVersion())
-                                    .setConflictTs(latestCommit)
-                                    .setConflictCommitTs(latestCommit)
+                                    .setConflictTs(conflictTs)
+                                    .setConflictCommitTs(conflictTs)
                                     .setKey(m.getKey())
                                     .setPrimary(req.getPrimaryLock())
                                     .setReason(Kvrpcpb.WriteConflict.Reason.PessimisticRetry))
