@@ -52,6 +52,7 @@ public final class LeaderBalanceScheduler implements AutoCloseable {
     private final AtomicLong ticksTotal = new AtomicLong();
     private final AtomicLong operatorsScheduled = new AtomicLong();
     private volatile boolean closed = false;
+    private volatile boolean paused = false;
 
     public LeaderBalanceScheduler(PdStateMachine state, OperatorController controller, long intervalMs) {
         this(state, controller, new StoreStatsCache(), intervalMs);
@@ -78,8 +79,12 @@ public final class LeaderBalanceScheduler implements AutoCloseable {
     public long ticksTotal() { return ticksTotal.get(); }
     public long operatorsScheduled() { return operatorsScheduled.get(); }
 
+    public void pause()  { paused = true; }
+    public void resume() { paused = false; }
+    public boolean isPaused() { return paused; }
+
     private void tickSafely() {
-        if (closed) return;
+        if (closed || paused) return;
         try { runOnce(); }
         catch (Throwable t) { log.warn("scheduler tick failed: {}", t.getMessage()); }
     }

@@ -3,6 +3,7 @@ syntax = "proto3";
 package pd_internalpb;
 
 import "metapb.proto";
+import "pdpb.proto";
 
 option java_package = "io.github.xinfra.lab.xkv.proto";
 option java_outer_classname = "PdInternalpb";
@@ -46,8 +47,11 @@ message PdCommand {
     AllocIdPayload alloc_id = 5;
     SafePointPayload safe_point = 6;
     ServiceSafePointPayload service_safe_point = 7;
+    PlacementRulePayload placement_rule = 8;
+    KeyspacePayload keyspace = 9;
+    ResourceGroupPayload resource_group = 10;
 
-    reserved 8 to 30;
+    reserved 11 to 30;
 }
 
 enum CommandType {
@@ -58,8 +62,13 @@ enum CommandType {
     CMD_ALLOC_ID = 4;
     CMD_UPDATE_GC_SAFE_POINT = 5;
     CMD_UPDATE_SERVICE_SAFE_POINT = 6;
+    CMD_SET_PLACEMENT_RULE = 7;
+    CMD_DELETE_PLACEMENT_RULE = 8;
+    CMD_SET_KEYSPACE = 9;
+    CMD_SET_RESOURCE_GROUP = 10;
+    CMD_DELETE_RESOURCE_GROUP = 11;
 
-    reserved 7 to 30;
+    reserved 12 to 30;
 }
 
 message BootstrapPayload {
@@ -82,6 +91,21 @@ message ServiceSafePointPayload {
     uint64 safe_point = 3;
 }
 
+message PlacementRulePayload {
+    pdpb.PlacementRule rule = 1;
+    string group_id = 2;
+    string rule_id = 3;
+}
+
+message KeyspacePayload {
+    pdpb.KeyspaceMeta keyspace = 1;
+}
+
+message ResourceGroupPayload {
+    pdpb.ResourceGroup group = 1;
+    string name = 2;
+}
+
 // ===========================================================================
 // Snapshot payload — the full serialized PD state for raft snapshot install.
 // PD state is small (typically <1MB), so a single message suffices.
@@ -95,8 +119,11 @@ message PdSnapshot {
     uint64 gc_safe_point = 6;
     map<uint64, metapb.Peer> leaders = 7;
     repeated RegionStatsEntry region_stats = 8;
+    repeated pdpb.PlacementRule placement_rules = 9;
+    repeated pdpb.KeyspaceMeta keyspaces = 10;
+    repeated pdpb.ResourceGroup resource_groups = 11;
 
-    reserved 9 to 30;
+    reserved 12 to 30;
 
     uint64 tso_physical_bound = 31;
 }

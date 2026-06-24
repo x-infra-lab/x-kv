@@ -69,6 +69,23 @@ service PD {
     // a bidi stream for higher throughput, but the semantics are identical.
     rpc DetectDeadlock(DetectDeadlockRequest) returns (DetectDeadlockResponse);
     rpc CleanupWaitFor(CleanupWaitForRequest) returns (CleanupWaitForResponse);
+
+    // ----- Placement rules -----
+    rpc GetPlacementRules(GetPlacementRulesRequest) returns (GetPlacementRulesResponse);
+    rpc SetPlacementRule(SetPlacementRuleRequest) returns (SetPlacementRuleResponse);
+    rpc DeletePlacementRule(DeletePlacementRuleRequest) returns (DeletePlacementRuleResponse);
+
+    // ----- Keyspace -----
+    rpc LoadKeyspace(LoadKeyspaceRequest) returns (LoadKeyspaceResponse);
+    rpc UpdateKeyspaceState(UpdateKeyspaceStateRequest) returns (UpdateKeyspaceStateResponse);
+    rpc ListKeyspaces(ListKeyspacesRequest) returns (ListKeyspacesResponse);
+
+    // ----- Resource Group -----
+    rpc GetResourceGroup(GetResourceGroupRequest) returns (GetResourceGroupResponse);
+    rpc AddResourceGroup(AddResourceGroupRequest) returns (AddResourceGroupResponse);
+    rpc ModifyResourceGroup(ModifyResourceGroupRequest) returns (ModifyResourceGroupResponse);
+    rpc DeleteResourceGroup(DeleteResourceGroupRequest) returns (DeleteResourceGroupResponse);
+    rpc ListResourceGroups(ListResourceGroupsRequest) returns (ListResourceGroupsResponse);
 }
 
 // ---- Common envelope ----
@@ -490,4 +507,163 @@ message CleanupWaitForRequest {
 }
 message CleanupWaitForResponse {
     ResponseHeader header = 1;
+}
+
+// ---- Placement rules ----
+//
+// Placement rules let operators define per-key-range replica requirements
+// with label constraints. Example: "3 voters spread across 3 zones" or
+// "2 replicas in zone-a, 1 learner in zone-b".
+
+enum LabelConstraintOp {
+    IN = 0;
+    NOT_IN = 1;
+    EXISTS = 2;
+    NOT_EXISTS = 3;
+}
+
+message LabelConstraint {
+    string key = 1;
+    LabelConstraintOp op = 2;
+    repeated string values = 3;
+}
+
+message PlacementRule {
+    string group_id = 1;
+    string id = 2;
+    int32  index = 3;
+    bool   override = 4;
+    bytes  start_key = 5;
+    bytes  end_key = 6;
+    string role = 7;
+    int32  count = 8;
+    repeated LabelConstraint label_constraints = 9;
+    repeated string location_labels = 10;
+}
+
+message GetPlacementRulesRequest {
+    RequestHeader header = 1;
+}
+message GetPlacementRulesResponse {
+    ResponseHeader header = 1;
+    repeated PlacementRule rules = 2;
+}
+
+message SetPlacementRuleRequest {
+    RequestHeader header = 1;
+    PlacementRule rule = 2;
+}
+message SetPlacementRuleResponse {
+    ResponseHeader header = 1;
+}
+
+message DeletePlacementRuleRequest {
+    RequestHeader header = 1;
+    string group_id = 2;
+    string id = 3;
+}
+message DeletePlacementRuleResponse {
+    ResponseHeader header = 1;
+}
+
+// ===========================================================================
+// Keyspace — logical tenant isolation
+// ===========================================================================
+enum KeyspaceState {
+    ENABLED = 0;
+    DISABLED = 1;
+    ARCHIVED = 2;
+    TOMBSTONE = 3;
+}
+
+message KeyspaceMeta {
+    uint32 id = 1;
+    string name = 2;
+    KeyspaceState state = 3;
+    int64  created_at = 4;
+    map<string, string> config = 5;
+}
+
+message LoadKeyspaceRequest {
+    RequestHeader header = 1;
+    string name = 2;
+}
+message LoadKeyspaceResponse {
+    ResponseHeader header = 1;
+    KeyspaceMeta keyspace = 2;
+}
+
+message UpdateKeyspaceStateRequest {
+    RequestHeader header = 1;
+    uint32 id = 2;
+    KeyspaceState state = 3;
+}
+message UpdateKeyspaceStateResponse {
+    ResponseHeader header = 1;
+    KeyspaceMeta keyspace = 2;
+}
+
+message ListKeyspacesRequest {
+    RequestHeader header = 1;
+    KeyspaceState state_filter = 2;
+}
+message ListKeyspacesResponse {
+    ResponseHeader header = 1;
+    repeated KeyspaceMeta keyspaces = 2;
+}
+
+// ===========================================================================
+// Resource Group — per-tenant resource control
+// ===========================================================================
+message RUSettings {
+    uint64 fill_rate = 1;
+    uint64 burst_limit = 2;
+}
+
+message ResourceGroup {
+    string name = 1;
+    RUSettings ru_settings = 2;
+    int32  priority = 3;
+    bool   background = 4;
+}
+
+message GetResourceGroupRequest {
+    RequestHeader header = 1;
+    string name = 2;
+}
+message GetResourceGroupResponse {
+    ResponseHeader header = 1;
+    ResourceGroup group = 2;
+}
+
+message AddResourceGroupRequest {
+    RequestHeader header = 1;
+    ResourceGroup group = 2;
+}
+message AddResourceGroupResponse {
+    ResponseHeader header = 1;
+}
+
+message ModifyResourceGroupRequest {
+    RequestHeader header = 1;
+    ResourceGroup group = 2;
+}
+message ModifyResourceGroupResponse {
+    ResponseHeader header = 1;
+}
+
+message DeleteResourceGroupRequest {
+    RequestHeader header = 1;
+    string name = 2;
+}
+message DeleteResourceGroupResponse {
+    ResponseHeader header = 1;
+}
+
+message ListResourceGroupsRequest {
+    RequestHeader header = 1;
+}
+message ListResourceGroupsResponse {
+    ResponseHeader header = 1;
+    repeated ResourceGroup groups = 2;
 }

@@ -98,6 +98,7 @@ public final class KvServer {
     private GcWorker gcWorker;
     private MetricsHttpServer metricsHttpServer;
     private DrainingInterceptor drainingInterceptor;
+    private io.github.xinfra.lab.xkv.kv.ratelimit.ResourceGroupThrottler resourceGroupThrottler;
     private CdcEventBus cdcEventBus;
     private ChangeDataServiceImpl cdcService;
     private io.github.xinfra.lab.xkv.kv.raft.ApplyWorker applyWorker;
@@ -126,12 +127,17 @@ public final class KvServer {
         pdManager = new PdEndpointManager(config.pdEndpoints(), config.clientTls(), config.authToken());
         var pdStub = pdManager.blockingStub();
 
-        var storeMeta = Metapb.Store.newBuilder()
+        var storeMetaBuilder = Metapb.Store.newBuilder()
                 .setId(config.storeId())
                 .setAddress(config.clientAddress())
                 .setPeerAddress(config.raftAddress())
-                .setState(Metapb.StoreState.Up)
-                .build();
+                .setState(Metapb.StoreState.Up);
+        for (var entry : config.labels().entrySet()) {
+            storeMetaBuilder.addLabels(Metapb.StoreLabel.newBuilder()
+                    .setKey(entry.getKey())
+                    .setValue(entry.getValue()));
+        }
+        var storeMeta = storeMetaBuilder.build();
 
         Metapb.Region initialRegion = bootstrapOrJoin(pdStub, storeMeta);
 
@@ -205,6 +211,7 @@ public final class KvServer {
         copService.register(new io.github.xinfra.lab.xkv.kv.coprocessor.SQLScanCoprocessor(engine));
         copService.register(new io.github.xinfra.lab.xkv.kv.coprocessor.AnalyzeCoprocessor(engine));
         copService.register(new io.github.xinfra.lab.xkv.kv.coprocessor.IndexScanCoprocessor(engine));
+        copService.register(new io.github.xinfra.lab.xkv.kv.coprocessor.SplitKeysCoprocessor(engine));
 
         // CDC service — resolved TS uses the initial region's CM.
         cdcService = new ChangeDataServiceImpl(cdcEventBus, engine, () -> cm.maxTs().current(), resolvedTsTracker);
@@ -213,16 +220,18 @@ public final class KvServer {
         var c = GrpcChannelFactory.parseHostPort(config.clientAddress());
         var clientServerBuilder = GrpcChannelFactory.serverBuilder(
                         new InetSocketAddress(c.host(), c.port()), config.clientTls())
-                .addService(new TikvServiceImpl(rawKvService, txnService, copService, splitDriver, locator))
+                .addService(buildTikvService(rawKvService, txnService, copService, splitDriver, locator))
                 .addService(cdcService);
         if (config.enableDebugService()) {
             clientServerBuilder.addService(
                     new DebugServiceImpl(metricsRegistry, store, engine, storeMeta, config.dataDir(), configManager));
         }
         // Interceptor order: last .intercept() is outermost (executed first).
-        // Desired: drain → auth → rateLimit → mdc → metrics (innermost)
+        // Desired: drain → auth → rateLimit → resourceGroup → mdc → metrics (innermost)
         clientServerBuilder.intercept(new GrpcServerMetricsInterceptor(metricsRegistry, config.slowLogThresholdMs()));
         clientServerBuilder.intercept(MdcServerInterceptor.forStore(config.storeId()));
+        resourceGroupThrottler = new io.github.xinfra.lab.xkv.kv.ratelimit.ResourceGroupThrottler();
+        clientServerBuilder.intercept(new io.github.xinfra.lab.xkv.kv.ratelimit.ResourceGroupInterceptor(resourceGroupThrottler));
         if (config.maxConcurrentRequests() > 0) {
             clientServerBuilder.intercept(new ConcurrencyLimitInterceptor(config.maxConcurrentRequests()));
         }
@@ -723,6 +732,18 @@ public final class KvServer {
     /** Visible for tests and metrics. */
     public StoreImpl store() { return store; }
     public RocksStorageEngine engine() { return engine; }
+
+    private TikvServiceImpl buildTikvService(RawKvService rawKv, TransactionService txn,
+                                              CoprocessorService cop,
+                                              io.github.xinfra.lab.xkv.kv.store.SplitDriver splitDriver,
+                                              RawKvService.PeerLocator locator) {
+        var svc = new TikvServiceImpl(rawKv, txn, cop, splitDriver, locator);
+        var backupTmp = config.dataDir().resolve("backup-tmp");
+        var restoreTmp = config.dataDir().resolve("restore-tmp");
+        svc.setBackupManager(new io.github.xinfra.lab.xkv.kv.backup.BackupManager(engine, backupTmp));
+        svc.setRestoreManager(new io.github.xinfra.lab.xkv.kv.backup.RestoreManager(engine, restoreTmp));
+        return svc;
+    }
 
     // ---- helpers ----
 

@@ -4,6 +4,7 @@ import io.github.xinfra.lab.xkv.common.tls.TlsConfig;
 
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Static configuration for one KV store node.
@@ -37,6 +38,7 @@ public final class KvConfig {
     private final long slowLogThresholdMs;
     private final long drainTimeoutMs;
     private final boolean enableDebugService;
+    private final Map<String, String> labels;
 
     private KvConfig(Builder b) {
         this.storeId = b.storeId;
@@ -56,6 +58,7 @@ public final class KvConfig {
         this.slowLogThresholdMs = b.slowLogThresholdMs;
         this.drainTimeoutMs = b.drainTimeoutMs;
         this.enableDebugService = b.enableDebugService;
+        this.labels = b.labels != null ? Map.copyOf(b.labels) : Map.of();
     }
 
     public long storeId() { return storeId; }
@@ -75,6 +78,7 @@ public final class KvConfig {
     public long slowLogThresholdMs() { return slowLogThresholdMs; }
     public long drainTimeoutMs() { return drainTimeoutMs; }
     public boolean enableDebugService() { return enableDebugService; }
+    public Map<String, String> labels() { return labels; }
 
     public static Builder builder() { return new Builder(); }
 
@@ -171,6 +175,7 @@ public final class KvConfig {
         private long slowLogThresholdMs = 1000;
         private long drainTimeoutMs = 10_000;
         private boolean enableDebugService = false;
+        private Map<String, String> labels;
 
         public Builder storeId(long v)            { this.storeId = v; return this; }
         public Builder pdEndpoints(List<String> v){ this.pdEndpoints = v; return this; }
@@ -189,6 +194,7 @@ public final class KvConfig {
         public Builder slowLogThresholdMs(long v) { this.slowLogThresholdMs = v; return this; }
         public Builder drainTimeoutMs(long v) { this.drainTimeoutMs = v; return this; }
         public Builder enableDebugService(boolean v) { this.enableDebugService = v; return this; }
+        public Builder labels(Map<String, String> v) { this.labels = v; return this; }
         public KvConfig build() { return new KvConfig(this); }
     }
 }

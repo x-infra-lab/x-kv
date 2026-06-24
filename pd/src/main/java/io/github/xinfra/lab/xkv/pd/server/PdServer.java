@@ -70,6 +70,8 @@ public final class PdServer {
     private io.github.xinfra.lab.xkv.pd.state.MergeCheckerScheduler mergeChecker;
     private io.github.xinfra.lab.xkv.pd.state.RuleCheckerScheduler ruleChecker;
     private StoreStatsCache storeStatsCache;
+    private io.github.xinfra.lab.xkv.pd.state.SchedulerManager schedulerManager;
+    private io.github.xinfra.lab.xkv.pd.config.PdScheduleConfigManager scheduleConfigManager;
     private PdServiceImpl service;
     private PdRaftNode raftNode;
     private PdRaftTransport raftTransport;
@@ -94,12 +96,14 @@ public final class PdServer {
         operators = new io.github.xinfra.lab.xkv.pd.state.OperatorQueue();
         deadlock = new io.github.xinfra.lab.xkv.pd.state.DeadlockDetector();
         storeStatsCache = new StoreStatsCache();
+        schedulerManager = new io.github.xinfra.lab.xkv.pd.state.SchedulerManager();
+        scheduleConfigManager = new io.github.xinfra.lab.xkv.pd.config.PdScheduleConfigManager(config.scheduler());
 
         var addr = GrpcChannelFactory.parseHostPort(config.clientAddress());
         var memberInfos = buildMemberInfos();
         service = new PdServiceImpl(state, tso, safePoint, operators, deadlock,
                 config.clusterId(), config.nodeId(), config.clientAddress(), memberInfos,
-                storeStatsCache);
+                storeStatsCache, state.placementRuleManager());
 
         // Multi-PD raft: if peers are configured, start the raft group.
         if (!config.peers().isEmpty()) {
@@ -124,6 +128,8 @@ public final class PdServer {
         if (config.metricsPort() > 0) {
             metricsHttpServer = new MetricsHttpServer(config.metricsPort(), metricsRegistry,
                     () -> grpcServer != null && !grpcServer.isShutdown());
+            var httpApi = new PdHttpApi(schedulerManager, scheduleConfigManager, state);
+            httpApi.register(metricsHttpServer);
         }
 
         scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -183,8 +189,16 @@ public final class PdServer {
         mergeChecker.start();
 
         ruleChecker = new io.github.xinfra.lab.xkv.pd.state.RuleCheckerScheduler(
-                state, operatorController, storeStatsCache, RULE_CHECKER_INTERVAL_MS);
+                state, operatorController, storeStatsCache,
+                state.placementRuleManager(), RULE_CHECKER_INTERVAL_MS);
         ruleChecker.start();
+
+        schedulerManager.register("leader-balance", leaderBalance);
+        schedulerManager.register("region-balance", regionBalance);
+        schedulerManager.register("split-checker", splitChecker);
+        schedulerManager.register("hot-region", hotRegion);
+        schedulerManager.register("merge-checker", mergeChecker);
+        schedulerManager.register("rule-checker", ruleChecker);
 
         schedulersRunning = true;
     }
@@ -192,6 +206,7 @@ public final class PdServer {
     private synchronized void stopSchedulers() {
         if (!schedulersRunning) return;
         log.info("PD node {} stopping schedulers (lost leadership)", config.nodeId());
+        if (schedulerManager != null) schedulerManager.unregisterAll();
         if (ruleChecker != null) { ruleChecker.close(); ruleChecker = null; }
         if (mergeChecker != null) { mergeChecker.close(); mergeChecker = null; }
         if (hotRegion != null) { hotRegion.close(); hotRegion = null; }

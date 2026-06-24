@@ -28,6 +28,7 @@ public final class SplitCheckerScheduler implements AutoCloseable {
     private final long intervalMs;
     private final ScheduledExecutorService timer;
     private final Counter errorCounter = XKvMetrics.errorCounter("split_checker", "tick");
+    private volatile boolean paused = false;
 
     public SplitCheckerScheduler(PdStateMachine state,
                                   OperatorController controller,
@@ -48,7 +49,12 @@ public final class SplitCheckerScheduler implements AutoCloseable {
         timer.scheduleAtFixedRate(this::tickSafely, intervalMs, intervalMs, TimeUnit.MILLISECONDS);
     }
 
+    public void pause()  { paused = true; }
+    public void resume() { paused = false; }
+    public boolean isPaused() { return paused; }
+
     private void tickSafely() {
+        if (paused) return;
         try { tick(); }
         catch (Throwable t) {
             errorCounter.increment();

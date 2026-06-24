@@ -4,6 +4,7 @@ package tikvpb;
 
 import "kvrpcpb.proto";
 import "coprocessor.proto";
+import "kv_serverpb.proto";
 
 option java_package = "io.github.xinfra.lab.xkv.proto";
 option java_outer_classname = "Tikvpb";
@@ -63,6 +64,10 @@ service Tikv {
 
     // ---- Version negotiation ----
     rpc GetVersion(GetVersionRequest) returns (GetVersionResponse);
+
+    // ---- Backup / Restore ----
+    rpc Backup(kv_serverpb.BackupRequest) returns (stream kv_serverpb.BackupResponse);
+    rpc Restore(kv_serverpb.RestoreRequest) returns (kv_serverpb.RestoreResponse);
 
     // ---- BatchCommands: bidi stream that multiplexes any number of the
     //      above RPCs over a single gRPC stream. The killer feature for

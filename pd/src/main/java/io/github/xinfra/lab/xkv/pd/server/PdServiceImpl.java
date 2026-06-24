@@ -101,6 +101,7 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
     private final String clientAddress;
     private final java.util.List<MemberInfo> members;
     private final StoreStatsCache storeStatsCache;
+    private final io.github.xinfra.lab.xkv.pd.state.placement.PlacementRuleManager placementRuleManager;
     /** Persisted cluster GC safe-point separate from per-service. */
     private final AtomicLong gcSafePoint = new AtomicLong(0);
 
@@ -179,6 +180,31 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
         this.clientAddress = clientAddress;
         this.members = java.util.List.copyOf(members);
         this.storeStatsCache = storeStatsCache;
+        this.placementRuleManager = null;
+    }
+
+    public PdServiceImpl(PdStateMachine state,
+                         Tso tso,
+                         SafePointService safePoint,
+                         io.github.xinfra.lab.xkv.pd.state.OperatorQueue operators,
+                         DeadlockDetector deadlock,
+                         long clusterId,
+                         long nodeId,
+                         String clientAddress,
+                         java.util.List<MemberInfo> members,
+                         StoreStatsCache storeStatsCache,
+                         io.github.xinfra.lab.xkv.pd.state.placement.PlacementRuleManager placementRuleManager) {
+        this.state = state;
+        this.tso = tso;
+        this.safePoint = safePoint;
+        this.operators = operators;
+        this.deadlock = deadlock;
+        this.clusterId = clusterId;
+        this.nodeId = nodeId;
+        this.clientAddress = clientAddress;
+        this.members = java.util.List.copyOf(members);
+        this.storeStatsCache = storeStatsCache;
+        this.placementRuleManager = placementRuleManager;
     }
 
     /** Phase-0 stub constructor still used by {@link PdServer} until full wiring. */
@@ -773,6 +799,248 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
         if (a.getConfVer() > b.getConfVer()) return true;
         if (a.getConfVer() < b.getConfVer()) return false;
         return a.getVersion() >= b.getVersion();
+    }
+
+    // ---- Placement rules ----
+
+    @Override
+    public void getPlacementRules(
+            io.github.xinfra.lab.xkv.proto.Pdpb.GetPlacementRulesRequest req,
+            StreamObserver<io.github.xinfra.lab.xkv.proto.Pdpb.GetPlacementRulesResponse> obs) {
+        var b = io.github.xinfra.lab.xkv.proto.Pdpb.GetPlacementRulesResponse.newBuilder()
+                .setHeader(header());
+        if (placementRuleManager != null) {
+            for (var rule : placementRuleManager.getRules()) {
+                b.addRules(rule.toProto());
+            }
+        }
+        obs.onNext(b.build());
+        obs.onCompleted();
+    }
+
+    @Override
+    public void setPlacementRule(
+            io.github.xinfra.lab.xkv.proto.Pdpb.SetPlacementRuleRequest req,
+            StreamObserver<io.github.xinfra.lab.xkv.proto.Pdpb.SetPlacementRuleResponse> obs) {
+        if (placementRuleManager == null) {
+            obs.onError(Status.UNIMPLEMENTED
+                    .withDescription("placement rules not enabled")
+                    .asRuntimeException());
+            return;
+        }
+        var rule = io.github.xinfra.lab.xkv.pd.state.placement.PlacementRule.fromProto(req.getRule());
+        placementRuleManager.setRule(rule);
+        obs.onNext(io.github.xinfra.lab.xkv.proto.Pdpb.SetPlacementRuleResponse.newBuilder()
+                .setHeader(header()).build());
+        obs.onCompleted();
+    }
+
+    @Override
+    public void deletePlacementRule(
+            io.github.xinfra.lab.xkv.proto.Pdpb.DeletePlacementRuleRequest req,
+            StreamObserver<io.github.xinfra.lab.xkv.proto.Pdpb.DeletePlacementRuleResponse> obs) {
+        if (placementRuleManager == null) {
+            obs.onError(Status.UNIMPLEMENTED
+                    .withDescription("placement rules not enabled")
+                    .asRuntimeException());
+            return;
+        }
+        placementRuleManager.deleteRule(req.getGroupId(), req.getId());
+        obs.onNext(io.github.xinfra.lab.xkv.proto.Pdpb.DeletePlacementRuleResponse.newBuilder()
+                .setHeader(header()).build());
+        obs.onCompleted();
+    }
+
+    // =====================================================================
+    // Keyspace
+    // =====================================================================
+
+    @Override
+    public void loadKeyspace(
+            io.github.xinfra.lab.xkv.proto.Pdpb.LoadKeyspaceRequest req,
+            StreamObserver<io.github.xinfra.lab.xkv.proto.Pdpb.LoadKeyspaceResponse> obs) {
+        var ksm = state.keyspaceManager();
+        if (ksm == null) {
+            obs.onError(Status.UNIMPLEMENTED.withDescription("keyspace not enabled").asRuntimeException());
+            return;
+        }
+        var meta = req.getName().isEmpty() ? null : ksm.loadByName(req.getName());
+        var b = io.github.xinfra.lab.xkv.proto.Pdpb.LoadKeyspaceResponse.newBuilder().setHeader(header());
+        if (meta != null) {
+            b.setKeyspace(meta);
+        }
+        obs.onNext(b.build());
+        obs.onCompleted();
+    }
+
+    @Override
+    public void updateKeyspaceState(
+            io.github.xinfra.lab.xkv.proto.Pdpb.UpdateKeyspaceStateRequest req,
+            StreamObserver<io.github.xinfra.lab.xkv.proto.Pdpb.UpdateKeyspaceStateResponse> obs) {
+        var ksm = state.keyspaceManager();
+        if (ksm == null) {
+            obs.onError(Status.UNIMPLEMENTED.withDescription("keyspace not enabled").asRuntimeException());
+            return;
+        }
+        var updated = ksm.updateState(req.getId(), req.getState());
+        var b = io.github.xinfra.lab.xkv.proto.Pdpb.UpdateKeyspaceStateResponse.newBuilder().setHeader(header());
+        if (updated != null) {
+            b.setKeyspace(updated);
+            var cmd = io.github.xinfra.lab.xkv.proto.PdInternalpb.PdCommand.newBuilder()
+                    .setType(io.github.xinfra.lab.xkv.proto.PdInternalpb.CommandType.CMD_SET_KEYSPACE)
+                    .setKeyspace(io.github.xinfra.lab.xkv.proto.PdInternalpb.KeyspacePayload.newBuilder()
+                            .setKeyspace(updated))
+                    .build();
+            proposeOrApply(cmd, obs, () -> b.build());
+        } else {
+            obs.onNext(b.build());
+            obs.onCompleted();
+        }
+    }
+
+    @Override
+    public void listKeyspaces(
+            io.github.xinfra.lab.xkv.proto.Pdpb.ListKeyspacesRequest req,
+            StreamObserver<io.github.xinfra.lab.xkv.proto.Pdpb.ListKeyspacesResponse> obs) {
+        var ksm = state.keyspaceManager();
+        if (ksm == null) {
+            obs.onError(Status.UNIMPLEMENTED.withDescription("keyspace not enabled").asRuntimeException());
+            return;
+        }
+        io.github.xinfra.lab.xkv.proto.Pdpb.KeyspaceState filter =
+                req.getStateFilterValue() == 0 ? null : req.getStateFilter();
+        var list = ksm.listKeyspaces(filter);
+        var b = io.github.xinfra.lab.xkv.proto.Pdpb.ListKeyspacesResponse.newBuilder().setHeader(header());
+        for (var ks : list) b.addKeyspaces(ks);
+        obs.onNext(b.build());
+        obs.onCompleted();
+    }
+
+    // =====================================================================
+    // Resource Group
+    // =====================================================================
+
+    @Override
+    public void getResourceGroup(
+            io.github.xinfra.lab.xkv.proto.Pdpb.GetResourceGroupRequest req,
+            StreamObserver<io.github.xinfra.lab.xkv.proto.Pdpb.GetResourceGroupResponse> obs) {
+        var rgm = state.resourceGroupManager();
+        if (rgm == null) {
+            obs.onError(Status.UNIMPLEMENTED.withDescription("resource group not enabled").asRuntimeException());
+            return;
+        }
+        var b = io.github.xinfra.lab.xkv.proto.Pdpb.GetResourceGroupResponse.newBuilder().setHeader(header());
+        var group = rgm.getGroup(req.getName());
+        if (group != null) b.setGroup(group);
+        obs.onNext(b.build());
+        obs.onCompleted();
+    }
+
+    @Override
+    public void addResourceGroup(
+            io.github.xinfra.lab.xkv.proto.Pdpb.AddResourceGroupRequest req,
+            StreamObserver<io.github.xinfra.lab.xkv.proto.Pdpb.AddResourceGroupResponse> obs) {
+        var rgm = state.resourceGroupManager();
+        if (rgm == null) {
+            obs.onError(Status.UNIMPLEMENTED.withDescription("resource group not enabled").asRuntimeException());
+            return;
+        }
+        if (!req.hasGroup()) {
+            obs.onError(Status.INVALID_ARGUMENT.withDescription("group required").asRuntimeException());
+            return;
+        }
+        if (!rgm.addGroup(req.getGroup())) {
+            obs.onNext(io.github.xinfra.lab.xkv.proto.Pdpb.AddResourceGroupResponse.newBuilder()
+                    .setHeader(errorHeader(
+                            io.github.xinfra.lab.xkv.proto.Pdpb.Error.ErrorType.UNKNOWN,
+                            "group already exists or invalid name"))
+                    .build());
+            obs.onCompleted();
+            return;
+        }
+        var cmd = io.github.xinfra.lab.xkv.proto.PdInternalpb.PdCommand.newBuilder()
+                .setType(io.github.xinfra.lab.xkv.proto.PdInternalpb.CommandType.CMD_SET_RESOURCE_GROUP)
+                .setResourceGroup(io.github.xinfra.lab.xkv.proto.PdInternalpb.ResourceGroupPayload.newBuilder()
+                        .setGroup(req.getGroup()))
+                .build();
+        proposeOrApply(cmd, obs,
+                () -> io.github.xinfra.lab.xkv.proto.Pdpb.AddResourceGroupResponse.newBuilder()
+                        .setHeader(header()).build());
+    }
+
+    @Override
+    public void modifyResourceGroup(
+            io.github.xinfra.lab.xkv.proto.Pdpb.ModifyResourceGroupRequest req,
+            StreamObserver<io.github.xinfra.lab.xkv.proto.Pdpb.ModifyResourceGroupResponse> obs) {
+        var rgm = state.resourceGroupManager();
+        if (rgm == null) {
+            obs.onError(Status.UNIMPLEMENTED.withDescription("resource group not enabled").asRuntimeException());
+            return;
+        }
+        if (!req.hasGroup()) {
+            obs.onError(Status.INVALID_ARGUMENT.withDescription("group required").asRuntimeException());
+            return;
+        }
+        if (!rgm.modifyGroup(req.getGroup())) {
+            obs.onNext(io.github.xinfra.lab.xkv.proto.Pdpb.ModifyResourceGroupResponse.newBuilder()
+                    .setHeader(errorHeader(
+                            io.github.xinfra.lab.xkv.proto.Pdpb.Error.ErrorType.UNKNOWN,
+                            "group not found"))
+                    .build());
+            obs.onCompleted();
+            return;
+        }
+        var cmd = io.github.xinfra.lab.xkv.proto.PdInternalpb.PdCommand.newBuilder()
+                .setType(io.github.xinfra.lab.xkv.proto.PdInternalpb.CommandType.CMD_SET_RESOURCE_GROUP)
+                .setResourceGroup(io.github.xinfra.lab.xkv.proto.PdInternalpb.ResourceGroupPayload.newBuilder()
+                        .setGroup(req.getGroup()))
+                .build();
+        proposeOrApply(cmd, obs,
+                () -> io.github.xinfra.lab.xkv.proto.Pdpb.ModifyResourceGroupResponse.newBuilder()
+                        .setHeader(header()).build());
+    }
+
+    @Override
+    public void deleteResourceGroup(
+            io.github.xinfra.lab.xkv.proto.Pdpb.DeleteResourceGroupRequest req,
+            StreamObserver<io.github.xinfra.lab.xkv.proto.Pdpb.DeleteResourceGroupResponse> obs) {
+        var rgm = state.resourceGroupManager();
+        if (rgm == null) {
+            obs.onError(Status.UNIMPLEMENTED.withDescription("resource group not enabled").asRuntimeException());
+            return;
+        }
+        if (!rgm.deleteGroup(req.getName())) {
+            obs.onNext(io.github.xinfra.lab.xkv.proto.Pdpb.DeleteResourceGroupResponse.newBuilder()
+                    .setHeader(errorHeader(
+                            io.github.xinfra.lab.xkv.proto.Pdpb.Error.ErrorType.UNKNOWN,
+                            "group not found or cannot delete default"))
+                    .build());
+            obs.onCompleted();
+            return;
+        }
+        var cmd = io.github.xinfra.lab.xkv.proto.PdInternalpb.PdCommand.newBuilder()
+                .setType(io.github.xinfra.lab.xkv.proto.PdInternalpb.CommandType.CMD_DELETE_RESOURCE_GROUP)
+                .setResourceGroup(io.github.xinfra.lab.xkv.proto.PdInternalpb.ResourceGroupPayload.newBuilder()
+                        .setName(req.getName()))
+                .build();
+        proposeOrApply(cmd, obs,
+                () -> io.github.xinfra.lab.xkv.proto.Pdpb.DeleteResourceGroupResponse.newBuilder()
+                        .setHeader(header()).build());
+    }
+
+    @Override
+    public void listResourceGroups(
+            io.github.xinfra.lab.xkv.proto.Pdpb.ListResourceGroupsRequest req,
+            StreamObserver<io.github.xinfra.lab.xkv.proto.Pdpb.ListResourceGroupsResponse> obs) {
+        var rgm = state.resourceGroupManager();
+        if (rgm == null) {
+            obs.onError(Status.UNIMPLEMENTED.withDescription("resource group not enabled").asRuntimeException());
+            return;
+        }
+        var b = io.github.xinfra.lab.xkv.proto.Pdpb.ListResourceGroupsResponse.newBuilder().setHeader(header());
+        for (var g : rgm.listGroups()) b.addGroups(g);
+        obs.onNext(b.build());
+        obs.onCompleted();
     }
 
     /** Stable 64-bit hash for the lock-key — matches TiKV's deadlock_key_hash. */

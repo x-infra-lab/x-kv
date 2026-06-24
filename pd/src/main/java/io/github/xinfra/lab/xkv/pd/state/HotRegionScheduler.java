@@ -42,6 +42,7 @@ public final class HotRegionScheduler implements AutoCloseable {
     private final AtomicLong ticksTotal = new AtomicLong();
     private final AtomicLong operatorsScheduled = new AtomicLong();
     private volatile boolean closed = false;
+    private volatile boolean paused = false;
 
     public HotRegionScheduler(PdStateMachine state,
                               OperatorControllerImpl controller,
@@ -68,8 +69,12 @@ public final class HotRegionScheduler implements AutoCloseable {
     public long ticksTotal() { return ticksTotal.get(); }
     public long operatorsScheduled() { return operatorsScheduled.get(); }
 
+    public void pause()  { paused = true; }
+    public void resume() { paused = false; }
+    public boolean isPaused() { return paused; }
+
     private void tickSafely() {
-        if (closed) return;
+        if (closed || paused) return;
         try { runOnce(); }
         catch (Throwable t) { log.warn("hot-region tick failed: {}", t.getMessage()); }
     }

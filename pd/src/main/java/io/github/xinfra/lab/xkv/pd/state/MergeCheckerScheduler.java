@@ -46,6 +46,7 @@ public final class MergeCheckerScheduler implements AutoCloseable {
     private final AtomicLong ticksTotal = new AtomicLong();
     private final AtomicLong operatorsScheduled = new AtomicLong();
     private volatile boolean closed = false;
+    private volatile boolean paused = false;
 
     public MergeCheckerScheduler(PdStateMachine state,
                                  OperatorController controller,
@@ -71,8 +72,12 @@ public final class MergeCheckerScheduler implements AutoCloseable {
     public long ticksTotal() { return ticksTotal.get(); }
     public long operatorsScheduled() { return operatorsScheduled.get(); }
 
+    public void pause()  { paused = true; }
+    public void resume() { paused = false; }
+    public boolean isPaused() { return paused; }
+
     private void tickSafely() {
-        if (closed) return;
+        if (closed || paused) return;
         try { runOnce(); }
         catch (Throwable t) { log.warn("merge-checker tick failed: {}", t.getMessage()); }
     }

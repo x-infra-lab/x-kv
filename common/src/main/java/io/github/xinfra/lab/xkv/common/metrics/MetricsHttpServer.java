@@ -78,6 +78,10 @@ public final class MetricsHttpServer implements AutoCloseable {
         log.info("Metrics HTTP server listening on port {}", port);
     }
 
+    public void addContext(String path, com.sun.net.httpserver.HttpHandler handler) {
+        httpServer.createContext(path, handler);
+    }
+
     public int port() {
         return httpServer.getAddress().getPort();
     }

@@ -20,6 +20,8 @@ public final class TikvServiceImpl extends TikvGrpc.TikvImplBase {
     private final CoprocessorService cop;
     private final io.github.xinfra.lab.xkv.kv.store.SplitDriver splitDriver;
     private final RawKvService.PeerLocator splitLocator;
+    private volatile io.github.xinfra.lab.xkv.kv.backup.BackupManager backupManager;
+    private volatile io.github.xinfra.lab.xkv.kv.backup.RestoreManager restoreManager;
 
     private final AtomicLong batchPending = new AtomicLong();
 
@@ -46,6 +48,14 @@ public final class TikvServiceImpl extends TikvGrpc.TikvImplBase {
         this.cop = cop;
         this.splitDriver = splitDriver;
         this.splitLocator = splitLocator;
+    }
+
+    public void setBackupManager(io.github.xinfra.lab.xkv.kv.backup.BackupManager bm) {
+        this.backupManager = bm;
+    }
+
+    public void setRestoreManager(io.github.xinfra.lab.xkv.kv.backup.RestoreManager rm) {
+        this.restoreManager = rm;
     }
 
     // ---- Transactional KV ----
@@ -371,6 +381,37 @@ public final class TikvServiceImpl extends TikvGrpc.TikvImplBase {
             log.warn("batchCommands sub-request {} failed: {}", req.getCmdCase(), t.getMessage());
         }
         return rb.build();
+    }
+
+    // ---- Backup / Restore ----
+
+    @Override
+    public void backup(io.github.xinfra.lab.xkv.proto.KvServerpb.BackupRequest req,
+                       StreamObserver<io.github.xinfra.lab.xkv.proto.KvServerpb.BackupResponse> obs) {
+        var bm = backupManager;
+        if (bm == null) { unimpl(obs); return; }
+        try {
+            byte[] startKey = req.getStartKey().isEmpty() ? null : req.getStartKey().toByteArray();
+            byte[] endKey = req.getEndKey().isEmpty() ? null : req.getEndKey().toByteArray();
+            bm.backup(startKey, endKey, resp -> obs.onNext(resp));
+            obs.onCompleted();
+        } catch (Throwable t) {
+            obs.onError(Status.INTERNAL.withDescription(t.getMessage()).asRuntimeException());
+        }
+    }
+
+    @Override
+    public void restore(io.github.xinfra.lab.xkv.proto.KvServerpb.RestoreRequest req,
+                        StreamObserver<io.github.xinfra.lab.xkv.proto.KvServerpb.RestoreResponse> obs) {
+        var rm = restoreManager;
+        if (rm == null) { unimpl(obs); return; }
+        try {
+            rm.restore(req.getSstsList());
+            obs.onNext(io.github.xinfra.lab.xkv.proto.KvServerpb.RestoreResponse.newBuilder().build());
+            obs.onCompleted();
+        } catch (Throwable t) {
+            obs.onError(Status.INTERNAL.withDescription(t.getMessage()).asRuntimeException());
+        }
     }
 
     private static void unimpl(StreamObserver<?> o) {

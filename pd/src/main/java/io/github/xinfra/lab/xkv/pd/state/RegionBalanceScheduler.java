@@ -51,6 +51,7 @@ public final class RegionBalanceScheduler implements AutoCloseable {
     private final AtomicLong ticksTotal = new AtomicLong();
     private final AtomicLong operatorsScheduled = new AtomicLong();
     private volatile boolean closed = false;
+    private volatile boolean paused = false;
 
     /** Stores with available ratio below this threshold are not AddPeer targets. */
     private static final double LOW_SPACE_RATIO = 0.05;
@@ -81,8 +82,12 @@ public final class RegionBalanceScheduler implements AutoCloseable {
     public long ticksTotal() { return ticksTotal.get(); }
     public long operatorsScheduled() { return operatorsScheduled.get(); }
 
+    public void pause()  { paused = true; }
+    public void resume() { paused = false; }
+    public boolean isPaused() { return paused; }
+
     private void tickSafely() {
-        if (closed) return;
+        if (closed || paused) return;
         try { runOnce(); }
         catch (Throwable t) { log.warn("region-balance tick failed: {}", t.getMessage()); }
     }

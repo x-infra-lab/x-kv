@@ -62,6 +62,12 @@ public final class InMemoryPdStateMachine implements PdStateMachine {
             new java.util.concurrent.ConcurrentHashMap<>();
 
     private final AtomicLong idAllocator = new AtomicLong(1000);   // start ids past well-known reserved ones
+    private final io.github.xinfra.lab.xkv.pd.state.placement.PlacementRuleManager placementRules =
+            new io.github.xinfra.lab.xkv.pd.state.placement.PlacementRuleManager();
+    private final io.github.xinfra.lab.xkv.pd.state.keyspace.KeyspaceManager keyspaces =
+            new io.github.xinfra.lab.xkv.pd.state.keyspace.KeyspaceManager();
+    private final io.github.xinfra.lab.xkv.pd.state.keyspace.ResourceGroupManager resourceGroups =
+            new io.github.xinfra.lab.xkv.pd.state.keyspace.ResourceGroupManager();
 
     @Override
     public void updateRegionStats(long regionId, long approximateSize, long approximateKeys) {
@@ -267,6 +273,15 @@ public final class InMemoryPdStateMachine implements PdStateMachine {
                         .setApproximateKeys(e.getValue().approximateKeys())
                         .build());
             }
+            for (var rule : placementRules.getRules()) {
+                snap.addPlacementRules(rule.toProto());
+            }
+            for (var ks : keyspaces.encode()) {
+                snap.addKeyspaces(ks);
+            }
+            for (var rg : resourceGroups.encode()) {
+                snap.addResourceGroups(rg);
+            }
             return snap.build().toByteArray();
         } finally {
             lock.readLock().unlock();
@@ -297,8 +312,26 @@ public final class InMemoryPdStateMachine implements PdStateMachine {
             if (snap.getIdAllocatorNext() > 0) {
                 idAllocator.set(snap.getIdAllocatorNext());
             }
-            log.info("PD snapshot installed: {} stores, {} regions, idAlloc={}",
-                    stores.size(), regionsById.size(), idAllocator.get());
+            // Restore placement rules from snapshot.
+            byte[] rulesData = null;
+            if (snap.getPlacementRulesCount() > 0) {
+                var rulesList = new java.util.ArrayList<io.github.xinfra.lab.xkv.pd.state.placement.PlacementRule>();
+                for (var rp : snap.getPlacementRulesList()) {
+                    rulesList.add(io.github.xinfra.lab.xkv.pd.state.placement.PlacementRule.fromProto(rp));
+                }
+                for (var rule : rulesList) {
+                    placementRules.setRule(rule);
+                }
+            }
+            if (snap.getKeyspacesCount() > 0) {
+                keyspaces.decode(snap.getKeyspacesList());
+            }
+            if (snap.getResourceGroupsCount() > 0) {
+                resourceGroups.decode(snap.getResourceGroupsList());
+            }
+            log.info("PD snapshot installed: {} stores, {} regions, {} rules, {} keyspaces, {} resource_groups, idAlloc={}",
+                    stores.size(), regionsById.size(), placementRules.ruleCount(),
+                    keyspaces.size(), resourceGroups.size(), idAllocator.get());
         } catch (Exception e) {
             throw new RuntimeException("PD snapshot install failed", e);
         } finally {
@@ -317,12 +350,37 @@ public final class InMemoryPdStateMachine implements PdStateMachine {
                 case CMD_PUT_STORE -> putStore(cmd.getStore());
                 case CMD_UPDATE_REGION -> updateRegion(cmd.getRegion());
                 case CMD_ALLOC_ID -> {
-                    // allocId is handled before propose (leader pre-allocates);
-                    // the apply path only needs to bump the allocator to ensure
-                    // followers stay in sync.
                     var payload = cmd.getAllocId();
                     long needed = payload.getBaseId() + payload.getCount();
                     idAllocator.updateAndGet(cur -> Math.max(cur, needed));
+                }
+                case CMD_SET_PLACEMENT_RULE -> {
+                    var payload = cmd.getPlacementRule();
+                    if (payload.hasRule()) {
+                        placementRules.setRule(
+                                io.github.xinfra.lab.xkv.pd.state.placement.PlacementRule.fromProto(
+                                        payload.getRule()));
+                    }
+                }
+                case CMD_DELETE_PLACEMENT_RULE -> {
+                    var payload = cmd.getPlacementRule();
+                    placementRules.deleteRule(payload.getGroupId(), payload.getRuleId());
+                }
+                case CMD_SET_KEYSPACE -> {
+                    var payload = cmd.getKeyspace();
+                    if (payload.hasKeyspace()) {
+                        keyspaces.setKeyspace(payload.getKeyspace());
+                    }
+                }
+                case CMD_SET_RESOURCE_GROUP -> {
+                    var payload = cmd.getResourceGroup();
+                    if (payload.hasGroup()) {
+                        resourceGroups.setGroup(payload.getGroup());
+                    }
+                }
+                case CMD_DELETE_RESOURCE_GROUP -> {
+                    var payload = cmd.getResourceGroup();
+                    resourceGroups.deleteGroup(payload.getName());
                 }
                 default -> log.warn("unknown PD command type: {}", cmd.getType());
             }
@@ -334,6 +392,11 @@ public final class InMemoryPdStateMachine implements PdStateMachine {
     @Override public void onBecomeLeader() { /* hook for TSO reload, scheduler start */ }
     @Override public void onLoseLeader()   { /* hook to pause scheduler */ }
     @Override public void close()          { /* in-memory: nothing to release */ }
+
+    @Override
+    public io.github.xinfra.lab.xkv.pd.state.placement.PlacementRuleManager placementRuleManager() {
+        return placementRules;
+    }
 
     @Override
     public int storeCount() {

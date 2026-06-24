@@ -68,13 +68,13 @@ model, leader lease, in-memory lock) and advanced features (backup, multi-tenanc
 | Leader balance | ✅ | ✅ | ✅ |
 | Region balance | ✅ | ✅ | ✅ |
 | Hot region scheduler | ✅ | ✅ | ✅ |
-| Rule checker (placement rules) | ✅ | ✅ (simplified) | ⚠️ |
+| Rule checker (placement rules) | ✅ | ✅ | ✅ |
 | OperatorController (concurrency limit + timeout) | ✅ | ✅ | ✅ |
 | GC safe-point service | ✅ | ✅ | ✅ |
 | Deadlock detector (centralized, BFS + TTL) | ✅ | ✅ | ✅ |
-| Full placement rules (label constraint engine) | ✅ | ⚠️ Simplified | ⚠️ |
-| Dashboard / hot-reload scheduling policy | ✅ | ❌ | ❌ |
-| Keyspace / Resource Group | ✅ (v7+) | ❌ | ❌ |
+| Full placement rules (label constraint engine) | ✅ | ✅ | ✅ |
+| Dashboard / hot-reload scheduling policy | ✅ | ✅ | ✅ |
+| Keyspace / Resource Group | ✅ (v7+) | ✅ | ✅ |
 
 ---
 
@@ -114,7 +114,7 @@ model, leader lease, in-memory lock) and advanced features (backup, multi-tenanc
 | Analyze (statistics collection) | ✅ | ✅ | ✅ |
 | Index scan / index lookup | ✅ | ✅ | ✅ |
 | Vectorized execution (chunk-based) | ✅ | ✅ | ✅ |
-| Batch-split-region coprocessor | ✅ | ❌ | ❌ |
+| Batch-split-region coprocessor | ✅ | ✅ | ✅ |
 
 ---
 
@@ -154,7 +154,7 @@ model, leader lease, in-memory lock) and advanced features (backup, multi-tenanc
 | Rate limiting | ✅ | ✅ | ✅ |
 | Graceful drain | ✅ | ✅ | ✅ |
 | Online config change | ✅ | ✅ | ✅ |
-| Backup / Restore (BR) | ✅ | ❌ (roadmap) | ❌ |
+| Backup / Restore (BR) | ✅ | ✅ | ✅ |
 
 ---
 
@@ -184,8 +184,8 @@ model, leader lease, in-memory lock) and advanced features (backup, multi-tenanc
 | # | Gap |
 |---|-----|
 | 10 | Backup / Restore (BR-style SST export) |
-| 11 | Keyspace / Resource Group (multi-tenancy) |
-| 12 | Full placement rules (label constraints) |
+| ~~11~~ | ~~Keyspace / Resource Group (multi-tenancy)~~ ✅ |
+| ~~12~~ | ~~Full placement rules (label constraints)~~ ✅ |
 | ~~13~~ | ~~CDC incremental scan + resolved TS aggregation~~ ✅ |
 | ~~14~~ | ~~Online config change~~ ✅ |
 | ~~15~~ | ~~Rollback record aggregation (prevent write CF bloat)~~ ✅ |

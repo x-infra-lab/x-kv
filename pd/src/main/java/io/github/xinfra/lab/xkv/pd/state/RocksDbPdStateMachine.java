@@ -82,6 +82,12 @@ public final class RocksDbPdStateMachine implements PdStateMachine {
 
     private final HashMap<Long, Metapb.Peer> leaders = new HashMap<>();
     private final ConcurrentHashMap<Long, RegionStats> regionStats = new ConcurrentHashMap<>();
+    private final io.github.xinfra.lab.xkv.pd.state.placement.PlacementRuleManager placementRules =
+            new io.github.xinfra.lab.xkv.pd.state.placement.PlacementRuleManager();
+    private final io.github.xinfra.lab.xkv.pd.state.keyspace.KeyspaceManager keyspaces =
+            new io.github.xinfra.lab.xkv.pd.state.keyspace.KeyspaceManager();
+    private final io.github.xinfra.lab.xkv.pd.state.keyspace.ResourceGroupManager resourceGroups =
+            new io.github.xinfra.lab.xkv.pd.state.keyspace.ResourceGroupManager();
 
     public RocksDbPdStateMachine(Path dataDir) {
         try {
@@ -391,6 +397,9 @@ public final class RocksDbPdStateMachine implements PdStateMachine {
             if (cluster != null) snap.setCluster(cluster);
             for (var s : stores.values()) snap.addStores(s);
             for (var r : regionsById.values()) snap.addRegions(r);
+            for (var rule : placementRules.getRules()) snap.addPlacementRules(rule.toProto());
+            for (var ks : keyspaces.encode()) snap.addKeyspaces(ks);
+            for (var rg : resourceGroups.encode()) snap.addResourceGroups(rg);
             return snap.build().toByteArray();
         } finally {
             lock.readLock().unlock();
@@ -421,9 +430,20 @@ public final class RocksDbPdStateMachine implements PdStateMachine {
                 tsoBound = snap.getTsoPhysicalBound();
             }
 
+            for (var rp : snap.getPlacementRulesList()) {
+                placementRules.setRule(
+                        io.github.xinfra.lab.xkv.pd.state.placement.PlacementRule.fromProto(rp));
+            }
+            if (snap.getKeyspacesCount() > 0) {
+                keyspaces.decode(snap.getKeyspacesList());
+            }
+            if (snap.getResourceGroupsCount() > 0) {
+                resourceGroups.decode(snap.getResourceGroupsList());
+            }
             clearAndWriteAll();
-            log.info("PD snapshot installed: {} stores, {} regions, idAlloc={}",
-                    stores.size(), regionsById.size(), idAllocator.get());
+            log.info("PD snapshot installed: {} stores, {} regions, {} rules, {} keyspaces, {} resource_groups, idAlloc={}",
+                    stores.size(), regionsById.size(), placementRules.ruleCount(),
+                    keyspaces.size(), resourceGroups.size(), idAllocator.get());
         } catch (Exception e) {
             throw new RuntimeException("PD snapshot install failed", e);
         } finally {
@@ -487,6 +507,34 @@ public final class RocksDbPdStateMachine implements PdStateMachine {
                         }
                     }
                 }
+                case CMD_SET_PLACEMENT_RULE -> {
+                    var payload = cmd.getPlacementRule();
+                    if (payload.hasRule()) {
+                        placementRules.setRule(
+                                io.github.xinfra.lab.xkv.pd.state.placement.PlacementRule.fromProto(
+                                        payload.getRule()));
+                    }
+                }
+                case CMD_DELETE_PLACEMENT_RULE -> {
+                    var payload = cmd.getPlacementRule();
+                    placementRules.deleteRule(payload.getGroupId(), payload.getRuleId());
+                }
+                case CMD_SET_KEYSPACE -> {
+                    var payload = cmd.getKeyspace();
+                    if (payload.hasKeyspace()) {
+                        keyspaces.setKeyspace(payload.getKeyspace());
+                    }
+                }
+                case CMD_SET_RESOURCE_GROUP -> {
+                    var payload = cmd.getResourceGroup();
+                    if (payload.hasGroup()) {
+                        resourceGroups.setGroup(payload.getGroup());
+                    }
+                }
+                case CMD_DELETE_RESOURCE_GROUP -> {
+                    var payload = cmd.getResourceGroup();
+                    resourceGroups.deleteGroup(payload.getName());
+                }
                 default -> log.warn("unknown PD command type: {}", cmd.getType());
             }
         } catch (Exception e) {
@@ -509,6 +557,21 @@ public final class RocksDbPdStateMachine implements PdStateMachine {
 
     @Override public void onBecomeLeader() {}
     @Override public void onLoseLeader() {}
+
+    @Override
+    public io.github.xinfra.lab.xkv.pd.state.placement.PlacementRuleManager placementRuleManager() {
+        return placementRules;
+    }
+
+    @Override
+    public io.github.xinfra.lab.xkv.pd.state.keyspace.KeyspaceManager keyspaceManager() {
+        return keyspaces;
+    }
+
+    @Override
+    public io.github.xinfra.lab.xkv.pd.state.keyspace.ResourceGroupManager resourceGroupManager() {
+        return resourceGroups;
+    }
 
     @Override
     public void close() {

@@ -112,5 +112,17 @@ public interface PdStateMachine {
     default int storeCount() { return 0; }
     default int regionCount() { return 0; }
 
+    default io.github.xinfra.lab.xkv.pd.state.placement.PlacementRuleManager placementRuleManager() {
+        return null;
+    }
+
+    default io.github.xinfra.lab.xkv.pd.state.keyspace.KeyspaceManager keyspaceManager() {
+        return null;
+    }
+
+    default io.github.xinfra.lab.xkv.pd.state.keyspace.ResourceGroupManager resourceGroupManager() {
+        return null;
+    }
+
     void close();
 }

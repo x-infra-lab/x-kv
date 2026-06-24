@@ -3,6 +3,7 @@ syntax = "proto3";
 package kv_serverpb;
 
 import "metapb.proto";
+import "errorpb.proto";
 
 option java_package = "io.github.xinfra.lab.xkv.proto";
 option java_outer_classname = "KvServerpb";
@@ -139,4 +140,45 @@ message ConfChangeContext {
     repeated metapb.Peer peers = 1;
 
     reserved 2 to 30;
+}
+
+// ===========================================================================
+// Backup / Restore (BR)
+// ===========================================================================
+
+message BackupRequest {
+    uint64 cluster_id = 1;
+    bytes start_key = 2;
+    bytes end_key = 3;
+    uint64 start_version = 4;
+    uint64 end_version = 5;
+    uint32 rate_limit = 6;
+}
+
+message BackupResponse {
+    errorpb.Error error = 1;
+    bytes start_key = 2;
+    bytes end_key = 3;
+    repeated BackupFile files = 4;
+}
+
+message BackupFile {
+    string name = 1;
+    bytes start_key = 2;
+    bytes end_key = 3;
+    uint64 total_kvs = 4;
+    uint64 total_bytes = 5;
+    string cf = 6;
+    uint64 size = 7;
+    bytes sha256 = 8;
+    bytes data = 9;
+}
+
+message RestoreRequest {
+    uint64 region_id = 1;
+    repeated BackupFile ssts = 2;
+}
+
+message RestoreResponse {
+    errorpb.Error error = 1;
 }
