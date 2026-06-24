@@ -72,6 +72,10 @@ message DAGRequest {
     int64 topn_limit = 7;
     int64 topn_offset = 8;
     repeated ByItem order_by = 9;
+    // Index scan fields (tp=3):
+    int64 index_id = 10;
+    repeated ColumnInfo index_columns = 11;
+    bool index_lookup = 12;
 }
 
 message PartialAggState {

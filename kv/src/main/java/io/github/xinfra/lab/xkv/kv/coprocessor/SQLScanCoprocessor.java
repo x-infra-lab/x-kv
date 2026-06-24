@@ -1,12 +1,13 @@
 package io.github.xinfra.lab.xkv.kv.coprocessor;
 
 import com.google.protobuf.ByteString;
-import io.github.xinfra.lab.xkv.kv.coprocessor.dag.CopOperator;
+import io.github.xinfra.lab.xkv.kv.coprocessor.dag.CopChunk;
 import io.github.xinfra.lab.xkv.kv.coprocessor.dag.CopRecord;
-import io.github.xinfra.lab.xkv.kv.coprocessor.dag.LimitOp;
-import io.github.xinfra.lab.xkv.kv.coprocessor.dag.SelectionOp;
-import io.github.xinfra.lab.xkv.kv.coprocessor.dag.TableScanOp;
-import io.github.xinfra.lab.xkv.kv.coprocessor.dag.TopNOp;
+import io.github.xinfra.lab.xkv.kv.coprocessor.dag.VecLimitOp;
+import io.github.xinfra.lab.xkv.kv.coprocessor.dag.VecOperator;
+import io.github.xinfra.lab.xkv.kv.coprocessor.dag.VecSelectionOp;
+import io.github.xinfra.lab.xkv.kv.coprocessor.dag.VecTableScanOp;
+import io.github.xinfra.lab.xkv.kv.coprocessor.dag.VecTopNOp;
 import io.github.xinfra.lab.xkv.kv.coprocessor.eval.CopAggFunction;
 import io.github.xinfra.lab.xkv.kv.coprocessor.eval.CopDatum;
 import io.github.xinfra.lab.xkv.kv.coprocessor.eval.CopDatumComparator;
@@ -69,7 +70,7 @@ public final class SQLScanCoprocessor implements Coprocessor {
             boolean hasAgg = dagReq.getAggFuncsCount() > 0;
             boolean hasTopN = dagReq.getTopnLimit() > 0;
 
-            CopOperator pipeline = buildBasePipeline(reader, dagReq, req, startTs);
+            VecOperator pipeline = buildVecPipeline(reader, dagReq, req, startTs);
 
             if (hasAgg) {
                 pipeline.open();
@@ -81,10 +82,10 @@ public final class SQLScanCoprocessor implements Coprocessor {
             }
 
             if (hasTopN) {
-                pipeline = new TopNOp(pipeline, dagReq.getOrderByList(),
+                pipeline = new VecTopNOp(pipeline, dagReq.getOrderByList(),
                         dagReq.getTopnLimit(), dagReq.getTopnOffset());
             } else {
-                pipeline = new LimitOp(pipeline, limit);
+                pipeline = new VecLimitOp(pipeline, limit);
             }
 
             pipeline.open();
@@ -113,7 +114,7 @@ public final class SQLScanCoprocessor implements Coprocessor {
             boolean hasTopN = dagReq.getTopnLimit() > 0;
             int pagingSize = req.getPagingSize() > 0 ? (int) req.getPagingSize() : Integer.MAX_VALUE;
 
-            CopOperator pipeline = buildBasePipeline(reader, dagReq, req, startTs);
+            VecOperator pipeline = buildVecPipeline(reader, dagReq, req, startTs);
 
             if (hasAgg) {
                 pipeline.open();
@@ -124,7 +125,7 @@ public final class SQLScanCoprocessor implements Coprocessor {
                     pipeline.close();
                 }
             } else if (hasTopN) {
-                pipeline = new TopNOp(pipeline, dagReq.getOrderByList(),
+                pipeline = new VecTopNOp(pipeline, dagReq.getOrderByList(),
                         dagReq.getTopnLimit(), dagReq.getTopnOffset());
                 pipeline.open();
                 try {
@@ -134,7 +135,7 @@ public final class SQLScanCoprocessor implements Coprocessor {
                     pipeline.close();
                 }
             } else {
-                pipeline = new LimitOp(pipeline, pagingSize);
+                pipeline = new VecLimitOp(pipeline, pagingSize);
                 pipeline.open();
                 try {
                     streamKvPairChunks(pipeline, sink);
@@ -152,23 +153,25 @@ public final class SQLScanCoprocessor implements Coprocessor {
 
     // --- Pipeline assembly ---
 
-    private CopOperator buildBasePipeline(MvccReader reader, Tipb.DAGRequest dagReq,
-                                           Request req, long startTs) {
-        CopOperator pipeline = new TableScanOp(reader, dagReq, req.getRangesList(),
-                startTs, scanBatchSize);
+    private VecOperator buildVecPipeline(MvccReader reader, Tipb.DAGRequest dagReq,
+                                          Request req, long startTs) {
+        VecOperator pipeline = new VecTableScanOp(reader, dagReq, req.getRangesList(), startTs);
         if (dagReq.getConditionsCount() > 0) {
-            pipeline = new SelectionOp(pipeline, dagReq.getConditionsList());
+            pipeline = new VecSelectionOp(pipeline, dagReq.getConditionsList());
         }
         return pipeline;
     }
 
     // --- Response builders ---
 
-    private Response drainToKvPairResponse(CopOperator pipeline) {
+    private Response drainToKvPairResponse(VecOperator pipeline) {
         var encoder = new TableScanCoprocessor.KvPairEncoder();
-        CopRecord record;
-        while ((record = pipeline.next()) != null) {
-            encoder.add(record.key(), record.value());
+        CopChunk chunk;
+        while ((chunk = pipeline.nextChunk(scanBatchSize)) != null) {
+            for (int i = 0; i < chunk.size(); i++) {
+                CopRecord record = chunk.get(i);
+                encoder.add(record.key(), record.value());
+            }
         }
         byte[] kvData = encoder.encode();
         Tipb.SelectResponse selectResp = Tipb.SelectResponse.newBuilder()
@@ -180,17 +183,20 @@ public final class SQLScanCoprocessor implements Coprocessor {
                 .build();
     }
 
-    private void streamKvPairChunks(CopOperator pipeline, Consumer<StreamResponse> sink) {
+    private void streamKvPairChunks(VecOperator pipeline, Consumer<StreamResponse> sink) {
         var encoder = new TableScanCoprocessor.KvPairEncoder();
         int chunkCount = 0;
-        CopRecord record;
-        while ((record = pipeline.next()) != null) {
-            encoder.add(record.key(), record.value());
-            chunkCount++;
-            if (chunkCount >= streamChunkSize) {
-                emitChunk(encoder, sink);
-                encoder = new TableScanCoprocessor.KvPairEncoder();
-                chunkCount = 0;
+        CopChunk chunk;
+        while ((chunk = pipeline.nextChunk(streamChunkSize)) != null) {
+            for (int i = 0; i < chunk.size(); i++) {
+                CopRecord record = chunk.get(i);
+                encoder.add(record.key(), record.value());
+                chunkCount++;
+                if (chunkCount >= streamChunkSize) {
+                    emitChunk(encoder, sink);
+                    encoder = new TableScanCoprocessor.KvPairEncoder();
+                    chunkCount = 0;
+                }
             }
         }
         if (chunkCount > 0) {
@@ -212,24 +218,27 @@ public final class SQLScanCoprocessor implements Coprocessor {
 
     // --- Aggregation ---
 
-    private Response executeAgg(CopOperator pipeline, Tipb.DAGRequest dagReq) {
+    private Response executeAgg(VecOperator pipeline, Tipb.DAGRequest dagReq) {
         Map<GroupKey, CopAggFunction[]> groups = new HashMap<>();
         List<Tipb.Expr> groupByExprs = dagReq.getGroupByExprsList();
         List<Tipb.AggFuncDesc> aggDescs = dagReq.getAggFuncsList();
 
-        CopRecord record;
-        while ((record = pipeline.next()) != null) {
-            CopRow row = record.row();
-            GroupKey gk = computeGroupKey(row, groupByExprs);
-            CopAggFunction[] aggs = groups.computeIfAbsent(gk,
-                    k -> createAggFunctions(aggDescs));
+        CopChunk chunk;
+        while ((chunk = pipeline.nextChunk(scanBatchSize)) != null) {
+            for (int ci = 0; ci < chunk.size(); ci++) {
+                CopRecord record = chunk.get(ci);
+                CopRow row = record.row();
+                GroupKey gk = computeGroupKey(row, groupByExprs);
+                CopAggFunction[] aggs = groups.computeIfAbsent(gk,
+                        k -> createAggFunctions(aggDescs));
 
-            for (int i = 0; i < aggs.length; i++) {
-                Tipb.AggFuncDesc desc = aggDescs.get(i);
-                CopDatum value = desc.hasArg()
-                        ? ExprEvaluator.eval(desc.getArg(), row)
-                        : CopDatum.of(1L);
-                aggs[i].update(value);
+                for (int i = 0; i < aggs.length; i++) {
+                    Tipb.AggFuncDesc desc = aggDescs.get(i);
+                    CopDatum value = desc.hasArg()
+                            ? ExprEvaluator.eval(desc.getArg(), row)
+                            : CopDatum.of(1L);
+                    aggs[i].update(value);
+                }
             }
         }
 

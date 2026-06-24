@@ -112,8 +112,8 @@ model, leader lease, in-memory lock) and advanced features (backup, multi-tenanc
 | Expression evaluator | ✅ | ✅ | ✅ |
 | Streaming response (chunked) | ✅ | ✅ | ✅ |
 | Analyze (statistics collection) | ✅ | ✅ | ✅ |
-| Index scan / index lookup | ✅ | ❌ TableScan only | ❌ |
-| Vectorized execution (chunk-based) | ✅ | ❌ Row-at-a-time | ⚠️ |
+| Index scan / index lookup | ✅ | ✅ | ✅ |
+| Vectorized execution (chunk-based) | ✅ | ✅ | ✅ |
 | Batch-split-region coprocessor | ✅ | ❌ | ❌ |
 
 ---
@@ -175,8 +175,8 @@ model, leader lease, in-memory lock) and advanced features (backup, multi-tenanc
 |---|-----|--------|--------|
 | ~~5~~ | ~~Write conflict scan is linear (not seek-based)~~ | ~~Hot keys with many versions slow prewrite~~ | ✅ |
 | ~~6~~ | ~~Client not using BatchCommands multiplexing~~ | ~~One gRPC call per RPC, no fsync amortization~~ | ✅ |
-| 7 | No Index Scan in coprocessor | SQL workloads require full table scan | |
-| 8 | Row-at-a-time coprocessor (not vectorized) | Low CPU utilization | |
+| ~~7~~ | ~~No Index Scan in coprocessor~~ | ~~SQL workloads require full table scan~~ | ✅ |
+| ~~8~~ | ~~Row-at-a-time coprocessor (not vectorized)~~ | ~~Low CPU utilization~~ | ✅ |
 | ~~9~~ | ~~Single channel per store~~ | ~~Concurrency limited~~ | ✅ |
 
 ### P2 — Features
@@ -212,3 +212,5 @@ model, leader lease, in-memory lock) and advanced features (backup, multi-tenanc
 1. ~~**Write conflict seek optimization** — reverse seek from `encode(key, MAX_TS)` to first non-rollback~~ ✅
 2. ~~**Client BatchCommands** — single stream, multiple RPCs, amortized fsync~~ ✅
 3. ~~**Async Apply** — decouple apply from the poller ready loop into a dedicated apply pool~~ ✅
+4. ~~**Index Scan coprocessor** — covering index scan + index lookup (double-read) with TiDB key encoding~~ ✅
+5. ~~**Vectorized execution** — chunk-based VecOperator pipeline replacing row-at-a-time CopOperator~~ ✅
