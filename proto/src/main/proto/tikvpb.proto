@@ -61,6 +61,9 @@ service Tikv {
     rpc MvccGetByKey(kvrpcpb.MvccGetByKeyRequest) returns (kvrpcpb.MvccGetByKeyResponse);
     rpc MvccGetByStartTs(kvrpcpb.MvccGetByStartTsRequest) returns (kvrpcpb.MvccGetByStartTsResponse);
 
+    // ---- Version negotiation ----
+    rpc GetVersion(GetVersionRequest) returns (GetVersionResponse);
+
     // ---- BatchCommands: bidi stream that multiplexes any number of the
     //      above RPCs over a single gRPC stream. The killer feature for
     //      throughput — one fsync trip in the server can flush replies for
@@ -146,6 +149,17 @@ message BatchCommandsResponse {
             Empty Empty = 255;
         }
     }
+}
+
+// ---- Version negotiation ----
+message GetVersionRequest {
+    string client_version = 1;
+    repeated string client_features = 2;
+}
+
+message GetVersionResponse {
+    string cluster_version = 1;
+    repeated string supported_features = 2;
 }
 
 // Heartbeat keep-alive on otherwise idle BatchCommands streams.

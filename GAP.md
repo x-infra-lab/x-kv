@@ -138,7 +138,7 @@ model, leader lease, in-memory lock) and advanced features (backup, multi-tenanc
 | BatchCommands multiplexing (server) | ✅ | ✅ | ✅ |
 | Error model (region_error + KeyError) | ✅ | ✅ Complete types | ✅ |
 | Context (epoch/term/stale_read/resource_group) | ✅ | ✅ | ✅ |
-| Compatibility version negotiation | ✅ | ❌ | ❌ |
+| Compatibility version negotiation | ✅ | ✅ | ✅ |
 
 ---
 

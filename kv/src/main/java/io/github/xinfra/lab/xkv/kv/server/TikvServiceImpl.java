@@ -240,6 +240,33 @@ public final class TikvServiceImpl extends TikvGrpc.TikvImplBase {
         dispatchTxn(o, () -> txn.kvMvccGetByStartTs(r));
     }
 
+    // ---- Version negotiation ----
+
+    private static final String CLUSTER_VERSION = "8.0.0-xkv";
+    private static final java.util.List<String> SUPPORTED_FEATURES = java.util.List.of(
+            "batch-commands",
+            "async-commit",
+            "1pc",
+            "pessimistic-lock",
+            "pipelined-pessimistic-lock",
+            "in-memory-lock",
+            "resolved-ts",
+            "cdc-incremental-scan",
+            "online-config"
+    );
+
+    @Override
+    public void getVersion(Tikvpb.GetVersionRequest r,
+                           StreamObserver<Tikvpb.GetVersionResponse> o) {
+        log.debug("getVersion: client_version={} features={}",
+                r.getClientVersion(), r.getClientFeaturesList());
+        o.onNext(Tikvpb.GetVersionResponse.newBuilder()
+                .setClusterVersion(CLUSTER_VERSION)
+                .addAllSupportedFeatures(SUPPORTED_FEATURES)
+                .build());
+        o.onCompleted();
+    }
+
     // ---- BatchCommands ----
     @Override
     public StreamObserver<BatchCommandsRequest> batchCommands(StreamObserver<BatchCommandsResponse> resp) {
