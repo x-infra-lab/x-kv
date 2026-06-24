@@ -103,6 +103,8 @@ public final class KvServer {
     private io.github.xinfra.lab.xkv.kv.raft.ApplyWorker applyWorker;
     private final io.github.xinfra.lab.xkv.kv.mvcc.InMemoryLockTable inMemoryLockTable =
             new io.github.xinfra.lab.xkv.kv.mvcc.InMemoryLockTable();
+    private final io.github.xinfra.lab.xkv.kv.cdc.RegionResolvedTsTracker resolvedTsTracker =
+            new io.github.xinfra.lab.xkv.kv.cdc.RegionResolvedTsTracker();
 
     private static final long STORE_HEARTBEAT_INTERVAL_MS = 10_000;
 
@@ -203,7 +205,7 @@ public final class KvServer {
         copService.register(new io.github.xinfra.lab.xkv.kv.coprocessor.IndexScanCoprocessor(engine));
 
         // CDC service — resolved TS uses the initial region's CM.
-        cdcService = new ChangeDataServiceImpl(cdcEventBus, () -> cm.maxTs().current());
+        cdcService = new ChangeDataServiceImpl(cdcEventBus, engine, () -> cm.maxTs().current(), resolvedTsTracker);
 
         var metricsRegistry = XKvMetrics.init("kv");
         var c = GrpcChannelFactory.parseHostPort(config.clientAddress());
@@ -418,7 +420,7 @@ public final class KvServer {
                 engine, raftEngine, region, self, raftPeers,
                 transport,
                 CompositeApplyHandler.defaultFor(engine, cm, region.getId(), cdcEventBus,
-                                inMemoryLockTable)
+                                inMemoryLockTable, resolvedTsTracker)
                         .withAdmin(raftEngine, engine, splitObserver, mergeObserver),
                 settings, cm, snapshotEngine, raftPoller, tickDriver, applyWorker);
         peerHolder.set(peer);
@@ -470,7 +472,7 @@ public final class KvServer {
                 };
 
         var childHandler = CompositeApplyHandler.defaultFor(engine, childCm, childRegionId, cdcEventBus,
-                        inMemoryLockTable)
+                        inMemoryLockTable, resolvedTsTracker)
                 .withAdmin(childRaftEngine, engine, (p, ch) -> {}, childMergeObserver);
 
         var childPeer = new BatchRegionPeer(

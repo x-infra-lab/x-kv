@@ -3,6 +3,7 @@ package io.github.xinfra.lab.xkv.kv.raft;
 import com.google.protobuf.InvalidProtocolBufferException;
 import io.github.xinfra.lab.xkv.kv.cdc.CdcEvent;
 import io.github.xinfra.lab.xkv.kv.cdc.CdcEventBus;
+import io.github.xinfra.lab.xkv.kv.cdc.RegionResolvedTsTracker;
 import io.github.xinfra.lab.xkv.kv.engine.StorageEngine;
 import io.github.xinfra.lab.xkv.kv.mvcc.ConcurrencyManager;
 import io.github.xinfra.lab.xkv.kv.mvcc.Lock;
@@ -53,6 +54,7 @@ public final class MvccApplyHandler implements ApplyHandler {
     private final ConcurrencyManager cm;
     private final long regionId;
     private final CdcEventBus cdcEventBus;
+    private final RegionResolvedTsTracker resolvedTsTracker;
     private volatile io.github.xinfra.lab.xkv.kv.mvcc.InMemoryLockTable inMemoryLockTable;
 
     public MvccApplyHandler(StorageEngine engine) {
@@ -65,15 +67,22 @@ public final class MvccApplyHandler implements ApplyHandler {
     }
 
     public MvccApplyHandler(StorageEngine engine, ConcurrencyManager cm) {
-        this(engine, cm, 0, null);
+        this(engine, cm, 0, null, null);
     }
 
     public MvccApplyHandler(StorageEngine engine, ConcurrencyManager cm,
                             long regionId, CdcEventBus cdcEventBus) {
+        this(engine, cm, regionId, cdcEventBus, null);
+    }
+
+    public MvccApplyHandler(StorageEngine engine, ConcurrencyManager cm,
+                            long regionId, CdcEventBus cdcEventBus,
+                            RegionResolvedTsTracker resolvedTsTracker) {
         this.engine = engine;
         this.cm = cm;
         this.regionId = regionId;
         this.cdcEventBus = cdcEventBus;
+        this.resolvedTsTracker = resolvedTsTracker;
     }
 
     public MaxTsTracker maxTs() { return cm.maxTs(); }
@@ -245,6 +254,10 @@ public final class MvccApplyHandler implements ApplyHandler {
             }
         }
 
+        if (resolvedTsTracker != null) {
+            resolvedTsTracker.trackLock(regionId, req.getStartVersion());
+        }
+
         var resp = Kvrpcpb.PrewriteResponse.newBuilder()
                 .setMinCommitTs(minCommitTs)
                 .build();
@@ -332,6 +345,10 @@ public final class MvccApplyHandler implements ApplyHandler {
 
         cm.observeSafeTs(req.getCommitVersion());
 
+        if (resolvedTsTracker != null) {
+            resolvedTsTracker.untrackLock(regionId, req.getStartVersion());
+        }
+
         // CDC: publish commit events.
         if (cdcLocks != null) {
             for (var k : req.getKeysList()) {
@@ -376,6 +393,10 @@ public final class MvccApplyHandler implements ApplyHandler {
                         .build()
                         .toByteArray());
             }
+        }
+
+        if (resolvedTsTracker != null) {
+            resolvedTsTracker.untrackLock(regionId, req.getStartVersion());
         }
 
         // CDC: publish rollback events.
@@ -497,6 +518,9 @@ public final class MvccApplyHandler implements ApplyHandler {
                     txn.resolveLockRollback(k.toByteArray(), startTs);
                 }
             }
+            if (resolvedTsTracker != null) {
+                resolvedTsTracker.untrackLock(regionId, startTs);
+            }
             return Result.ok(Kvrpcpb.ResolveLockResponse.newBuilder().build().toByteArray());
         }
 
@@ -540,11 +564,19 @@ public final class MvccApplyHandler implements ApplyHandler {
             }
         }
 
+        java.util.Set<Long> resolvedStartTsSet = resolvedTsTracker != null
+                ? new java.util.HashSet<>() : null;
         for (var t : targets) {
             if (t.commitTs() > 0) {
                 txn.resolveLockCommit(t.userKey(), t.startTs(), t.commitTs());
             } else {
                 txn.resolveLockRollback(t.userKey(), t.startTs());
+            }
+            if (resolvedStartTsSet != null) resolvedStartTsSet.add(t.startTs());
+        }
+        if (resolvedStartTsSet != null) {
+            for (long st : resolvedStartTsSet) {
+                resolvedTsTracker.untrackLock(regionId, st);
             }
         }
         return Result.ok(Kvrpcpb.ResolveLockResponse.newBuilder().build().toByteArray());

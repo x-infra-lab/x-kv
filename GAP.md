@@ -124,9 +124,9 @@ model, leader lease, in-memory lock) and advanced features (backup, multi-tenanc
 |-----------|---------|------|--------|
 | Region-scoped event bus | ✅ | ✅ | ✅ |
 | gRPC bidi EventFeed | ✅ | ✅ | ✅ |
-| Resolved TS push | ✅ | ⚠️ Proto defined, simplified impl | ⚠️ |
-| Incremental scan (catch-up) | ✅ | ❌ | ❌ |
-| Multi-region resolved TS aggregation | ✅ | ❌ | ❌ |
+| Resolved TS push (per-region) | ✅ | ✅ | ✅ |
+| Incremental scan (catch-up) | ✅ | ✅ | ✅ |
+| Per-region resolved TS tracking | ✅ | ✅ | ✅ |
 
 ---
 
@@ -186,7 +186,7 @@ model, leader lease, in-memory lock) and advanced features (backup, multi-tenanc
 | 10 | Backup / Restore (BR-style SST export) |
 | 11 | Keyspace / Resource Group (multi-tenancy) |
 | 12 | Full placement rules (label constraints) |
-| 13 | CDC incremental scan + resolved TS aggregation |
+| ~~13~~ | ~~CDC incremental scan + resolved TS aggregation~~ ✅ |
 | 14 | Online config change |
 | ~~15~~ | ~~Rollback record aggregation (prevent write CF bloat)~~ ✅ |
 
