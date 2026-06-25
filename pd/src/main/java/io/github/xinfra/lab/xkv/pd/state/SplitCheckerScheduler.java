@@ -82,10 +82,13 @@ public final class SplitCheckerScheduler implements AutoCloseable {
                     .setRegionId(regionId)
                     .setSplitRegion(sr)
                     .build();
+            long currentVersion = region.getRegionEpoch().getVersion();
             var op = new SimpleOperator(
                     System.nanoTime(), regionId, Operator.Kind.SPLIT,
                     "split-checker: approxSize=" + stats.approximateSize(),
-                    resp, storeIds);
+                    resp, storeIds,
+                    java.util.List.of(new OperatorSteps.SplitRegionStep(currentVersion + 1)),
+                    Operator.PRIORITY_DEFAULT);
             if (!controller.addOperator(op)) continue;
 
             log.info("split-checker: region={} approxSize={} exceeds threshold={}, scheduling APPROXIMATE split",

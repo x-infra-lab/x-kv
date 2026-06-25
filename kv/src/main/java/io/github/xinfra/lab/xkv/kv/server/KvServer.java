@@ -41,6 +41,8 @@ import io.github.xinfra.lab.xkv.proto.Metapb;
 import io.github.xinfra.lab.xkv.proto.PDGrpc;
 import io.github.xinfra.lab.xkv.proto.Pdpb;
 import io.grpc.Server;
+import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -50,39 +52,43 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * KV store node entrypoint.
  *
- * <p>Boots a fully-functional KV node that:
+ * <p>Boots a fully-functional KV node following TiKV's startup protocol:
  * <ol>
- *   <li>Connects to PD and registers this store (or bootstraps the cluster
- *       if it is the first store).</li>
- *   <li>Discovers the initial region assignment from PD.</li>
- *   <li>Opens a shared {@link RocksStorageEngine} at {@code dataDir}.</li>
- *   <li>Creates a {@link RegionPeerImpl} per locally-assigned region, wired
- *       to the raft transport and apply pipeline.</li>
- *   <li>Starts the client-facing gRPC server ({@code Tikv} service) and the
- *       raft transport gRPC server ({@code KvRaft} service).</li>
- *   <li>Starts a {@link RegionHeartbeater} per region to report leader +
- *       region state to PD.</li>
+ *   <li>Opens the local storage engine.</li>
+ *   <li>Connects to PD: bootstraps the cluster (first store) or registers
+ *       via {@code PutStore} (subsequent stores).</li>
+ *   <li>Recovers all regions from the local RAFT CF (primary recovery path).</li>
+ *   <li>If this is the bootstrap store and no regions were recovered, creates
+ *       the initial Region 1 peer.</li>
+ *   <li>Starts the raft transport, client-facing gRPC, and heartbeaters.</li>
  * </ol>
  *
+ * <p>A store can start with zero regions — PD's schedulers will assign
+ * regions via ConfChange, and {@code spawnOnDemand} creates peers when
+ * raft messages arrive.
+ *
  * <p>Shutdown order: heartbeaters → gRPC servers → peers → PD channels → engine.
- * This prevents RocksDB use-after-close crashes.
  */
 public final class KvServer {
     private static final Logger log = LoggerFactory.getLogger(KvServer.class);
 
     private static final long PROPOSE_TIMEOUT_MS = 10_000;
     private static final long HEARTBEAT_INTERVAL_MS = 500;
+    private static final long STORE_HEARTBEAT_INTERVAL_MS = 10_000;
+    private static final int BOOTSTRAP_CHECK_MAX_RETRIES = 3;
 
     private final KvConfig config;
 
     private RocksStorageEngine engine;
     private StoreImpl store;
+    private ConcurrencyManager storeCm;
     private RaftMessageDispatcher dispatcher;
     private Server clientServer;
     private Server raftServer;
@@ -107,8 +113,6 @@ public final class KvServer {
     private final io.github.xinfra.lab.xkv.kv.cdc.RegionResolvedTsTracker resolvedTsTracker =
             new io.github.xinfra.lab.xkv.kv.cdc.RegionResolvedTsTracker();
     private io.github.xinfra.lab.xkv.kv.config.ConfigManager configManager;
-
-    private static final long STORE_HEARTBEAT_INTERVAL_MS = 10_000;
 
     public KvServer(KvConfig config) {
         this.config = config;
@@ -139,19 +143,16 @@ public final class KvServer {
         }
         var storeMeta = storeMetaBuilder.build();
 
-        Metapb.Region initialRegion = bootstrapOrJoin(pdStub, storeMeta);
+        // 3) Bootstrap or join the cluster.
+        Optional<Metapb.Region> bootstrapRegion = bootstrapOrJoin(pdStub, storeMeta);
 
-        // 3) Build store container + CDC event bus + config manager.
+        // 4) Build store container + CDC event bus + config manager.
         store = new StoreImpl(config.storeId(), storeMeta);
         dispatcher = new RaftMessageDispatcher();
         cdcEventBus = new CdcEventBus();
         configManager = new io.github.xinfra.lab.xkv.kv.config.ConfigManager(config);
 
-        // 4) Resolve peer addresses from PD for raft transport.
-        Map<Long, String> peerAddrs = resolvePeerAddresses(pdStub, initialRegion);
-
-        // 5) Boot the raft gRPC server first so peers can receive messages
-        //    as soon as they start.
+        // 5) Boot the raft gRPC server so peers can receive messages immediately.
         var snapshotEngine = new SnapshotEngineImpl(engine, config.dataDir().resolve("snap"));
         var r = GrpcChannelFactory.parseHostPort(config.raftAddress());
         var raftBuilder = GrpcChannelFactory.serverBuilder(
@@ -179,24 +180,34 @@ public final class KvServer {
         applyWorker = new io.github.xinfra.lab.xkv.kv.raft.ApplyWorker(
                 config.worker().applyPoolThreads());
 
-        // 6) Create the initial region peer.
-        long selfPeerId = findSelfPeerId(initialRegion);
-        var raftEngine = new PerRegionRaftEngine(engine, initialRegion.getId());
-        var cm = new ConcurrencyManager(
-                new MaxTsTracker(raftEngine.persistedMaxTs()));
-        var regionPeer = createRegionPeer(initialRegion, peerAddrs, snapshotEngine,
-                raftEngine, cm);
-        store.registerPeer(regionPeer);
-        peers.add(regionPeer);
-
-        // 6b) Recover any additional regions persisted by prior splits.
+        // 6) Recover ALL persisted regions from RAFT CF (primary recovery path).
         recoverPersistedRegions(pdStub, snapshotEngine);
 
-        // 7) Build RPC services backed by the store's peer locator.
+        // 6b) If this is the bootstrap store and no regions were recovered
+        //     (first-ever boot), create the initial Region 1 peer.
+        if (bootstrapRegion.isPresent() && peers.isEmpty()) {
+            var region = bootstrapRegion.get();
+            Map<Long, String> peerAddrs = resolvePeerAddresses(pdStub, region);
+            var raftEngine = new PerRegionRaftEngine(engine, region.getId());
+            var cm = new ConcurrencyManager(new MaxTsTracker(raftEngine.persistedMaxTs()));
+            var regionPeer = createRegionPeer(region, peerAddrs, snapshotEngine, raftEngine, cm);
+            store.registerPeer(regionPeer);
+            peers.add(regionPeer);
+        }
+
+        // 7) Build store-level ConcurrencyManager from max across all regions.
+        long globalMaxTs = 0;
+        for (var peer : peers) {
+            var re = new PerRegionRaftEngine(engine, peer.regionId());
+            globalMaxTs = Math.max(globalMaxTs, re.persistedMaxTs());
+        }
+        storeCm = new ConcurrencyManager(new MaxTsTracker(globalMaxTs));
+
+        // 8) Build RPC services backed by the store's peer locator.
         RawKvService.PeerLocator locator = key ->
                 store.peerForKey(key).orElse(null);
         rawKvService = new RawKvService(engine, locator, PROPOSE_TIMEOUT_MS);
-        txnService = new TransactionService(engine, locator, PROPOSE_TIMEOUT_MS, cm, inMemoryLockTable);
+        txnService = new TransactionService(engine, locator, PROPOSE_TIMEOUT_MS, storeCm, inMemoryLockTable);
 
         // Deadlock detector via PD.
         var deadlockClient = new DeadlockClient(pdManager.blockingStub(), /* clusterId= */ 1L);
@@ -205,7 +216,7 @@ public final class KvServer {
         // Split driver.
         var splitDriver = new SplitDriver(pdManager.blockingStub(), PROPOSE_TIMEOUT_MS);
 
-        // 8) Build CoprocessorService and start client-facing gRPC server.
+        // 9) Build CoprocessorService and start client-facing gRPC server.
         var copService = new CoprocessorService();
         copService.register(new TableScanCoprocessor(engine));
         copService.register(new io.github.xinfra.lab.xkv.kv.coprocessor.SQLScanCoprocessor(engine));
@@ -213,8 +224,8 @@ public final class KvServer {
         copService.register(new io.github.xinfra.lab.xkv.kv.coprocessor.IndexScanCoprocessor(engine));
         copService.register(new io.github.xinfra.lab.xkv.kv.coprocessor.SplitKeysCoprocessor(engine));
 
-        // CDC service — resolved TS uses the initial region's CM.
-        cdcService = new ChangeDataServiceImpl(cdcEventBus, engine, () -> cm.maxTs().current(), resolvedTsTracker);
+        // CDC service — resolved TS uses the store-level CM.
+        cdcService = new ChangeDataServiceImpl(cdcEventBus, engine, () -> storeCm.maxTs().current(), resolvedTsTracker);
 
         var metricsRegistry = XKvMetrics.init("kv");
         var c = GrpcChannelFactory.parseHostPort(config.clientAddress());
@@ -227,7 +238,6 @@ public final class KvServer {
                     new DebugServiceImpl(metricsRegistry, store, engine, storeMeta, config.dataDir(), configManager));
         }
         // Interceptor order: last .intercept() is outermost (executed first).
-        // Desired: drain → auth → rateLimit → resourceGroup → mdc → metrics (innermost)
         clientServerBuilder.intercept(new GrpcServerMetricsInterceptor(metricsRegistry, config.slowLogThresholdMs()));
         clientServerBuilder.intercept(MdcServerInterceptor.forStore(config.storeId()));
         resourceGroupThrottler = new io.github.xinfra.lab.xkv.kv.ratelimit.ResourceGroupThrottler();
@@ -242,22 +252,22 @@ public final class KvServer {
         clientServerBuilder.intercept(drainingInterceptor);
         clientServer = clientServerBuilder.build().start();
 
-        // 8b) Start metrics HTTP server if configured.
+        // 9b) Start metrics HTTP server if configured.
         if (config.metricsPort() > 0) {
             metricsHttpServer = new MetricsHttpServer(config.metricsPort(), metricsRegistry,
                     () -> store != null && !peers.isEmpty());
         }
 
-        // 9) Start region heartbeater(s) for all loaded peers.
+        // 10) Start region heartbeater(s) for all loaded peers.
         for (var p : peers) {
             startHeartbeater(p);
         }
 
-        // 10) Start store-level heartbeater.
+        // 11) Start store-level heartbeater.
         storeHeartbeater = new StoreHeartbeater(config.storeId(), pdManager,
                 store, config.dataDir(), STORE_HEARTBEAT_INTERVAL_MS);
 
-        // 11) Start background workers.
+        // 12) Start background workers.
         var wc = config.worker();
         logCompactionWorker = new LogCompactionWorker(store,
                 wc.logCompactionIntervalMs(),
@@ -270,62 +280,77 @@ public final class KvServer {
                 wc.gcIntervalMs(), PROPOSE_TIMEOUT_MS);
         gcWorker.start();
 
-        log.info("KV store {} started: client={} raft={} region={} peers={}",
-                config.storeId(), config.clientAddress(), config.raftAddress(),
-                initialRegion.getId(), initialRegion.getPeersList().size());
+        if (peers.isEmpty()) {
+            log.info("KV store {} started with 0 regions, waiting for PD scheduling: client={} raft={}",
+                    config.storeId(), config.clientAddress(), config.raftAddress());
+        } else {
+            log.info("KV store {} started: client={} raft={} regions={}",
+                    config.storeId(), config.clientAddress(), config.raftAddress(), peers.size());
+        }
     }
+
+    // =====================================================================
+    // Bootstrap / Join
+    // =====================================================================
 
     /**
      * Bootstrap the cluster (if this is the first store) or register this
      * store as a member of an existing cluster.
      *
-     * <p>The protocol follows TiKV's bootstrap convention:
+     * <p>Follows TiKV's bootstrap protocol:
      * <ol>
-     *   <li>Call {@code GetClusterInfo}. If the cluster is already bootstrapped
-     *       (i.e. has a non-empty cluster config), register via {@code PutStore}
-     *       and discover the initial region via {@code GetRegionByID(1)}.</li>
-     *   <li>Otherwise, this is the first store: call {@code Bootstrap} with
-     *       the store metadata and a single region spanning the entire key
-     *       space.</li>
+     *   <li>Call {@code IsBootstrapped} with retry on transient errors.</li>
+     *   <li>If already bootstrapped: register via {@code PutStore}, return empty.</li>
+     *   <li>If not bootstrapped: prepare bootstrap region locally (persist to
+     *       RAFT CF), then call {@code PD.Bootstrap}. On {@code ALREADY_BOOTSTRAPPED}
+     *       race, clean up local state and fall back to join.</li>
      * </ol>
+     *
+     * <p>Non-bootstrap stores start with zero regions — region assignment
+     * happens via PD scheduling and {@code spawnOnDemand}.
      */
-    private Metapb.Region bootstrapOrJoin(PDGrpc.PDBlockingStub pdStub,
-                                           Metapb.Store storeMeta) {
-        try {
-            var clusterInfo = pdStub.getClusterInfo(
-                    Pdpb.GetClusterInfoRequest.newBuilder().build());
-            if (clusterInfo.hasCluster() && clusterInfo.getCluster().getId() > 0) {
-                // Cluster already bootstrapped — register this store and fetch region.
-                log.info("Joining existing cluster (id={})", clusterInfo.getCluster().getId());
-                pdStub.putStore(Pdpb.PutStoreRequest.newBuilder()
-                        .setStore(storeMeta).build());
+    private Optional<Metapb.Region> bootstrapOrJoin(PDGrpc.PDBlockingStub pdStub,
+                                                     Metapb.Store storeMeta) {
+        boolean bootstrapped = checkClusterBootstrapped(pdStub);
 
-                // Try to find a region assigned to this store. Start with
-                // region 1 (the bootstrap region), then fall back to ScanRegions.
-                var resp = pdStub.getRegionByID(Pdpb.GetRegionByIDRequest.newBuilder()
-                        .setRegionId(1).build());
-                if (resp.hasRegion()) return resp.getRegion();
-
-                // Scan for any region with a peer on this store.
-                var scanResp = pdStub.scanRegions(Pdpb.ScanRegionsRequest.newBuilder()
-                        .setLimit(100).build());
-                for (var region : scanResp.getRegionsList()) {
-                    for (var peer : region.getPeersList()) {
-                        if (peer.getStoreId() == config.storeId()) return region;
-                    }
-                }
-                throw new IllegalStateException(
-                        "No region found for store " + config.storeId() + " in PD");
-            }
-        } catch (io.grpc.StatusRuntimeException e) {
-            if (e.getStatus().getCode() != io.grpc.Status.Code.UNIMPLEMENTED) {
-                log.debug("getClusterInfo failed (expected on first boot): {}", e.getMessage());
-            }
+        if (bootstrapped) {
+            log.info("Joining existing cluster, registering store {}", config.storeId());
+            pdStub.putStore(Pdpb.PutStoreRequest.newBuilder()
+                    .setStore(storeMeta).build());
+            return Optional.empty();
         }
 
-        // First store — bootstrap the cluster.
+        // First store — prepare locally, then bootstrap via PD.
         log.info("Bootstrapping cluster with store {}", config.storeId());
-        var bootstrapRegion = Metapb.Region.newBuilder()
+        var region = prepareBootstrapRegion();
+
+        try {
+            pdStub.bootstrap(Pdpb.BootstrapRequest.newBuilder()
+                    .setStore(storeMeta)
+                    .setRegion(region)
+                    .build());
+        } catch (StatusRuntimeException e) {
+            if (isAlreadyBootstrappedError(e)) {
+                log.info("Another store bootstrapped first, switching to join path");
+                clearPreparedBootstrap();
+                pdStub.putStore(Pdpb.PutStoreRequest.newBuilder()
+                        .setStore(storeMeta).build());
+                return Optional.empty();
+            }
+            clearPreparedBootstrap();
+            throw e;
+        }
+
+        return Optional.of(region);
+    }
+
+    /**
+     * Persist bootstrap Region 1 to local RAFT CF before calling PD.Bootstrap().
+     * Aligns with TiKV's {@code prepare_bootstrap_cluster}: ensures the region
+     * is recoverable even if the store crashes between PD.Bootstrap() and peer creation.
+     */
+    private Metapb.Region prepareBootstrapRegion() {
+        var region = Metapb.Region.newBuilder()
                 .setId(1)
                 .setRegionEpoch(Metapb.RegionEpoch.newBuilder()
                         .setConfVer(1).setVersion(1))
@@ -334,19 +359,71 @@ public final class KvServer {
                         .setStoreId(config.storeId())
                         .setRole(Metapb.PeerRole.Voter))
                 .build();
-
-        pdStub.bootstrap(Pdpb.BootstrapRequest.newBuilder()
-                .setStore(storeMeta)
-                .setRegion(bootstrapRegion)
-                .build());
-
-        return bootstrapRegion;
+        try (var batch = engine.newWriteBatch()) {
+            batch.put(StorageEngine.Cf.RAFT, RaftCfKeys.regionKey(1), region.toByteArray());
+            engine.write(batch, true);
+        }
+        return region;
     }
 
     /**
-     * Resolve raft peer addresses by querying PD for each peer's store
-     * metadata. Returns a map of peer_id → raft address.
+     * Remove locally prepared bootstrap state. Called when another store won
+     * the bootstrap race (ALREADY_BOOTSTRAPPED), aligning with TiKV's
+     * {@code clear_prepare_bootstrap_state}.
      */
+    private void clearPreparedBootstrap() {
+        try (var batch = engine.newWriteBatch()) {
+            batch.delete(StorageEngine.Cf.RAFT, RaftCfKeys.regionKey(1));
+            engine.write(batch, true);
+        }
+    }
+
+    /**
+     * Check cluster bootstrap status with retry on transient errors.
+     * Throws on persistent failure — never falls through to bootstrap on error.
+     */
+    private boolean checkClusterBootstrapped(PDGrpc.PDBlockingStub pdStub) {
+        for (int attempt = 0; attempt < BOOTSTRAP_CHECK_MAX_RETRIES; attempt++) {
+            try {
+                var resp = pdStub.isBootstrapped(
+                        Pdpb.IsBootstrappedRequest.newBuilder().build());
+                return resp.getBootstrapped();
+            } catch (StatusRuntimeException e) {
+                if (isTransientError(e) && attempt < BOOTSTRAP_CHECK_MAX_RETRIES - 1) {
+                    long backoffMs = 100L * (1L << attempt);
+                    log.warn("PD unreachable (attempt {}/{}), retrying in {}ms: {}",
+                            attempt + 1, BOOTSTRAP_CHECK_MAX_RETRIES, backoffMs, e.getMessage());
+                    try { Thread.sleep(backoffMs); } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new IllegalStateException("Interrupted while checking PD", ie);
+                    }
+                    continue;
+                }
+                throw new IllegalStateException(
+                        "Cannot determine cluster state after " + BOOTSTRAP_CHECK_MAX_RETRIES + " attempts", e);
+            }
+        }
+        throw new IllegalStateException("Cannot reach PD");
+    }
+
+    private static boolean isTransientError(StatusRuntimeException e) {
+        var code = e.getStatus().getCode();
+        return code == Status.Code.UNAVAILABLE
+                || code == Status.Code.DEADLINE_EXCEEDED
+                || code == Status.Code.INTERNAL;
+    }
+
+    private static boolean isAlreadyBootstrappedError(StatusRuntimeException e) {
+        // PD returns ALREADY_BOOTSTRAPPED in the response header, but may also
+        // signal it via gRPC error status in some implementations.
+        return e.getMessage() != null
+                && e.getMessage().contains("already bootstrapped");
+    }
+
+    // =====================================================================
+    // Peer address resolution
+    // =====================================================================
+
     private Map<Long, String> resolvePeerAddresses(PDGrpc.PDBlockingStub pdStub,
                                                     Metapb.Region region) {
         var addrs = new HashMap<Long, String>();
@@ -369,10 +446,10 @@ public final class KvServer {
         return addrs;
     }
 
-    /**
-     * Create a fully-wired {@link BatchRegionPeer} for a region, backed by
-     * the shared {@link RaftPoller} and {@link TickDriver}.
-     */
+    // =====================================================================
+    // Region peer creation
+    // =====================================================================
+
     private BatchRegionPeer createRegionPeer(Metapb.Region region,
                                               Map<Long, String> peerAddrs,
                                               SnapshotEngineImpl snapshotEngine,
@@ -450,6 +527,7 @@ public final class KvServer {
 
     /**
      * Spawn a freshly-split child region as a live RegionPeer.
+     * Uses the store-level ConcurrencyManager for consistent max_ts tracking.
      */
     private void spawnChildPeer(Metapb.Region childRegion,
                                  Metapb.Peer childSelf,
@@ -470,8 +548,9 @@ public final class KvServer {
         var childPeers = new ArrayList<Peer>();
         for (var pe : childRegion.getPeersList()) childPeers.add(new Peer(pe.getId()));
 
-        var childCm = new ConcurrencyManager(
-                new MaxTsTracker(childRaftEngine.persistedMaxTs()));
+        // Use store-level CM: consistent max_ts across all regions.
+        var childCm = storeCm != null ? storeCm
+                : new ConcurrencyManager(new MaxTsTracker(childRaftEngine.persistedMaxTs()));
 
         var childPeerHolder = new AtomicReference<BatchRegionPeer>();
         var childMergeObserver = (AdminApplyHandler.MergeObserver)
@@ -539,6 +618,15 @@ public final class KvServer {
         }
     }
 
+    // =====================================================================
+    // Region recovery from local RAFT CF
+    // =====================================================================
+
+    /**
+     * Recover all regions persisted in the local RAFT CF.
+     * This is the primary recovery path on restart — we never query PD
+     * for "which regions does this store host".
+     */
     private void recoverPersistedRegions(PDGrpc.PDBlockingStub pdStub,
                                          SnapshotEngineImpl snapshotEngine) {
         byte[] prefix = RaftCfKeys.allRegionKeysPrefix();
@@ -576,16 +664,20 @@ public final class KvServer {
                 peers.add(peer);
                 recovered++;
 
-                log.info("recovered persisted region={} range=[{}, {})",
+                log.debug("recovered persisted region={} range=[{}, {})",
                         regionId,
                         region.getStartKey().toStringUtf8(),
                         region.getEndKey().toStringUtf8());
             }
         }
         if (recovered > 0) {
-            log.info("recovered {} additional region(s) from RAFT CF", recovered);
+            log.info("Recovered {} region(s) from RAFT CF", recovered);
         }
     }
+
+    // =====================================================================
+    // Heartbeaters
+    // =====================================================================
 
     private void startHeartbeater(RegionPeer peer) {
         var pdAsyncStub = pdManager.asyncStub();
@@ -595,6 +687,10 @@ public final class KvServer {
         hb.start();
         heartbeaters.add(hb);
     }
+
+    // =====================================================================
+    // Lifecycle
+    // =====================================================================
 
     public void awaitTermination() throws InterruptedException {
         if (clientServer != null) clientServer.awaitTermination();

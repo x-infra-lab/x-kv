@@ -5,19 +5,18 @@ import io.github.xinfra.lab.xkv.proto.Pdpb;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
 import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 final class OperatorControllerImplTest {
 
-    private OperatorQueue queue;
     private OperatorControllerImpl controller;
 
     @BeforeEach
     void setUp() {
-        queue = new OperatorQueue();
-        controller = new OperatorControllerImpl(queue, /* maxPerStore= */ 2, /* timeoutMs= */ 60_000);
+        controller = new OperatorControllerImpl(/* maxPerStore= */ 2, /* timeoutMs= */ 60_000);
     }
 
     @Test
@@ -26,7 +25,6 @@ final class OperatorControllerImplTest {
         assertThat(controller.addOperator(op)).isTrue();
         assertThat(controller.totalInFlight()).isEqualTo(1);
         assertThat(controller.storeInFlightCount(2)).isEqualTo(1);
-        assertThat(queue.size(100)).isEqualTo(1);
     }
 
     @Test
@@ -35,19 +33,33 @@ final class OperatorControllerImplTest {
         controller.addOperator(transferLeaderOp(2, 101, Set.of(2L)));
         assertThat(controller.storeInFlightCount(2)).isEqualTo(2);
 
-        // Third operator targeting same store should be rejected.
         var op3 = transferLeaderOp(3, 102, Set.of(2L));
         assertThat(controller.addOperator(op3)).isFalse();
         assertThat(controller.totalInFlight()).isEqualTo(2);
     }
 
     @Test
-    void addOperator_rejects_duplicate_region() {
+    void addOperator_rejects_duplicate_region_same_priority() {
         controller.addOperator(transferLeaderOp(1, 100, Set.of(2L)));
 
         var dup = transferLeaderOp(2, 100, Set.of(3L));
         assertThat(controller.addOperator(dup)).isFalse();
         assertThat(controller.totalInFlight()).isEqualTo(1);
+    }
+
+    @Test
+    void addOperator_replaces_lower_priority_operator() {
+        var lowPri = transferLeaderOp(1, 100, Set.of(2L), Operator.PRIORITY_BALANCE);
+        controller.addOperator(lowPri);
+        assertThat(controller.totalInFlight()).isEqualTo(1);
+
+        var highPri = transferLeaderOp(2, 100, Set.of(3L), Operator.PRIORITY_RULE_FIX);
+        assertThat(controller.addOperator(highPri)).isTrue();
+        assertThat(controller.totalInFlight()).isEqualTo(1);
+        assertThat(controller.getOperator(100).get().id()).isEqualTo(2);
+        assertThat(controller.storeInFlightCount(2)).isEqualTo(0);
+        assertThat(controller.storeInFlightCount(3)).isEqualTo(1);
+        assertThat(controller.opsReplaced()).isEqualTo(1);
     }
 
     @Test
@@ -88,15 +100,40 @@ final class OperatorControllerImplTest {
     }
 
     @Test
-    void dispatch_returns_response_for_inflight_region() {
+    void dispatch_returns_response_when_pending() {
+        var target = Metapb.Peer.newBuilder()
+                .setId(10).setStoreId(2).setRole(Metapb.PeerRole.Voter).build();
         controller.addOperator(transferLeaderOp(1, 100, Set.of(2L)));
 
+        // Heartbeat where leader is NOT the target → step not satisfied → PENDING → resend
         var hb = Pdpb.RegionHeartbeatRequest.newBuilder()
-                .setRegion(Metapb.Region.newBuilder().setId(100))
+                .setRegion(Metapb.Region.newBuilder().setId(100)
+                        .addPeers(Metapb.Peer.newBuilder().setId(10).setStoreId(2)))
+                .setLeader(Metapb.Peer.newBuilder().setId(99).setStoreId(1))
                 .build();
         var result = controller.dispatch(hb);
         assertThat(result).isPresent();
         assertThat(result.get().hasTransferLeader()).isTrue();
+        assertThat(controller.totalInFlight()).isEqualTo(1);
+    }
+
+    @Test
+    void dispatch_returns_empty_and_removes_when_finished() {
+        var target = Metapb.Peer.newBuilder()
+                .setId(10).setStoreId(2).setRole(Metapb.PeerRole.Voter).build();
+        controller.addOperator(transferLeaderOp(1, 100, Set.of(2L)));
+
+        // Heartbeat where leader IS the target → step satisfied → FINISHED
+        var hb = Pdpb.RegionHeartbeatRequest.newBuilder()
+                .setRegion(Metapb.Region.newBuilder().setId(100)
+                        .addPeers(target))
+                .setLeader(target)
+                .build();
+        var result = controller.dispatch(hb);
+        assertThat(result).isEmpty();
+        assertThat(controller.totalInFlight()).isEqualTo(0);
+        assertThat(controller.storeInFlightCount(2)).isEqualTo(0);
+        assertThat(controller.opsSuccess()).isEqualTo(1);
     }
 
     @Test
@@ -109,21 +146,35 @@ final class OperatorControllerImplTest {
 
     @Test
     void dispatch_evicts_expired_operators() {
-        var shortTimeout = new OperatorControllerImpl(queue, 5, /* timeoutMs= */ 1);
+        var shortTimeout = new OperatorControllerImpl(5, /* timeoutMs= */ 1);
         shortTimeout.addOperator(transferLeaderOp(1, 100, Set.of(2L)));
 
-        // Wait for expiry.
         try { Thread.sleep(10); } catch (InterruptedException ignored) {}
 
         var hb = Pdpb.RegionHeartbeatRequest.newBuilder()
                 .setRegion(Metapb.Region.newBuilder().setId(100))
                 .build();
-        // dispatch should evict the expired operator, then return the
-        // next response (empty since operator was evicted and removed).
         shortTimeout.dispatch(hb);
 
         assertThat(shortTimeout.totalInFlight()).isEqualTo(0);
         assertThat(shortTimeout.storeInFlightCount(2)).isEqualTo(0);
+        assertThat(shortTimeout.opsTimeout()).isEqualTo(1);
+    }
+
+    @Test
+    void history_tracks_completed_operators() {
+        controller.addOperator(transferLeaderOp(1, 100, Set.of(2L)));
+
+        var target = Metapb.Peer.newBuilder()
+                .setId(10).setStoreId(2).setRole(Metapb.PeerRole.Voter).build();
+        var hb = Pdpb.RegionHeartbeatRequest.newBuilder()
+                .setRegion(Metapb.Region.newBuilder().setId(100).addPeers(target))
+                .setLeader(target)
+                .build();
+        controller.dispatch(hb);
+
+        assertThat(controller.history()).hasSize(1);
+        assertThat(controller.history().get(0).id()).isEqualTo(1);
     }
 
     @Test
@@ -137,6 +188,11 @@ final class OperatorControllerImplTest {
     }
 
     private static SimpleOperator transferLeaderOp(long id, long regionId, Set<Long> targetStores) {
+        return transferLeaderOp(id, regionId, targetStores, Operator.PRIORITY_DEFAULT);
+    }
+
+    private static SimpleOperator transferLeaderOp(long id, long regionId,
+                                                    Set<Long> targetStores, int priority) {
         var target = Metapb.Peer.newBuilder()
                 .setId(id * 10)
                 .setStoreId(targetStores.iterator().next())
@@ -147,6 +203,8 @@ final class OperatorControllerImplTest {
                 .setTransferLeader(target)
                 .build();
         return new SimpleOperator(id, regionId, Operator.Kind.TRANSFER_LEADER,
-                "test-transfer-leader", resp, targetStores);
+                "test-transfer-leader", resp, targetStores,
+                List.of(new OperatorSteps.TransferLeaderStep(target)),
+                priority);
     }
 }

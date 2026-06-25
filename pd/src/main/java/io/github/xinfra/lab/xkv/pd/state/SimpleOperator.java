@@ -5,14 +5,6 @@ import io.github.xinfra.lab.xkv.proto.Pdpb;
 import java.util.List;
 import java.util.Set;
 
-/**
- * Minimal {@link Operator} implementation used by schedulers to produce
- * operators for {@link OperatorControllerImpl}.
- *
- * <p>Each SimpleOperator wraps a single pre-built
- * {@link Pdpb.RegionHeartbeatResponse}. The controller materializes it
- * into the {@link OperatorQueue} and tracks it for store-limit enforcement.
- */
 public final class SimpleOperator implements Operator {
 
     private final long id;
@@ -22,10 +14,15 @@ public final class SimpleOperator implements Operator {
     private final Pdpb.RegionHeartbeatResponse response;
     private final Set<Long> targetStoreIds;
     private final long createdAtMs;
+    private final List<Step> steps;
+    private final int priority;
+    private int currentStep = 0;
 
     public SimpleOperator(long id, long regionId, Kind kind, String desc,
                           Pdpb.RegionHeartbeatResponse response,
-                          Set<Long> targetStoreIds) {
+                          Set<Long> targetStoreIds,
+                          List<Step> steps,
+                          int priority) {
         this.id = id;
         this.regionId = regionId;
         this.kind = kind;
@@ -33,6 +30,8 @@ public final class SimpleOperator implements Operator {
         this.response = response;
         this.targetStoreIds = Set.copyOf(targetStoreIds);
         this.createdAtMs = System.currentTimeMillis();
+        this.steps = List.copyOf(steps);
+        this.priority = priority;
     }
 
     @Override public long id() { return id; }
@@ -40,7 +39,8 @@ public final class SimpleOperator implements Operator {
     @Override public Kind kind() { return kind; }
     @Override public String desc() { return desc; }
     @Override public long createdAtMs() { return createdAtMs; }
-    @Override public List<Step> steps() { return List.of(); }
+    @Override public List<Step> steps() { return steps; }
+    @Override public int priority() { return priority; }
 
     @Override
     public Pdpb.RegionHeartbeatResponse next(Pdpb.RegionHeartbeatRequest hb) {
@@ -49,6 +49,14 @@ public final class SimpleOperator implements Operator {
 
     @Override
     public Outcome observe(Pdpb.RegionHeartbeatRequest hb) {
+        if (steps.isEmpty()) return Outcome.FINISHED;
+        while (currentStep < steps.size()) {
+            if (steps.get(currentStep).satisfied(hb)) {
+                currentStep++;
+            } else {
+                return Outcome.PENDING;
+            }
+        }
         return Outcome.FINISHED;
     }
 

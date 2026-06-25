@@ -11,6 +11,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -139,7 +140,9 @@ public final class RuleCheckerScheduler implements AutoCloseable {
                     var op = new SimpleOperator(
                             System.nanoTime(), region.getId(), Operator.Kind.RULE_FIX,
                             "rule-checker: remove " + storeState + " peer " + peer.getId(),
-                            resp, java.util.Set.of(peer.getStoreId()));
+                            resp, Set.of(peer.getStoreId()),
+                            List.of(new OperatorSteps.RemovePeerStep(peer)),
+                            Operator.PRIORITY_RULE_FIX);
                     if (!controller.addOperator(op)) break;
                     operatorsScheduled.incrementAndGet();
                     scheduled++;
@@ -210,7 +213,9 @@ public final class RuleCheckerScheduler implements AutoCloseable {
                 var op = new SimpleOperator(System.nanoTime(), region.getId(),
                         Operator.Kind.RULE_FIX,
                         "rule-checker: add peer on store " + bestStore,
-                        resp, java.util.Set.of(bestStore));
+                        resp, Set.of(bestStore),
+                        List.of(new OperatorSteps.AddPeerStep(newPeer)),
+                        Operator.PRIORITY_RULE_FIX);
                 if (controller.addOperator(op)) {
                     operatorsScheduled.incrementAndGet();
                     scheduled++;
@@ -240,7 +245,9 @@ public final class RuleCheckerScheduler implements AutoCloseable {
                 var op = new SimpleOperator(System.nanoTime(), region.getId(),
                         Operator.Kind.RULE_FIX,
                         "rule-checker: remove peer " + victim.getId() + " from store " + victim.getStoreId(),
-                        resp, java.util.Set.of(victim.getStoreId()));
+                        resp, Set.of(victim.getStoreId()),
+                        List.of(new OperatorSteps.RemovePeerStep(victim)),
+                        Operator.PRIORITY_RULE_FIX);
                 if (controller.addOperator(op)) {
                     operatorsScheduled.incrementAndGet();
                     scheduled++;
@@ -317,11 +324,16 @@ public final class RuleCheckerScheduler implements AutoCloseable {
                             .addChangePeerV2(Pdpb.ChangePeer.newBuilder()
                                     .setPeer(newPeer).setChangeType(changeType))
                             .build();
+                    Operator.Step step = rule.isLearner()
+                            ? new OperatorSteps.AddLearnerStep(newPeer)
+                            : new OperatorSteps.AddPeerStep(newPeer);
                     var op = new SimpleOperator(System.nanoTime(), region.getId(),
                             Operator.Kind.RULE_FIX,
                             "rule-checker: add " + rule.role() + " on store " + bestStore
                                     + " (rule=" + rule.key() + ", isolation=" + bestScore + ")",
-                            resp, java.util.Set.of(bestStore));
+                            resp, Set.of(bestStore),
+                            List.of(step),
+                            Operator.PRIORITY_RULE_FIX);
                     if (controller.addOperator(op)) {
                         operatorsScheduled.incrementAndGet();
                         scheduled++;
@@ -372,7 +384,9 @@ public final class RuleCheckerScheduler implements AutoCloseable {
                             "rule-checker: remove " + rule.role() + " peer " + victim.getId()
                                     + " from store " + victim.getStoreId()
                                     + " (rule=" + rule.key() + ")",
-                            resp, java.util.Set.of(victim.getStoreId()));
+                            resp, Set.of(victim.getStoreId()),
+                            List.of(new OperatorSteps.RemovePeerStep(victim)),
+                            Operator.PRIORITY_RULE_FIX);
                     if (controller.addOperator(op)) {
                         operatorsScheduled.incrementAndGet();
                         scheduled++;

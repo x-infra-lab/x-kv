@@ -2,6 +2,10 @@ package io.github.xinfra.lab.xkv.test;
 
 import io.github.xinfra.lab.xkv.client.XKvClient;
 import io.github.xinfra.lab.xkv.client.config.ClientConfig;
+import io.github.xinfra.lab.xkv.pd.state.Operator;
+import io.github.xinfra.lab.xkv.pd.state.OperatorSteps;
+import io.github.xinfra.lab.xkv.pd.state.SimpleOperator;
+import io.github.xinfra.lab.xkv.proto.Pdpb;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -82,12 +86,19 @@ final class AutoSplitE2ETest {
         harness.pdServer().state().updateRegionStats(regionId,
                 splitThresholdBytes + 1, 200);
 
-        // Schedule the split via operator queue — simulating what
-        // SplitCheckerScheduler would do. The heartbeat stream will
-        // deliver this to the KV leader.
-        harness.pdServer().operators().scheduleSplit(
-                regionId, List.of(),
-                io.github.xinfra.lab.xkv.proto.Pdpb.SplitRegion.Policy.APPROXIMATE);
+        var region = harness.pdServer().state().getRegion(regionId).orElseThrow();
+        long currentVersion = region.getRegionEpoch().getVersion();
+        var storeIds = new java.util.HashSet<Long>();
+        for (var p : region.getPeersList()) storeIds.add(p.getStoreId());
+        var sr = Pdpb.SplitRegion.newBuilder()
+                .setPolicy(Pdpb.SplitRegion.Policy.APPROXIMATE).build();
+        var resp = Pdpb.RegionHeartbeatResponse.newBuilder()
+                .setRegionId(regionId).setSplitRegion(sr).build();
+        var splitOp = new SimpleOperator(System.nanoTime(), regionId, Operator.Kind.SPLIT,
+                "test: approximate split", resp, storeIds,
+                List.of(new OperatorSteps.SplitRegionStep(currentVersion + 1)),
+                Operator.PRIORITY_ADMIN);
+        harness.pdServer().operatorController().addOperator(splitOp);
 
         // Wait for the split to happen: region count should increase.
         await().atMost(30, TimeUnit.SECONDS)

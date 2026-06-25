@@ -7,6 +7,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -166,7 +167,9 @@ public final class RegionBalanceScheduler implements AutoCloseable {
             var op = new SimpleOperator(
                     System.nanoTime(), target.getId(), Operator.Kind.BALANCE_REGION,
                     "region-balance: add peer on store " + minStore,
-                    resp, java.util.Set.of(minStore));
+                    resp, java.util.Set.of(minStore),
+                    List.of(new OperatorSteps.AddPeerStep(newPeer)),
+                    Operator.PRIORITY_BALANCE);
             if (!controller.addOperator(op)) continue;
             operatorsScheduled.incrementAndGet();
             scheduled++;

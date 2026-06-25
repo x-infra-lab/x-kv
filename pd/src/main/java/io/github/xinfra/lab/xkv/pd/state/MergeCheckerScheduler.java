@@ -8,6 +8,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -133,7 +134,9 @@ public final class MergeCheckerScheduler implements AutoCloseable {
             var op = new SimpleOperator(
                     System.nanoTime(), region.getId(), Operator.Kind.MERGE,
                     "merge-checker: merge region " + region.getId() + " into " + neighbor.getId(),
-                    resp, storeIds);
+                    resp, storeIds,
+                    List.of(new OperatorSteps.MergeRegionStep(region.getId())),
+                    Operator.PRIORITY_MERGE);
             if (!controller.addOperator(op)) continue;
             operatorsScheduled.incrementAndGet();
             scheduled++;

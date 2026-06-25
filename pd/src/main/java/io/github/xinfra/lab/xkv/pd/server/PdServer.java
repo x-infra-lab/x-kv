@@ -60,7 +60,6 @@ public final class PdServer {
     private RocksDbPdStateMachine state;
     private HlcTsoOracle tso;
     private InMemorySafePointService safePoint;
-    private io.github.xinfra.lab.xkv.pd.state.OperatorQueue operators;
     private io.github.xinfra.lab.xkv.pd.state.DeadlockDetector deadlock;
     private io.github.xinfra.lab.xkv.pd.state.LeaderBalanceScheduler leaderBalance;
     private io.github.xinfra.lab.xkv.pd.state.RegionBalanceScheduler regionBalance;
@@ -93,7 +92,6 @@ public final class PdServer {
                 System::currentTimeMillis,
                 config.tso().savedIntervalMs());
         safePoint = new InMemorySafePointService();
-        operators = new io.github.xinfra.lab.xkv.pd.state.OperatorQueue();
         deadlock = new io.github.xinfra.lab.xkv.pd.state.DeadlockDetector();
         storeStatsCache = new StoreStatsCache();
         schedulerManager = new io.github.xinfra.lab.xkv.pd.state.SchedulerManager();
@@ -101,7 +99,7 @@ public final class PdServer {
 
         var addr = GrpcChannelFactory.parseHostPort(config.clientAddress());
         var memberInfos = buildMemberInfos();
-        service = new PdServiceImpl(state, tso, safePoint, operators, deadlock,
+        service = new PdServiceImpl(state, tso, safePoint, deadlock,
                 config.clusterId(), config.nodeId(), config.clientAddress(), memberInfos,
                 storeStatsCache, state.placementRuleManager());
 
@@ -143,7 +141,7 @@ public final class PdServer {
                 DEADLOCK_CLEANUP_INTERVAL_MS, DEADLOCK_CLEANUP_INTERVAL_MS, TimeUnit.MILLISECONDS);
 
         operatorController = new io.github.xinfra.lab.xkv.pd.state.OperatorControllerImpl(
-                operators, config.scheduler().maxOperatorsPerStore(), OPERATOR_TIMEOUT_MS);
+                config.scheduler().maxOperatorsPerStore(), OPERATOR_TIMEOUT_MS);
         service.setOperatorController(operatorController);
 
         if (config.peers().isEmpty()) {
@@ -180,7 +178,7 @@ public final class PdServer {
         splitChecker.start();
 
         hotRegion = new io.github.xinfra.lab.xkv.pd.state.HotRegionScheduler(
-                state, operatorController, operators, storeStatsCache, HOT_REGION_INTERVAL_MS);
+                state, operatorController, storeStatsCache, HOT_REGION_INTERVAL_MS);
         hotRegion.start();
 
         mergeChecker = new io.github.xinfra.lab.xkv.pd.state.MergeCheckerScheduler(
@@ -283,7 +281,7 @@ public final class PdServer {
     public RocksDbPdStateMachine state() { return state; }
     public HlcTsoOracle tso() { return tso; }
     public InMemorySafePointService safePointService() { return safePoint; }
-    public io.github.xinfra.lab.xkv.pd.state.OperatorQueue operators() { return operators; }
+    public io.github.xinfra.lab.xkv.pd.state.OperatorController operatorController() { return operatorController; }
     public io.github.xinfra.lab.xkv.pd.state.DeadlockDetector deadlockDetector() { return deadlock; }
     public PdRaftNode raftNode() { return raftNode; }
 

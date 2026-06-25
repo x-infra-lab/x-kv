@@ -6,41 +6,35 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
-/**
- * Concrete {@link OperatorController} with per-store concurrency limits
- * (token-bucket style) and operator timeout.
- *
- * <p>Sits between schedulers and {@link OperatorQueue}. When a scheduler
- * submits an {@link Operator} via {@link #addOperator}, the controller:
- * <ol>
- *   <li>Checks per-store in-flight limits for every target store.</li>
- *   <li>Rejects if the region already has an in-flight operator.</li>
- *   <li>Records the operator and forwards its materialized response to
- *       the {@link OperatorQueue} for heartbeat delivery.</li>
- * </ol>
- *
- * <p>On {@link #dispatch}, expired operators are evicted so they don't
- * block the store limit indefinitely.
- */
 public final class OperatorControllerImpl implements OperatorController {
     private static final Logger log = LoggerFactory.getLogger(OperatorControllerImpl.class);
 
-    private final OperatorQueue queue;
+    private static final int MAX_HISTORY = 100;
+
     private final int maxPerStore;
     private final long timeoutMs;
 
     private final ConcurrentHashMap<Long, OperatorRecord> inFlight = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Long, AtomicInteger> storeInFlight = new ConcurrentHashMap<>();
+    private final ConcurrentLinkedDeque<Operator> historyDeque = new ConcurrentLinkedDeque<>();
+
+    private final AtomicLong opsCreated = new AtomicLong();
+    private final AtomicLong opsSuccess = new AtomicLong();
+    private final AtomicLong opsFailed = new AtomicLong();
+    private final AtomicLong opsTimeout = new AtomicLong();
+    private final AtomicLong opsReplaced = new AtomicLong();
 
     record OperatorRecord(Operator operator, Set<Long> targetStoreIds, long createdAtMs) {}
 
-    public OperatorControllerImpl(OperatorQueue queue, int maxPerStore, long timeoutMs) {
-        this.queue = queue;
+    public OperatorControllerImpl(int maxPerStore, long timeoutMs) {
         this.maxPerStore = maxPerStore;
         this.timeoutMs = timeoutMs;
     }
@@ -49,9 +43,19 @@ public final class OperatorControllerImpl implements OperatorController {
     public synchronized boolean addOperator(Operator op) {
         long regionId = op.regionId();
 
-        if (inFlight.containsKey(regionId)) {
-            log.debug("operator rejected: region {} already has in-flight operator", regionId);
-            return false;
+        var existing = inFlight.get(regionId);
+        if (existing != null) {
+            if (op.priority() > existing.operator().priority()) {
+                doRemoveOperator(regionId, existing);
+                opsReplaced.incrementAndGet();
+                log.info("operator replaced: region={} old={} new={} (priority {} > {})",
+                        regionId, existing.operator().desc(), op.desc(),
+                        op.priority(), existing.operator().priority());
+            } else {
+                log.debug("operator rejected: region {} already has in-flight operator (priority {} <= {})",
+                        regionId, op.priority(), existing.operator().priority());
+                return false;
+            }
         }
 
         Set<Long> targets = (op instanceof SimpleOperator so) ? so.targetStoreIds() : Set.of();
@@ -75,20 +79,17 @@ public final class OperatorControllerImpl implements OperatorController {
             storeInFlight.computeIfAbsent(storeId, k -> new AtomicInteger(0)).incrementAndGet();
         }
 
-        if (op instanceof SimpleOperator so) {
-            queue.offer(regionId, so.response());
-        }
-
-        log.info("operator added: region={} kind={} desc={} targets={}",
-                regionId, op.kind(), op.desc(), targets);
+        opsCreated.incrementAndGet();
+        log.info("operator added: region={} kind={} desc={} priority={} targets={}",
+                regionId, op.kind(), op.desc(), op.priority(), targets);
         return true;
     }
 
     @Override
     public synchronized boolean removeOperator(long regionId) {
-        var record = inFlight.remove(regionId);
+        var record = inFlight.get(regionId);
         if (record == null) return false;
-        decrementStoreCounters(record.targetStoreIds());
+        doRemoveOperator(regionId, record);
         log.debug("operator removed: region={}", regionId);
         return true;
     }
@@ -109,22 +110,41 @@ public final class OperatorControllerImpl implements OperatorController {
     }
 
     @Override
-    public Optional<Pdpb.RegionHeartbeatResponse> dispatch(Pdpb.RegionHeartbeatRequest hb) {
+    public synchronized Optional<Pdpb.RegionHeartbeatResponse> dispatch(Pdpb.RegionHeartbeatRequest hb) {
         long regionId = hb.hasRegion() ? hb.getRegion().getId() : 0L;
         if (regionId == 0) return Optional.empty();
 
         evictExpired();
 
         var record = inFlight.get(regionId);
-        if (record == null) return queue.poll(regionId);
+        if (record == null) return Optional.empty();
 
         var outcome = record.operator().observe(hb);
-        if (outcome == Operator.Outcome.FINISHED || outcome == Operator.Outcome.FAILED) {
-            removeOperator(regionId);
-            queue.poll(regionId);
+        switch (outcome) {
+            case FINISHED -> {
+                doRemoveOperator(regionId, record);
+                addHistory(record.operator());
+                opsSuccess.incrementAndGet();
+                log.info("operator finished: region={} desc={}", regionId, record.operator().desc());
+                return Optional.empty();
+            }
+            case FAILED -> {
+                doRemoveOperator(regionId, record);
+                addHistory(record.operator());
+                opsFailed.incrementAndGet();
+                log.warn("operator failed: region={} desc={}", regionId, record.operator().desc());
+                return Optional.empty();
+            }
+            case PENDING -> {
+                return Optional.of(record.operator().next(hb));
+            }
         }
+        return Optional.empty();
+    }
 
-        return Optional.of(record.operator().next(hb));
+    @Override
+    public List<Operator> history() {
+        return List.copyOf(historyDeque);
     }
 
     @Override
@@ -133,15 +153,29 @@ public final class OperatorControllerImpl implements OperatorController {
         storeInFlight.clear();
     }
 
-    /** Visible for tests. */
     public int storeInFlightCount(long storeId) {
         var counter = storeInFlight.get(storeId);
         return counter == null ? 0 : counter.get();
     }
 
-    /** Visible for tests. */
     public int totalInFlight() {
         return inFlight.size();
+    }
+
+    public long opsCreated()  { return opsCreated.get(); }
+    public long opsSuccess()  { return opsSuccess.get(); }
+    public long opsFailed()   { return opsFailed.get(); }
+    public long opsTimeout()  { return opsTimeout.get(); }
+    public long opsReplaced() { return opsReplaced.get(); }
+
+    private void doRemoveOperator(long regionId, OperatorRecord record) {
+        inFlight.remove(regionId);
+        decrementStoreCounters(record.targetStoreIds());
+    }
+
+    private void addHistory(Operator op) {
+        historyDeque.addFirst(op);
+        while (historyDeque.size() > MAX_HISTORY) historyDeque.removeLast();
     }
 
     private void evictExpired() {
@@ -152,7 +186,10 @@ public final class OperatorControllerImpl implements OperatorController {
             if (now - entry.getValue().createdAtMs() > timeoutMs) {
                 it.remove();
                 decrementStoreCounters(entry.getValue().targetStoreIds());
-                log.info("operator timed out: region={}", entry.getKey());
+                addHistory(entry.getValue().operator());
+                opsTimeout.incrementAndGet();
+                log.info("operator timed out: region={} desc={}",
+                        entry.getKey(), entry.getValue().operator().desc());
             }
         }
     }

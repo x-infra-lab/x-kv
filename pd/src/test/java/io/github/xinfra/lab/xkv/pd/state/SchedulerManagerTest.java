@@ -17,7 +17,7 @@ class SchedulerManagerTest {
     @Test
     void registerAndList() {
         var state = new InMemoryPdStateMachine();
-        var controller = new OperatorControllerImpl(new OperatorQueue(), 5, 600_000);
+        var controller = new OperatorControllerImpl(5, 600_000);
         var scheduler = new LeaderBalanceScheduler(state, controller, 60_000);
 
         mgr.register("leader-balance", scheduler);
@@ -34,7 +34,7 @@ class SchedulerManagerTest {
     @Test
     void pauseAndResume() {
         var state = new InMemoryPdStateMachine();
-        var controller = new OperatorControllerImpl(new OperatorQueue(), 5, 600_000);
+        var controller = new OperatorControllerImpl(5, 600_000);
         var scheduler = new LeaderBalanceScheduler(state, controller, 60_000);
 
         mgr.register("leader-balance", scheduler);
@@ -59,7 +59,7 @@ class SchedulerManagerTest {
     @Test
     void unregisterRemovesEntry() {
         var state = new InMemoryPdStateMachine();
-        var controller = new OperatorControllerImpl(new OperatorQueue(), 5, 600_000);
+        var controller = new OperatorControllerImpl(5, 600_000);
         var scheduler = new LeaderBalanceScheduler(state, controller, 60_000);
 
         mgr.register("leader-balance", scheduler);
@@ -75,7 +75,7 @@ class SchedulerManagerTest {
     @Test
     void unregisterAll() {
         var state = new InMemoryPdStateMachine();
-        var controller = new OperatorControllerImpl(new OperatorQueue(), 5, 600_000);
+        var controller = new OperatorControllerImpl(5, 600_000);
         var s1 = new LeaderBalanceScheduler(state, controller, 60_000);
         var s2 = new RegionBalanceScheduler(state, controller, 60_000);
 
@@ -93,7 +93,7 @@ class SchedulerManagerTest {
     @Test
     void listSortedByName() {
         var state = new InMemoryPdStateMachine();
-        var controller = new OperatorControllerImpl(new OperatorQueue(), 5, 600_000);
+        var controller = new OperatorControllerImpl(5, 600_000);
         var s1 = new RegionBalanceScheduler(state, controller, 60_000);
         var s2 = new LeaderBalanceScheduler(state, controller, 60_000);
 

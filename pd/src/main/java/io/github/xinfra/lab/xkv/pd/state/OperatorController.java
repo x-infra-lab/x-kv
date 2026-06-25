@@ -3,6 +3,7 @@ package io.github.xinfra.lab.xkv.pd.state;
 import io.github.xinfra.lab.xkv.proto.Pdpb;
 
 import java.util.Collection;
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -48,6 +49,9 @@ public interface OperatorController {
      *         if no operator is in flight for this region.
      */
     Optional<Pdpb.RegionHeartbeatResponse> dispatch(Pdpb.RegionHeartbeatRequest hb);
+
+    /** Recently completed/failed/timed-out operators for diagnostics. */
+    List<Operator> history();
 
     void shutdown();
 }

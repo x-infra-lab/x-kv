@@ -3,18 +3,13 @@ package io.github.xinfra.lab.xkv.test;
 import com.google.protobuf.ByteString;
 import io.github.xinfra.lab.xkv.pd.state.InMemoryPdStateMachine;
 import io.github.xinfra.lab.xkv.pd.state.OperatorControllerImpl;
-import io.github.xinfra.lab.xkv.pd.state.OperatorQueue;
 import io.github.xinfra.lab.xkv.pd.state.RegionBalanceScheduler;
+import io.github.xinfra.lab.xkv.pd.state.SimpleOperator;
 import io.github.xinfra.lab.xkv.proto.Metapb;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-/**
- * Unit-level test for {@link RegionBalanceScheduler}: regions are skewed
- * (all on stores 1+2, none on store 3); scheduler enqueues AddPeer
- * operators targeting store 3.
- */
 final class RegionBalanceSchedulerTest {
 
     @Test
@@ -33,7 +28,6 @@ final class RegionBalanceSchedulerTest {
                         .addPeers(peer(1, 1))
                         .build());
 
-        // 4 regions hosted on stores 1+2 only — store 3 has zero replicas.
         for (long i = 0; i < 4; i++) {
             state.updateRegion(Metapb.Region.newBuilder()
                     .setId(100 + i)
@@ -45,27 +39,23 @@ final class RegionBalanceSchedulerTest {
                     .build());
         }
 
-        var ops = new OperatorQueue();
-        var controller = new OperatorControllerImpl(ops, 64, 600_000);
-        var scheduler = new RegionBalanceScheduler(state, controller, /* intervalMs= */ 60_000);
+        var controller = new OperatorControllerImpl(64, 600_000);
+        var scheduler = new RegionBalanceScheduler(state, controller, 60_000);
         try {
             int round1 = scheduler.runOnce();
             assertThat(round1).isGreaterThan(0);
-            // Drain every region's queue — the bootstrap region (id=1) is
-            // also a balance candidate since it currently sits only on
-            // store 1.
+
             int targetingStore3 = 0;
             for (long regionId : new long[]{ 1, 100, 101, 102, 103 }) {
-                while (true) {
-                    var op = ops.poll(regionId);
-                    if (op.isEmpty()) break;
-                    assertThat(op.get().hasChangePeer()).isTrue();
-                    var newPeer = op.get().getChangePeer();
-                    assertThat(newPeer.getStoreId())
-                            .as("AddPeer must target the under-loaded store")
-                            .isEqualTo(3L);
-                    targetingStore3++;
-                }
+                var op = controller.getOperator(regionId);
+                if (op.isEmpty()) continue;
+                var resp = ((SimpleOperator) op.get()).response();
+                assertThat(resp.hasChangePeer()).isTrue();
+                var newPeer = resp.getChangePeer();
+                assertThat(newPeer.getStoreId())
+                        .as("AddPeer must target the under-loaded store")
+                        .isEqualTo(3L);
+                targetingStore3++;
             }
             assertThat(targetingStore3).isEqualTo(round1);
         } finally {

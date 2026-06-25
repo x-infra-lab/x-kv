@@ -8,25 +8,13 @@ import org.slf4j.LoggerFactory;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
-/**
- * Balances hot regions across stores by transferring leadership away from
- * stores that host disproportionately many hot regions.
- *
- * <p>A region is "hot" when its approximate key/byte throughput (reported
- * in region stats) exceeds twice the cluster-wide average. The scheduler
- * identifies the store with the most hot-region leaders and transfers one
- * to the least-hot store that has a follower for that region.
- *
- * <p>Conservative by design: caps at {@link #MAX_OPERATORS_PER_TICK} = 2,
- * because hot-region moves may cause transient throughput drops on the
- * source and target stores.
- */
 public final class HotRegionScheduler implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(HotRegionScheduler.class);
 
@@ -34,8 +22,7 @@ public final class HotRegionScheduler implements AutoCloseable {
     private static final double HOT_MULTIPLIER = 2.0;
 
     private final PdStateMachine state;
-    private final OperatorControllerImpl controller;
-    private final OperatorQueue operators;
+    private final OperatorController controller;
     private final StoreStatsCache storeStats;
     private final long intervalMs;
     private final ScheduledExecutorService timer;
@@ -45,13 +32,11 @@ public final class HotRegionScheduler implements AutoCloseable {
     private volatile boolean paused = false;
 
     public HotRegionScheduler(PdStateMachine state,
-                              OperatorControllerImpl controller,
-                              OperatorQueue operators,
+                              OperatorController controller,
                               StoreStatsCache storeStats,
                               long intervalMs) {
         this.state = state;
         this.controller = controller;
-        this.operators = operators;
         this.storeStats = storeStats;
         this.intervalMs = intervalMs;
         this.timer = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -79,7 +64,6 @@ public final class HotRegionScheduler implements AutoCloseable {
         catch (Throwable t) { log.warn("hot-region tick failed: {}", t.getMessage()); }
     }
 
-    /** Visible for tests. Returns operators enqueued this round. */
     public int runOnce() {
         ticksTotal.incrementAndGet();
 
@@ -105,7 +89,6 @@ public final class HotRegionScheduler implements AutoCloseable {
         if (hotRegions.isEmpty()) return 0;
         hotRegions.sort(Comparator.comparingLong(HotRegion::load).reversed());
 
-        // Count hot regions per leader-store.
         var hotByStore = new HashMap<Long, Integer>();
         var regionMap = new HashMap<Long, Metapb.Region>();
         for (var hr : hotRegions) {
@@ -128,12 +111,11 @@ public final class HotRegionScheduler implements AutoCloseable {
             if (scheduled >= MAX_OPERATORS_PER_TICK) break;
             var region = regionMap.get(hr.regionId());
             if (region == null) continue;
-            if (operators.size(region.getId()) > 0) continue;
+            if (controller.getOperator(region.getId()).isPresent()) continue;
 
             long leaderStore = region.getPeers(0).getStoreId();
             int leaderHotCount = hotByStore.getOrDefault(leaderStore, 0);
 
-            // Find the store with fewest hot leaders that has a peer for this region.
             Metapb.Peer bestTarget = null;
             int bestHotCount = Integer.MAX_VALUE;
 
@@ -157,7 +139,9 @@ public final class HotRegionScheduler implements AutoCloseable {
             var op = new SimpleOperator(
                     System.nanoTime(), region.getId(), Operator.Kind.HOT_REGION,
                     "hot-region: transfer leader from store " + leaderStore + " to " + bestTarget.getStoreId(),
-                    resp, Set.of(bestTarget.getStoreId()));
+                    resp, Set.of(bestTarget.getStoreId()),
+                    List.of(new OperatorSteps.TransferLeaderStep(bestTarget)),
+                    Operator.PRIORITY_HOT_REGION);
 
             if (controller.addOperator(op)) {
                 operatorsScheduled.incrementAndGet();

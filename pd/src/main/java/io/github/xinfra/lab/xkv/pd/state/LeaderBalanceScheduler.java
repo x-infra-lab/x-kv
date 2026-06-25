@@ -7,6 +7,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -162,7 +163,9 @@ public final class LeaderBalanceScheduler implements AutoCloseable {
             var op = new SimpleOperator(
                     System.nanoTime(), move.region().getId(), Operator.Kind.BALANCE_LEADER,
                     "leader-balance: transfer leader to store " + target.getStoreId(),
-                    resp, java.util.Set.of(target.getStoreId()));
+                    resp, java.util.Set.of(target.getStoreId()),
+                    List.of(new OperatorSteps.TransferLeaderStep(target)),
+                    Operator.PRIORITY_BALANCE);
             if (!controller.addOperator(op)) continue;
             operatorsScheduled.incrementAndGet();
             scheduled++;

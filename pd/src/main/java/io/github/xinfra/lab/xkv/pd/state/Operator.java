@@ -56,6 +56,15 @@ public interface Operator {
 
     long createdAtMs();
 
+    int PRIORITY_DEFAULT = 0;
+    int PRIORITY_MERGE = 5;
+    int PRIORITY_BALANCE = 10;
+    int PRIORITY_HOT_REGION = 30;
+    int PRIORITY_RULE_FIX = 50;
+    int PRIORITY_ADMIN = 100;
+
+    default int priority() { return PRIORITY_DEFAULT; }
+
     /** Per-step abstraction so the scheduler can inspect / throttle. */
     interface Step {
         StepType type();

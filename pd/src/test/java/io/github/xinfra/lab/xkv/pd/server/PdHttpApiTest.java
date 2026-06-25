@@ -5,7 +5,6 @@ import io.github.xinfra.lab.xkv.pd.config.PdScheduleConfigManager;
 import io.github.xinfra.lab.xkv.pd.state.InMemoryPdStateMachine;
 import io.github.xinfra.lab.xkv.pd.state.LeaderBalanceScheduler;
 import io.github.xinfra.lab.xkv.pd.state.OperatorControllerImpl;
-import io.github.xinfra.lab.xkv.pd.state.OperatorQueue;
 import io.github.xinfra.lab.xkv.pd.state.RegionBalanceScheduler;
 import io.github.xinfra.lab.xkv.pd.state.SchedulerManager;
 import io.micrometer.prometheusmetrics.PrometheusConfig;
@@ -41,7 +40,7 @@ class PdHttpApiTest {
         schedulerManager = new SchedulerManager();
         configManager = new PdScheduleConfigManager();
 
-        var controller = new OperatorControllerImpl(new OperatorQueue(), 5, 600_000);
+        var controller = new OperatorControllerImpl(5, 600_000);
         leaderBalance = new LeaderBalanceScheduler(state, controller, 60_000);
         regionBalance = new RegionBalanceScheduler(state, controller, 60_000);
         schedulerManager.register("leader-balance", leaderBalance);

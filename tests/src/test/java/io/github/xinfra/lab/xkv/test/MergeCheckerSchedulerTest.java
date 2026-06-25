@@ -4,18 +4,15 @@ import com.google.protobuf.ByteString;
 import io.github.xinfra.lab.xkv.pd.state.InMemoryPdStateMachine;
 import io.github.xinfra.lab.xkv.pd.state.MergeCheckerScheduler;
 import io.github.xinfra.lab.xkv.pd.state.OperatorControllerImpl;
-import io.github.xinfra.lab.xkv.pd.state.OperatorQueue;
+import io.github.xinfra.lab.xkv.pd.state.SimpleOperator;
 import io.github.xinfra.lab.xkv.proto.Metapb;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-/**
- * Unit-level test for {@link MergeCheckerScheduler}.
- */
 final class MergeCheckerSchedulerTest {
 
-    private static final long MERGE_THRESHOLD = 1024 * 1024; // 1 MB
+    private static final long MERGE_THRESHOLD = 1024 * 1024;
 
     @Test
     void mergesAdjacentSmallRegions() {
@@ -33,7 +30,6 @@ final class MergeCheckerSchedulerTest {
                         .addPeers(peer(1, 1))
                         .build());
 
-        // Two adjacent small regions on the same stores.
         state.updateRegion(Metapb.Region.newBuilder()
                 .setId(100)
                 .setStartKey(ByteString.copyFromUtf8("a"))
@@ -53,22 +49,20 @@ final class MergeCheckerSchedulerTest {
                 .addPeers(peer(31, 3))
                 .build());
 
-        // Both regions are small.
         state.updateRegionStats(100, 100, 10);
         state.updateRegionStats(101, 200, 20);
 
-        var ops = new OperatorQueue();
-        var controller = new OperatorControllerImpl(ops, 64, 600_000);
+        var controller = new OperatorControllerImpl(64, 600_000);
         var scheduler = new MergeCheckerScheduler(state, controller, MERGE_THRESHOLD, 60_000);
         try {
             int scheduled = scheduler.runOnce();
             assertThat(scheduled).isEqualTo(1);
 
-            // The merge operator should be on region 100, targeting region 101.
-            var op = ops.poll(100);
+            var op = controller.getOperator(100);
             assertThat(op).isPresent();
-            assertThat(op.get().hasMerge()).isTrue();
-            assertThat(op.get().getMerge().getTarget().getId()).isEqualTo(101);
+            var resp = ((SimpleOperator) op.get()).response();
+            assertThat(resp.hasMerge()).isTrue();
+            assertThat(resp.getMerge().getTarget().getId()).isEqualTo(101);
         } finally {
             scheduler.close();
         }
@@ -103,12 +97,10 @@ final class MergeCheckerSchedulerTest {
                 .addPeers(peer(11, 1))
                 .build());
 
-        // Both regions are above threshold.
         state.updateRegionStats(100, MERGE_THRESHOLD + 1, 1000);
         state.updateRegionStats(101, MERGE_THRESHOLD + 1, 1000);
 
-        var ops = new OperatorQueue();
-        var controller = new OperatorControllerImpl(ops, 64, 600_000);
+        var controller = new OperatorControllerImpl(64, 600_000);
         var scheduler = new MergeCheckerScheduler(state, controller, MERGE_THRESHOLD, 60_000);
         try {
             assertThat(scheduler.runOnce()).isEqualTo(0);
@@ -131,7 +123,6 @@ final class MergeCheckerSchedulerTest {
                         .addPeers(peer(1, 1))
                         .build());
 
-        // Two non-adjacent small regions (gap between "m" and "p").
         state.updateRegion(Metapb.Region.newBuilder()
                 .setId(100)
                 .setStartKey(ByteString.copyFromUtf8("a"))
@@ -150,8 +141,7 @@ final class MergeCheckerSchedulerTest {
         state.updateRegionStats(100, 100, 10);
         state.updateRegionStats(101, 100, 10);
 
-        var ops = new OperatorQueue();
-        var controller = new OperatorControllerImpl(ops, 64, 600_000);
+        var controller = new OperatorControllerImpl(64, 600_000);
         var scheduler = new MergeCheckerScheduler(state, controller, MERGE_THRESHOLD, 60_000);
         try {
             assertThat(scheduler.runOnce()).isEqualTo(0);
@@ -176,7 +166,6 @@ final class MergeCheckerSchedulerTest {
                         .addPeers(peer(1, 1))
                         .build());
 
-        // Adjacent regions on different store sets.
         state.updateRegion(Metapb.Region.newBuilder()
                 .setId(100)
                 .setStartKey(ByteString.copyFromUtf8("a"))
@@ -191,14 +180,13 @@ final class MergeCheckerSchedulerTest {
                 .setEndKey(ByteString.copyFromUtf8("z"))
                 .setRegionEpoch(Metapb.RegionEpoch.newBuilder().setConfVer(1).setVersion(1))
                 .addPeers(peer(11, 1))
-                .addPeers(peer(31, 3))  // different store
+                .addPeers(peer(31, 3))
                 .build());
 
         state.updateRegionStats(100, 100, 10);
         state.updateRegionStats(101, 100, 10);
 
-        var ops = new OperatorQueue();
-        var controller = new OperatorControllerImpl(ops, 64, 600_000);
+        var controller = new OperatorControllerImpl(64, 600_000);
         var scheduler = new MergeCheckerScheduler(state, controller, MERGE_THRESHOLD, 60_000);
         try {
             assertThat(scheduler.runOnce()).isEqualTo(0);

@@ -3,6 +3,10 @@ package io.github.xinfra.lab.xkv.test;
 import io.github.xinfra.lab.xkv.client.XKvClient;
 import io.github.xinfra.lab.xkv.client.config.ClientConfig;
 import io.github.xinfra.lab.xkv.kv.store.MergeDriver;
+import io.github.xinfra.lab.xkv.pd.state.Operator;
+import io.github.xinfra.lab.xkv.pd.state.OperatorSteps;
+import io.github.xinfra.lab.xkv.pd.state.SimpleOperator;
+import io.github.xinfra.lab.xkv.proto.Pdpb;
 import org.awaitility.Awaitility;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -77,9 +81,7 @@ final class SplitMergeClientE2ETest {
         // delivered through the real heartbeat response stream to the KV
         // leader, which computes the midpoint and drives the split end-to-end.
         long regionId = harness.bootstrapRegionId();
-        harness.pdServer().operators().scheduleSplit(
-                regionId, java.util.List.of(),
-                io.github.xinfra.lab.xkv.proto.Pdpb.SplitRegion.Policy.APPROXIMATE);
+        scheduleApproximateSplit(regionId);
 
         // Wait for the split to materialize on at least one store.
         Awaitility.await().atMost(Duration.ofSeconds(30))
@@ -133,9 +135,7 @@ final class SplitMergeClientE2ETest {
         // Schedule split via PD operator controller — delivered through the
         // real heartbeat response stream.
         long regionId = harness.bootstrapRegionId();
-        harness.pdServer().operators().scheduleSplit(
-                regionId, java.util.List.of(),
-                io.github.xinfra.lab.xkv.proto.Pdpb.SplitRegion.Policy.APPROXIMATE);
+        scheduleApproximateSplit(regionId);
 
         Awaitility.await().atMost(Duration.ofSeconds(30))
                 .pollInterval(Duration.ofMillis(200))
@@ -263,9 +263,7 @@ final class SplitMergeClientE2ETest {
 
         // Schedule split while readers are running.
         long regionId = harness.bootstrapRegionId();
-        harness.pdServer().operators().scheduleSplit(
-                regionId, java.util.List.of(),
-                io.github.xinfra.lab.xkv.proto.Pdpb.SplitRegion.Policy.APPROXIMATE);
+        scheduleApproximateSplit(regionId);
 
         Awaitility.await().atMost(Duration.ofSeconds(30))
                 .pollInterval(Duration.ofMillis(200))
@@ -281,5 +279,21 @@ final class SplitMergeClientE2ETest {
         assertThat(errors)
                 .as("no reader errors during or after split")
                 .isEmpty();
+    }
+
+    private void scheduleApproximateSplit(long regionId) {
+        var region = harness.pdServer().state().getRegion(regionId).orElseThrow();
+        long currentVersion = region.getRegionEpoch().getVersion();
+        var storeIds = new java.util.HashSet<Long>();
+        for (var p : region.getPeersList()) storeIds.add(p.getStoreId());
+        var sr = Pdpb.SplitRegion.newBuilder()
+                .setPolicy(Pdpb.SplitRegion.Policy.APPROXIMATE).build();
+        var resp = Pdpb.RegionHeartbeatResponse.newBuilder()
+                .setRegionId(regionId).setSplitRegion(sr).build();
+        var splitOp = new SimpleOperator(System.nanoTime(), regionId, Operator.Kind.SPLIT,
+                "test: approximate split", resp, storeIds,
+                List.of(new OperatorSteps.SplitRegionStep(currentVersion + 1)),
+                Operator.PRIORITY_ADMIN);
+        harness.pdServer().operatorController().addOperator(splitOp);
     }
 }

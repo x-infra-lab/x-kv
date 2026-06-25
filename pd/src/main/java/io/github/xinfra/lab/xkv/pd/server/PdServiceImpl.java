@@ -94,7 +94,6 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
     private final PdStateMachine state;
     private final Tso tso;
     private final SafePointService safePoint;
-    private final io.github.xinfra.lab.xkv.pd.state.OperatorQueue operators;
     private final DeadlockDetector deadlock;
     private final long clusterId;
     private final long nodeId;
@@ -121,72 +120,23 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
                          SafePointService safePoint,
                          long clusterId,
                          long nodeId) {
-        this(state, tso, safePoint, new io.github.xinfra.lab.xkv.pd.state.OperatorQueue(),
-                new DeadlockDetector(), clusterId, nodeId, "", java.util.List.of(),
-                new StoreStatsCache());
+        this(state, tso, safePoint, new DeadlockDetector(), clusterId, nodeId,
+                "", java.util.List.of(), new StoreStatsCache(), null);
     }
 
     public PdServiceImpl(PdStateMachine state,
                          Tso tso,
                          SafePointService safePoint,
-                         io.github.xinfra.lab.xkv.pd.state.OperatorQueue operators,
-                         long clusterId,
-                         long nodeId) {
-        this(state, tso, safePoint, operators, new DeadlockDetector(), clusterId, nodeId,
-                "", java.util.List.of(), new StoreStatsCache());
-    }
-
-    public PdServiceImpl(PdStateMachine state,
-                         Tso tso,
-                         SafePointService safePoint,
-                         io.github.xinfra.lab.xkv.pd.state.OperatorQueue operators,
                          DeadlockDetector deadlock,
                          long clusterId,
                          long nodeId) {
-        this(state, tso, safePoint, operators, deadlock, clusterId, nodeId,
-                "", java.util.List.of(), new StoreStatsCache());
+        this(state, tso, safePoint, deadlock, clusterId, nodeId,
+                "", java.util.List.of(), new StoreStatsCache(), null);
     }
 
     public PdServiceImpl(PdStateMachine state,
                          Tso tso,
                          SafePointService safePoint,
-                         io.github.xinfra.lab.xkv.pd.state.OperatorQueue operators,
-                         DeadlockDetector deadlock,
-                         long clusterId,
-                         long nodeId,
-                         String clientAddress,
-                         java.util.List<MemberInfo> members) {
-        this(state, tso, safePoint, operators, deadlock, clusterId, nodeId, clientAddress,
-                members, new StoreStatsCache());
-    }
-
-    public PdServiceImpl(PdStateMachine state,
-                         Tso tso,
-                         SafePointService safePoint,
-                         io.github.xinfra.lab.xkv.pd.state.OperatorQueue operators,
-                         DeadlockDetector deadlock,
-                         long clusterId,
-                         long nodeId,
-                         String clientAddress,
-                         java.util.List<MemberInfo> members,
-                         StoreStatsCache storeStatsCache) {
-        this.state = state;
-        this.tso = tso;
-        this.safePoint = safePoint;
-        this.operators = operators;
-        this.deadlock = deadlock;
-        this.clusterId = clusterId;
-        this.nodeId = nodeId;
-        this.clientAddress = clientAddress;
-        this.members = java.util.List.copyOf(members);
-        this.storeStatsCache = storeStatsCache;
-        this.placementRuleManager = null;
-    }
-
-    public PdServiceImpl(PdStateMachine state,
-                         Tso tso,
-                         SafePointService safePoint,
-                         io.github.xinfra.lab.xkv.pd.state.OperatorQueue operators,
                          DeadlockDetector deadlock,
                          long clusterId,
                          long nodeId,
@@ -197,7 +147,6 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
         this.state = state;
         this.tso = tso;
         this.safePoint = safePoint;
-        this.operators = operators;
         this.deadlock = deadlock;
         this.clusterId = clusterId;
         this.nodeId = nodeId;
@@ -207,7 +156,6 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
         this.placementRuleManager = placementRuleManager;
     }
 
-    /** Phase-0 stub constructor still used by {@link PdServer} until full wiring. */
     public PdServiceImpl() {
         this(new InMemoryPdStateMachine(), null, null, 1, 1);
     }
@@ -222,9 +170,6 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
     public void setOperatorController(io.github.xinfra.lab.xkv.pd.state.OperatorController oc) {
         this.operatorController = oc;
     }
-
-    /** Test / scheduler hook: enqueue operators visible to the next heartbeat. */
-    public io.github.xinfra.lab.xkv.pd.state.OperatorQueue operators() { return operators; }
 
     /** Diagnostic / scheduler hook: the global deadlock-detector instance. */
     public DeadlockDetector deadlock() { return deadlock; }
@@ -625,13 +570,33 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
             return;
         }
         var regionIds = new java.util.ArrayList<Long>();
+        var oc = operatorController;
         for (var keyBs : req.getSplitKeysList()) {
             byte[] key = keyBs.toByteArray();
             var regionOpt = state.getRegionByKey(key);
             if (regionOpt.isEmpty()) continue;
             var region = regionOpt.get();
-            operators.scheduleSplit(region.getId(),
-                    java.util.List.of(key), SplitRegion.Policy.USER_KEY);
+            if (oc != null) {
+                var sr = SplitRegion.newBuilder()
+                        .setPolicy(SplitRegion.Policy.USER_KEY)
+                        .addKeys(com.google.protobuf.ByteString.copyFrom(key))
+                        .build();
+                var resp = io.github.xinfra.lab.xkv.proto.Pdpb.RegionHeartbeatResponse.newBuilder()
+                        .setRegionId(region.getId())
+                        .setSplitRegion(sr)
+                        .build();
+                var storeIds = new java.util.HashSet<Long>();
+                for (var p : region.getPeersList()) storeIds.add(p.getStoreId());
+                long currentVersion = region.getRegionEpoch().getVersion();
+                var op = new io.github.xinfra.lab.xkv.pd.state.SimpleOperator(
+                        System.nanoTime(), region.getId(),
+                        io.github.xinfra.lab.xkv.pd.state.Operator.Kind.SPLIT,
+                        "admin-split: user-requested split",
+                        resp, storeIds,
+                        java.util.List.of(new io.github.xinfra.lab.xkv.pd.state.OperatorSteps.SplitRegionStep(currentVersion + 1)),
+                        io.github.xinfra.lab.xkv.pd.state.Operator.PRIORITY_ADMIN);
+                oc.addOperator(op);
+            }
             regionIds.add(region.getId());
         }
         obs.onNext(SplitRegionsResponse.newBuilder()
