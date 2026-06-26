@@ -37,6 +37,7 @@ public final class RaftCfKeys {
     public static final byte TYPE_REGION = 0x07;
     public static final byte TYPE_MAX_TS = 0x08;
     public static final byte TYPE_MERGE_STATE = 0x09;
+    public static final byte TYPE_PENDING_SNAP = 0x0A;
 
     private RaftCfKeys() {}
 
@@ -101,6 +102,10 @@ public final class RaftCfKeys {
 
     public static byte[] mergeStateKey(long regionId) {
         return regionTypePrefix(regionId, TYPE_MERGE_STATE);
+    }
+
+    public static byte[] pendingSnapKey(long regionId) {
+        return regionTypePrefix(regionId, TYPE_PENDING_SNAP);
     }
 
     public static byte[] confStateKey(long regionId) {

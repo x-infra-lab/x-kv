@@ -269,13 +269,13 @@ public final class PdRaftNode implements AutoCloseable {
     }
 
     private void applyReady(Ready ready) {
-        // Persist entries + hard state + snapshot atomically via writeBatched.
         var entries = ready.entries() != null ? ready.entries() : List.<Eraftpb.Entry>of();
         var hs = ready.hardState();
         if (hs != null && hs.equals(Eraftpb.HardState.getDefaultInstance())) hs = null;
         var snap = ready.snapshot();
         if (snap != null && (!snap.hasMetadata() || snap.getMetadata().getIndex() == 0)) snap = null;
 
+        // Phase A: persist entries + hard state + snapshot to raft engine.
         if (!entries.isEmpty() || hs != null || snap != null) {
             try {
                 storage.writeBatched(entries, hs, snap);
@@ -284,7 +284,15 @@ public final class PdRaftNode implements AutoCloseable {
             }
         }
 
-        // Install snapshot into state machine.
+        // Send messages immediately after persistence.
+        if (ready.messages() != null) {
+            for (var msg : ready.messages()) {
+                if (msg.getTo() == nodeId) continue;
+                transport.send(msg.getTo(), msg);
+            }
+        }
+
+        // Install snapshot into state machine (apply phase).
         if (snap != null) {
             try {
                 stateMachine.installSnapshot(snap.getData().toByteArray());
@@ -309,14 +317,6 @@ public final class PdRaftNode implements AutoCloseable {
                 appliedIndex = entry.getIndex();
                 storage.setApplied(appliedIndex);
                 maybeSnapshot();
-            }
-        }
-
-        // Send raft messages.
-        if (ready.messages() != null) {
-            for (var msg : ready.messages()) {
-                if (msg.getTo() == nodeId) continue;
-                transport.send(msg.getTo(), msg);
             }
         }
     }

@@ -153,6 +153,9 @@ public final class RegionMailbox {
             rawNode.bootstrap(peers);
         }
 
+        // Recover pending snapshot from a previous crash (if any).
+        raftStorage.installPendingSnapshot();
+
         // Wire transport receiver: step messages enqueue to the mailbox.
         transport.setReceiver(msg -> {
             events.offer(new StepEvent(msg));
@@ -234,7 +237,7 @@ public final class RegionMailbox {
     }
 
     // ================================================================
-    // Apply logic (mirrors RegionPeerImpl.applyReadyLocked)
+    // Apply logic (mirrors RegionPeerImpl.applyReady)
     // ================================================================
 
     private void applyReady(Ready ready) throws Exception {
@@ -254,43 +257,47 @@ public final class RegionMailbox {
             }
         }
 
-        boolean wroteAnything = false;
+        boolean logWrote = false;
 
-        // Phase 0: install snapshot.
-        if (ready.snapshot() != null && ready.snapshot().hasMetadata()
-                && ready.snapshot().getMetadata().getIndex() > 0) {
-            raftStorage.applySnapshot(ready.snapshot());
-            log.info("region={} applied snapshot at index={} term={}",
-                    regionId, ready.snapshot().getMetadata().getIndex(),
-                    ready.snapshot().getMetadata().getTerm());
-            wroteAnything = true;
-        }
-
-        // Phase A: stage log entries + hard state.
+        // Phase A: persist log entries + hard state + snapshot metadata.
         boolean haveEntries = ready.entries() != null && !ready.entries().isEmpty();
         boolean haveHs = ready.hardState() != null
                 && !ready.hardState().equals(Eraftpb.HardState.getDefaultInstance());
-        if (haveEntries || haveHs) {
+        boolean haveSnap = ready.snapshot() != null && ready.snapshot().hasMetadata()
+                && ready.snapshot().getMetadata().getIndex() > 0;
+
+        if (haveEntries || haveHs || haveSnap) {
             try (var logBatch = storage.newWriteBatch()) {
+                if (haveSnap) {
+                    raftStorage.saveSnapshotMeta(ready.snapshot(), logBatch);
+                }
                 raftStorage.appendFused(ready.entries(), ready.hardState(), logBatch);
                 storage.write(logBatch, false);
-                wroteAnything = true;
+                logWrote = true;
             }
         }
 
-        // Fsync for log entries (Phase 0 + A) before sending messages.
-        if (wroteAnything) {
+        // Fsync log — raft persistence contract.
+        if (logWrote) {
             storage.flushWal(true);
         }
 
-        raftStorage.postApply(ready.hardState());
+        raftStorage.updateCachedHardState(ready.hardState());
 
-        // Send raft messages promptly — don't wait for apply.
+        // Send raft messages (log durable, safe to ack).
         if (ready.messages() != null) {
             for (var msg : ready.messages()) {
                 if (msg.getTo() == selfPeerId) continue;
                 transport.send(msg.getTo(), msg);
             }
+        }
+
+        // Install snapshot KV data (apply phase).
+        if (haveSnap) {
+            raftStorage.installPendingSnapshot();
+            log.info("region={} applied snapshot at index={} term={}",
+                    regionId, ready.snapshot().getMetadata().getIndex(),
+                    ready.snapshot().getMetadata().getTerm());
         }
 
         // Register ReadIndex waiters (they will be drained after apply completes).

@@ -35,38 +35,27 @@ import java.util.concurrent.atomic.AtomicLong;
 /**
  * Default {@link RegionPeer} implementation.
  *
- * <h3>Apply loop = the load-bearing v2 invariant</h3>
+ * <h3>Ready loop — TiKV-style three-phase pipeline</h3>
  *
- * <p>Each iteration of {@link #readyLoop} pulls one {@link Ready} from
- * x-raft-lib and writes it to disk in TWO phases:
+ * <p>Each iteration of {@link #readyLoop} pulls one {@link Ready} and
+ * processes it in three phases:
  *
  * <ol>
- *   <li><b>Phase A — log durability.</b> One batch holding the new entries
- *       (from {@code ready.entries()}) and hard state (from
- *       {@code ready.hardState()}); one {@code write(batch, sync=true)}.
- *       This satisfies the raft library's persistence contract before any
- *       MsgAppResp goes out.</li>
+ *   <li><b>Phase A — persist.</b> Entries + hard state + snapshot metadata
+ *       written in one batch (sync=false), then a single flushWal. Raft
+ *       messages are sent immediately after this fsync — the persistence
+ *       contract is satisfied so MsgAppResp is safe to dispatch.</li>
+ *   <li><b>Snapshot KV install</b> (rare). After messages are sent, the
+ *       pending snapshot's user-data is installed into KV CFs.</li>
  *   <li><b>Phase B — apply.</b> For EACH committed entry: one batch
  *       containing that entry's business CF mutations AND its
- *       {@code appliedIndex} bump; one {@code write(batch, sync=true)}.</li>
+ *       appliedIndex bump (sync=false). A second flushWal at the end
+ *       durably commits all applied state.</li>
  * </ol>
  *
- * <p><b>Why per-entry fsync in Phase B</b>: the MVCC apply path reads
- * RocksDB state (via {@code engine.get}) when checking prewrite conflicts.
- * If two committed entries shared a batch, entry N's reader would see
- * pre-Ready RocksDB state and miss entry N-1's staged-but-unflushed lock CF
- * writes — two concurrent prewrites for the same key could both pass their
- * conflict checks. Per-entry fsync flushes entry N-1 before entry N's
- * MvccTxn runs, restoring the conflict-detection invariant.
- *
- * <p>Inv-1 ("appliedIndex paired atomically with business data") still
- * holds at the entry granularity — they share one batch, one fsync. A crash
- * mid-Ready cannot leave appliedIndex out of sync with the data.
- *
- * <p>v1 split appliedIndex and business data into two RocksDB instances and
- * two fsyncs; a crash between them reported a committed transaction as not
- * committed. The unified-CF design here makes that class of bug impossible
- * by construction.
+ * <p>Sending messages between Phase A and Phase B (rather than after) is
+ * the key latency optimization: MsgAppResp reaches the leader while apply
+ * proceeds locally, keeping the raft pipeline full.
  */
 public final class RegionPeerImpl implements RegionPeer {
     private static final Logger log = LoggerFactory.getLogger(RegionPeerImpl.class);
@@ -259,6 +248,9 @@ public final class RegionPeerImpl implements RegionPeer {
                         regionId, self.getId(), isLeader, newLeader);
             }
         });
+
+        // Recover pending snapshot from a previous crash (if any).
+        raftStorage.installPendingSnapshot();
 
         // Reader loop.
         this.readyThread = new Thread(this::readyLoop, "region-" + regionId + "-ready");
@@ -497,100 +489,55 @@ public final class RegionPeerImpl implements RegionPeer {
     }
 
     private void applyReady(Ready ready) throws Exception {
-        // We DON'T take the coarse writer lock here anymore. Each committed
-        // entry takes per-stripe writer locks for ONLY the keys it mutates
-        // (see {@link ProposalKeyScope#peekKeys}), so reads on disjoint keys
-        // run concurrently with apply — the main throughput win versus the
-        // coarse-lock design that preceded this.
-        //
-        // The SI invariant ("reader's observe HAPPENS-BEFORE the prewrite's
-        // max_ts read") is still preserved per key: a reader on key K holds
-        // stripe(K)'s read lock for the observe; a subsequent prewrite on K
-        // takes stripe(K)'s write lock and so cannot read max_ts until that
-        // observe has retired.
-        //
-        // Region-wide entries (GC, full-range resolve, delete-range, snapshot
-        // installs) fall back to the coarse writer lock — see
-        // {@link #applyOneEntry} for the dispatch.
-        applyReadyLocked(ready);
-    }
-
-    private void applyReadyLocked(Ready ready) throws Exception {
         var pending = new ArrayList<PendingDispatch>();
         var confChanges = new ArrayList<Eraftpb.ConfChangeV2>();
         var postFlushCallbacks = new ArrayList<Runnable>();
-        boolean wroteAnything = false;
+        boolean logWrote = false;
+        boolean applyWrote = false;
 
-        // === Phase 0: install incoming snapshot (if any) ===
-        //
-        // When the leader sends a snapshot (MsgSnapshot), x-raft-lib surfaces
-        // it through ready.snapshot(). We must install user-data CFs + raft
-        // meta BEFORE processing log entries or advancing the raft state.
-        if (ready.snapshot() != null && ready.snapshot().hasMetadata()
-                && ready.snapshot().getMetadata().getIndex() > 0) {
-            raftStorage.applySnapshot(ready.snapshot());
-            log.info("region={} applied snapshot at index={} term={}",
-                    regionId, ready.snapshot().getMetadata().getIndex(),
-                    ready.snapshot().getMetadata().getTerm());
-            wroteAnything = true;
-        }
-
-        // === Phase A: stage new log entries + hard state ===
-        //
-        // We write with sync=false: the entries land in memtable + WAL buffer
-        // immediately and become visible to subsequent reads, but the WAL
-        // fsync is deferred to the final flushWal at the end of this round.
+        // === Phase A: persist log entries + hard state + snapshot metadata ===
         boolean haveEntries = ready.entries() != null && !ready.entries().isEmpty();
         boolean haveHs = ready.hardState() != null
                 && !ready.hardState().equals(Eraftpb.HardState.getDefaultInstance());
-        if (haveEntries || haveHs) {
+        boolean haveSnap = ready.snapshot() != null && ready.snapshot().hasMetadata()
+                && ready.snapshot().getMetadata().getIndex() > 0;
+
+        if (haveEntries || haveHs || haveSnap) {
             try (var logBatch = storage.newWriteBatch()) {
+                if (haveSnap) {
+                    raftStorage.saveSnapshotMeta(ready.snapshot(), logBatch);
+                }
                 raftStorage.appendFused(ready.entries(), ready.hardState(), logBatch);
                 storage.write(logBatch, false);
-                wroteAnything = true;
+                logWrote = true;
             }
         }
 
-        // === Phase B: apply committed entries — one batch PER entry ===
-        //
-        // Critical for SI under concurrency: the MvccApplyHandler reads
-        // RocksDB state (via engine.get) when checking conflicts. If we
-        // packed multiple entries into one batch, entry N's reader would see
-        // RocksDB state from BEFORE this Ready cycle and miss entry N-1's
-        // pending lock CF writes — two concurrent prewrites on the same key
-        // could both pass their checkPrewrite.
-        //
-        // sync=false per entry is sufficient: RocksDB applies the batch to
-        // its memtable on return from write(), so entry N+1's get() sees
-        // entry N's writes. Durability is provided by the single flushWal
-        // call below.
-        //
-        // Inv-1 still holds at the ENTRY level: applied_index is bumped in
-        // the SAME batch as that entry's business mutations. The flushWal
-        // fsyncs them as a unit at end-of-round, so a crash either persists
-        // the whole batch (entry data + applied_index advance) or nothing.
-        //
-        // Per-entry per-stripe writer locks: we look up the entry's key
-        // footprint with {@link ProposalKeyScope#peekKeys} and acquire ONLY
-        // the corresponding stripe write-locks. Region-wide footprints
-        // (GC / range delete / unscoped resolve) take the coarse lock.
-        if (ready.committedEntries() != null) {
-            for (var entry : ready.committedEntries()) {
-                long idx = entry.getIndex();
-                if (idx <= raftEngine.appliedIndex()) continue; // already applied (replay)
+        // === Fsync log — raft persistence contract ===
+        if (logWrote) {
+            storage.flushWal(true);
+        }
 
-                if (applyOneEntry(entry, pending, confChanges, postFlushCallbacks, idx)) {
-                    wroteAnything = true;
-                }
+        // === Update in-memory hard state cache ===
+        raftStorage.updateCachedHardState(ready.hardState());
+
+        // === Send raft messages (log durable, safe to ack) ===
+        if (ready.messages() != null) {
+            for (var msg : ready.messages()) {
+                if (msg.getTo() == self.getId()) continue;
+                transport.send(msg.getTo(), msg);
             }
+        }
+
+        // === Install snapshot KV data (apply phase, after messages sent) ===
+        if (haveSnap) {
+            raftStorage.installPendingSnapshot();
+            log.info("region={} applied snapshot at index={} term={}",
+                    regionId, ready.snapshot().getMetadata().getIndex(),
+                    ready.snapshot().getMetadata().getTerm());
         }
 
         // === ReadIndex processing ===
-        //
-        // Each ReadState returned by the raft library represents a completed
-        // readIndex quorum check. Its index() is the commit index at the time
-        // the leader confirmed its authority. We can serve the read once
-        // appliedIndex >= that index.
         if (ready.readStates() != null) {
             for (var rs : ready.readStates()) {
                 var key = ByteBuffer.wrap(rs.requestCtx());
@@ -605,69 +552,53 @@ public final class RegionPeerImpl implements RegionPeer {
             }
         }
 
-        // Drain readIndex waiters whose target index is now satisfied.
-        drainReadIndexWaiters();
+        // === Phase B: apply committed entries (one batch per entry, sync=false) ===
+        if (ready.committedEntries() != null) {
+            for (var entry : ready.committedEntries()) {
+                long idx = entry.getIndex();
+                if (idx <= raftEngine.appliedIndex()) continue;
+                if (applyOneEntry(entry, pending, confChanges, postFlushCallbacks, idx)) {
+                    applyWrote = true;
+                }
+            }
+        }
 
-        // === Opportunistic max_ts persistence ===
-        //
-        // The apply round runs under cm.withWriter() — ALL stripe write
-        // locks are held, so NO reader can hold a read lock and bump max_ts
-        // concurrently. The current value therefore reflects every observe()
-        // call that completed before this round started. Persisting it now
-        // (in this round's fsync) ensures a restarted leader resumes with
-        // at least this floor and won't serve a prewrite whose commit_ts
-        // sinks below an in-flight reader's read_ts.
-        //
-        // Reads that arrive AFTER this round are NOT captured here; they
-        // get the next round's flush, or — for an idle leader — the leader
-        // change refresh path (PD TSO). The window of loss is bounded by
-        // the inter-apply interval, which is sub-second under normal load.
+        // === max_ts persistence ===
         if (cm != null) {
             long inMemory = cm.maxTs().current();
             if (inMemory > raftEngine.persistedMaxTs()) {
                 try (var mtsBatch = storage.newWriteBatch()) {
                     raftEngine.saveMaxTs(inMemory, mtsBatch);
                     storage.write(mtsBatch, false);
-                    wroteAnything = true;
+                    applyWrote = true;
                 }
             }
         }
 
-        // === Single fsync for the entire Ready round (durability barrier) ===
-        //
-        // Must complete BEFORE this method returns so that node.advance() in
-        // the caller doesn't tell raft "persisted" until the data is on disk.
-        if (wroteAnything) {
+        // === Fsync apply data ===
+        if (applyWrote) {
             storage.flushWal(true);
         }
 
+        // === Post-flush callbacks ===
         for (var cb : postFlushCallbacks) {
             try { cb.run(); }
             catch (Throwable t) { log.warn("region={} postFlush callback failed", regionId, t); }
         }
 
-        // === Post-write fan-out ===
-
-        raftStorage.postApply(ready.hardState());
-
+        // === Complete pending proposals ===
         for (var pd : pending) {
             var fut = pendingProposals.remove(pd.proposeSeq);
             if (fut != null) fut.complete(pd.result);
         }
 
-        // Send raft messages before conf-change so the peer topology
-        // is stable while messages prepared by this Ready are dispatched.
-        if (ready.messages() != null) {
-            for (var msg : ready.messages()) {
-                if (msg.getTo() == self.getId()) continue;
-                transport.send(msg.getTo(), msg);
-            }
-        }
-
-        // Conf-change apply (after messages are dispatched).
+        // === Conf-change apply ===
         for (var cc : confChanges) {
             applyConfChangeOne(cc);
         }
+
+        // === Drain readIndex waiters (apply may have advanced appliedIndex) ===
+        drainReadIndexWaiters();
     }
 
     /**

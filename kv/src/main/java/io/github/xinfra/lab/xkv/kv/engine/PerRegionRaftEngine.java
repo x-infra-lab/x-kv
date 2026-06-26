@@ -40,6 +40,7 @@ public final class PerRegionRaftEngine implements RaftEngine {
     private volatile SnapshotMeta lastSnapshotMeta;
     private volatile long persistedMaxTs;
     private volatile byte[] mergeState;       // null = not merging; non-null = serialized target descriptor
+    private volatile boolean hasPendingSnapshot;
 
     /** clientId → highest seen requestId. Reload from disk on open. */
     private final ConcurrentHashMap<Long, Long> dedupCache = new ConcurrentHashMap<>();
@@ -86,6 +87,10 @@ public final class PerRegionRaftEngine implements RaftEngine {
         // gate survives restart so a leader-crash mid-merge doesn't let
         // writes slip through on the next leader's apply.
         this.mergeState = storage.get(StorageEngine.Cf.RAFT, mergeStateKey(regionId));
+
+        // Pending snapshot: if a crash happened after persist but before KV install.
+        byte[] pendingSnap = storage.get(StorageEngine.Cf.RAFT, pendingSnapKey(regionId));
+        this.hasPendingSnapshot = (pendingSnap != null && pendingSnap.length > 0);
 
         // Index range: scan the log type prefix.
         scanIndexRange();
@@ -244,6 +249,24 @@ public final class PerRegionRaftEngine implements RaftEngine {
     public void saveSnapshotMeta(SnapshotMeta meta, StorageEngine.WriteBatch batch) {
         batch.put(StorageEngine.Cf.RAFT, snapshotMetaKey(regionId), encodeSnapshotMeta(meta));
         this.lastSnapshotMeta = meta;
+    }
+
+    // ---- pending snapshot ----
+
+    public boolean hasPendingSnapshot() { return hasPendingSnapshot; }
+
+    public void savePendingSnapshot(byte[] snapData, StorageEngine.WriteBatch batch) {
+        batch.put(StorageEngine.Cf.RAFT, pendingSnapKey(regionId), snapData);
+        this.hasPendingSnapshot = true;
+    }
+
+    public byte[] loadPendingSnapshot() {
+        return storage.get(StorageEngine.Cf.RAFT, pendingSnapKey(regionId));
+    }
+
+    public void clearPendingSnapshot(StorageEngine.WriteBatch batch) {
+        batch.delete(StorageEngine.Cf.RAFT, pendingSnapKey(regionId));
+        this.hasPendingSnapshot = false;
     }
 
     /** Value reloaded from disk on startup — the apply loop wrote this. */

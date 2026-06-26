@@ -217,58 +217,84 @@ public final class RegionRaftStorage implements Storage {
         }
     }
 
-    @Override
-    public void applySnapshot(Eraftpb.Snapshot snap) throws RaftException {
+    /**
+     * Persist snapshot raft metadata into the caller's batch. Does NOT install
+     * KV user data — that is deferred to {@link #installPendingSnapshot()} so
+     * raft messages can be sent immediately after the persist-phase fsync.
+     *
+     * <p>The snapshot's raw data bytes are stored in a pending key; on restart
+     * after a crash between persist and install, the pending key triggers
+     * re-installation.
+     */
+    public void saveSnapshotMeta(Eraftpb.Snapshot snap, StorageEngine.WriteBatch batch) throws RaftException {
         if (snap == null || !snap.hasMetadata()) {
-            throw new RaftException(RaftException.Code.UNAVAILABLE, "applySnapshot: no metadata");
+            throw new RaftException(RaftException.Code.UNAVAILABLE, "saveSnapshotMeta: no metadata");
         }
         long snapIndex = snap.getMetadata().getIndex();
-        long snapTerm  = snap.getMetadata().getTerm();
+        long snapTerm = snap.getMetadata().getTerm();
         if (snapIndex < raft.firstIndex() - 1) {
             throw RaftException.ErrSnapOutOfDate;
         }
 
-        // Step 1: install user-data CFs from the snapshot's `data` envelope.
-        // We do this BEFORE writing raft meta so that on a mid-install crash,
-        // the next startup still has the OLD raft meta and will be re-served
-        // a snapshot by the leader (idempotent restart).
+        batch.deleteRange(StorageEngine.Cf.RAFT,
+                RaftCfKeys.logKey(regionId(), 0),
+                RaftCfKeys.logKey(regionId(), Long.MAX_VALUE));
+        raft.saveSnapshotMeta(new io.github.xinfra.lab.xkv.kv.engine.RaftEngine.SnapshotMeta(
+                snapTerm, snapIndex, null, null), batch);
+        raft.saveAppliedIndex(snapIndex, batch);
+
+        var cs = snap.getMetadata().getConfState();
+        batch.put(StorageEngine.Cf.RAFT, RaftCfKeys.confStateKey(regionId()), cs.toByteArray());
+        this.cachedConfState = cs;
+
         byte[] dataBytes = snap.getData().toByteArray();
-        if (snapshotEngine != null && dataBytes.length > 0) {
+        if (dataBytes.length > 0) {
+            raft.savePendingSnapshot(dataBytes, batch);
+        }
+    }
+
+    /**
+     * Install KV user data from a previously persisted pending snapshot.
+     * Called in the apply phase (after messages are sent) or on restart
+     * recovery.
+     */
+    public void installPendingSnapshot() {
+        if (!raft.hasPendingSnapshot()) return;
+        byte[] dataBytes = raft.loadPendingSnapshot();
+        if (dataBytes == null || dataBytes.length == 0) {
+            try (var b = storage.newWriteBatch()) {
+                raft.clearPendingSnapshot(b);
+                storage.write(b, false);
+            }
+            return;
+        }
+
+        if (snapshotEngine != null) {
             try {
                 var chunks = decodeChunkEnvelope(dataBytes);
                 snapshotEngine.receiveAndInstall(regionId(), chunks);
             } catch (Throwable t) {
-                log.warn("region={} applySnapshot user-data install failed: {}",
-                        regionId(), t.getMessage());
-                throw new RaftException(RaftException.Code.UNAVAILABLE,
-                        "user-data install: " + t.getMessage(), t);
+                log.warn("region={} installPendingSnapshot failed: {}", regionId(), t.getMessage());
+                throw new RuntimeException("snapshot KV install failed", t);
             }
         }
 
-        // Step 2: install raft meta. After this point the local view says
-        // "I'm at applied=snapIndex" — must come AFTER the user data is in
-        // place or readers between these two writes would see stale state.
         try (var b = storage.newWriteBatch()) {
-            // Wipe log entries; the snapshot replaces them.
-            b.deleteRange(StorageEngine.Cf.RAFT,
-                    RaftCfKeys.logKey(regionId(), 0),
-                    RaftCfKeys.logKey(regionId(), Long.MAX_VALUE));
-            raft.saveSnapshotMeta(new io.github.xinfra.lab.xkv.kv.engine.RaftEngine.SnapshotMeta(
-                    snapTerm, snapIndex, null, null), b);
-            raft.saveAppliedIndex(snapIndex, b);
-            // Also update first/lastIndex so the in-memory engine cache matches:
-            // after a snapshot install, firstIndex = snapIndex + 1 and lastIndex
-            // >= snapIndex (no log entries exist below). The engine recalculates
-            // its scan range on next access; for in-memory consistency we bump
-            // through saveSnapshotMeta which leaves it to the engine.
-            // ConfState: persisted as a separate entry alongside snapshot meta.
-            var cs = snap.getMetadata().getConfState();
-            b.put(StorageEngine.Cf.RAFT, RaftCfKeys.confStateKey(regionId()), cs.toByteArray());
-            this.cachedConfState = cs;
+            raft.clearPendingSnapshot(b);
             storage.write(b, true);
         }
-        log.info("region={} applySnapshot installed at index={} term={}",
-                regionId(), snapIndex, snapTerm);
+    }
+
+    @Override
+    public void applySnapshot(Eraftpb.Snapshot snap) throws RaftException {
+        // Legacy path — delegates to the two-phase split for callers that
+        // still use the Storage SPI directly (e.g. RawNode internal calls).
+        try (var batch = storage.newWriteBatch()) {
+            saveSnapshotMeta(snap, batch);
+            storage.write(batch, false);
+        }
+        storage.flushWal(true);
+        installPendingSnapshot();
     }
 
     private static java.util.List<io.github.xinfra.lab.xkv.proto.KvServerpb.SnapshotChunk>
@@ -357,13 +383,9 @@ public final class RegionRaftStorage implements Storage {
     // ===== Fused single-batch path used by RegionPeerImpl =====
 
     /**
-     * The Inv-1 entrypoint. Stages every persistence the apply round needs
-     * — entries, hard state, applied index, snapshot meta, and arbitrary
-     * business mutations the caller has already added — into one batch
-     * supplied by the caller, then the caller does ONE
-     * {@code engine.write(batch, sync=true)}. The cached hard state is
-     * updated in-memory after the caller's write succeeds; the caller
-     * notifies us via {@link #postApply}.
+     * Stages entries and hard state into the caller's batch. After the
+     * batch is written and fsynced, the caller must invoke
+     * {@link #updateCachedHardState} to sync the in-memory cache.
      */
     public void appendFused(List<Eraftpb.Entry> entries,
                             Eraftpb.HardState hs,
@@ -385,11 +407,10 @@ public final class RegionRaftStorage implements Storage {
     }
 
     /**
-     * Called by RegionPeerImpl after the fused batch was successfully
-     * written. Synchronizes the in-memory hard-state cache with what was
-     * just persisted.
+     * Synchronize the in-memory hard-state cache with what was just persisted.
+     * Called after the persist-phase batch (entries + hardState) is fsynced.
      */
-    public void postApply(Eraftpb.HardState hs) {
+    public void updateCachedHardState(Eraftpb.HardState hs) {
         if (hs != null && !hs.equals(Eraftpb.HardState.getDefaultInstance())) {
             this.cachedHardState = hs;
         }
