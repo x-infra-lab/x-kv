@@ -4,11 +4,16 @@ import io.github.xinfra.lab.xkv.proto.Tipb;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.zip.CRC32;
 
 public final class ExprEvaluator {
     private ExprEvaluator() {}
@@ -333,6 +338,7 @@ public final class ExprEvaluator {
 
     private static CopDatum evalScalarFunction(String name, List<CopDatum> args) {
         return switch (name) {
+            // --- Control flow ---
             case "IF" -> args.size() >= 3 ? (args.get(0).toBoolean() ? args.get(1) : args.get(2)) : CopDatum.nil();
             case "IFNULL" -> args.size() >= 2 ? (args.get(0).isNull() ? args.get(1) : args.get(0)) : CopDatum.nil();
             case "NULLIF" -> args.size() >= 2 && CopDatumComparator.compare(args.get(0), args.get(1)) == 0
@@ -341,15 +347,122 @@ public final class ExprEvaluator {
                 for (CopDatum d : args) if (!d.isNull()) yield d;
                 yield CopDatum.nil();
             }
+
+            // --- String functions ---
             case "CONCAT" -> {
                 StringBuilder sb = new StringBuilder();
                 for (CopDatum d : args) { if (d.isNull()) yield CopDatum.nil(); sb.append(d.toStringValue()); }
+                yield CopDatum.of(sb.toString());
+            }
+            case "CONCAT_WS" -> {
+                if (args.isEmpty() || args.get(0).isNull()) yield CopDatum.nil();
+                String sep = args.get(0).toStringValue();
+                StringBuilder sb = new StringBuilder();
+                boolean first = true;
+                for (int i = 1; i < args.size(); i++) {
+                    if (args.get(i).isNull()) continue;
+                    if (!first) sb.append(sep);
+                    sb.append(args.get(i).toStringValue());
+                    first = false;
+                }
                 yield CopDatum.of(sb.toString());
             }
             case "LENGTH", "CHAR_LENGTH", "CHARACTER_LENGTH" -> nullSafe1(args, d -> CopDatum.of(d.toStringValue().length()));
             case "UPPER", "UCASE" -> nullSafe1(args, d -> CopDatum.of(d.toStringValue().toUpperCase()));
             case "LOWER", "LCASE" -> nullSafe1(args, d -> CopDatum.of(d.toStringValue().toLowerCase()));
             case "TRIM" -> nullSafe1(args, d -> CopDatum.of(d.toStringValue().trim()));
+            case "LTRIM" -> nullSafe1(args, d -> CopDatum.of(d.toStringValue().stripLeading()));
+            case "RTRIM" -> nullSafe1(args, d -> CopDatum.of(d.toStringValue().stripTrailing()));
+            case "REVERSE" -> nullSafe1(args, d -> CopDatum.of(new StringBuilder(d.toStringValue()).reverse().toString()));
+            case "SPACE" -> nullSafe1(args, d -> {
+                int n = (int) Math.min(d.toLong(), 65535);
+                return CopDatum.of(" ".repeat(Math.max(0, n)));
+            });
+            case "REPEAT" -> {
+                if (args.size() < 2 || args.get(0).isNull() || args.get(1).isNull()) yield CopDatum.nil();
+                int n = (int) Math.min(args.get(1).toLong(), 65535);
+                yield n <= 0 ? CopDatum.of("") : CopDatum.of(args.get(0).toStringValue().repeat(n));
+            }
+            case "SUBSTR", "SUBSTRING", "MID" -> {
+                if (args.isEmpty() || args.get(0).isNull()) yield CopDatum.nil();
+                String s = args.get(0).toStringValue();
+                int pos = args.size() >= 2 ? (int) args.get(1).toLong() : 1;
+                int len = args.size() >= 3 ? (int) args.get(2).toLong() : s.length();
+                if (pos > 0) pos--;
+                else if (pos < 0) pos = s.length() + pos;
+                else { yield CopDatum.of(""); }
+                if (pos < 0) pos = 0;
+                int end = Math.min(pos + len, s.length());
+                yield pos >= s.length() ? CopDatum.of("") : CopDatum.of(s.substring(pos, end));
+            }
+            case "LEFT" -> {
+                if (args.size() < 2 || args.get(0).isNull() || args.get(1).isNull()) yield CopDatum.nil();
+                String s = args.get(0).toStringValue();
+                int n = (int) args.get(1).toLong();
+                yield CopDatum.of(n >= s.length() ? s : s.substring(0, Math.max(0, n)));
+            }
+            case "RIGHT" -> {
+                if (args.size() < 2 || args.get(0).isNull() || args.get(1).isNull()) yield CopDatum.nil();
+                String s = args.get(0).toStringValue();
+                int n = (int) args.get(1).toLong();
+                yield CopDatum.of(n >= s.length() ? s : s.substring(s.length() - n));
+            }
+            case "REPLACE" -> {
+                if (args.size() < 3 || args.get(0).isNull()) yield CopDatum.nil();
+                yield CopDatum.of(args.get(0).toStringValue()
+                        .replace(args.get(1).toStringValue(), args.get(2).toStringValue()));
+            }
+            case "LPAD" -> {
+                if (args.size() < 3 || args.get(0).isNull()) yield CopDatum.nil();
+                String s = args.get(0).toStringValue();
+                int targetLen = (int) args.get(1).toLong();
+                String pad = args.get(2).toStringValue();
+                if (pad.isEmpty() || targetLen < 0) yield CopDatum.nil();
+                if (s.length() >= targetLen) yield CopDatum.of(s.substring(0, targetLen));
+                StringBuilder sb = new StringBuilder();
+                while (sb.length() + s.length() < targetLen) sb.append(pad);
+                sb.append(s);
+                yield CopDatum.of(sb.substring(sb.length() - targetLen));
+            }
+            case "RPAD" -> {
+                if (args.size() < 3 || args.get(0).isNull()) yield CopDatum.nil();
+                String s = args.get(0).toStringValue();
+                int targetLen = (int) args.get(1).toLong();
+                String pad = args.get(2).toStringValue();
+                if (pad.isEmpty() || targetLen < 0) yield CopDatum.nil();
+                if (s.length() >= targetLen) yield CopDatum.of(s.substring(0, targetLen));
+                StringBuilder sb = new StringBuilder(s);
+                while (sb.length() < targetLen) sb.append(pad);
+                yield CopDatum.of(sb.substring(0, targetLen));
+            }
+            case "LOCATE", "INSTR", "POSITION" -> {
+                if (args.size() < 2 || args.get(0).isNull() || args.get(1).isNull()) yield CopDatum.nil();
+                String substr = args.get(0).toStringValue();
+                String str = args.get(1).toStringValue();
+                int startPos = args.size() >= 3 ? (int) args.get(2).toLong() - 1 : 0;
+                int idx = str.indexOf(substr, Math.max(0, startPos));
+                yield CopDatum.of((long) (idx + 1));
+            }
+            case "HEX" -> nullSafe1(args, d -> {
+                if (d instanceof CopDatum.IntVal i) return CopDatum.of(Long.toHexString(i.value()).toUpperCase());
+                StringBuilder sb = new StringBuilder();
+                for (byte b : d.toStringValue().getBytes()) sb.append(String.format("%02X", b & 0xFF));
+                return CopDatum.of(sb.toString());
+            });
+            case "UNHEX" -> nullSafe1(args, d -> {
+                String hex = d.toStringValue();
+                if (hex.length() % 2 != 0) return CopDatum.nil();
+                byte[] bytes = new byte[hex.length() / 2];
+                for (int i = 0; i < bytes.length; i++) {
+                    int hi = Character.digit(hex.charAt(i * 2), 16);
+                    int lo = Character.digit(hex.charAt(i * 2 + 1), 16);
+                    if (hi < 0 || lo < 0) return CopDatum.nil();
+                    bytes[i] = (byte) ((hi << 4) | lo);
+                }
+                return CopDatum.of(new String(bytes));
+            });
+
+            // --- Math functions ---
             case "ABS" -> nullSafe1(args, d -> {
                 if (d instanceof CopDatum.IntVal i) {
                     long v = i.value();
@@ -367,15 +480,153 @@ public final class ExprEvaluator {
                 BigDecimal bd = BigDecimal.valueOf(v).setScale(scale, RoundingMode.HALF_UP);
                 yield scale == 0 ? CopDatum.of(bd.longValue()) : CopDatum.of(bd.doubleValue());
             }
+            case "TRUNCATE" -> {
+                if (args.size() < 2 || args.get(0).isNull() || args.get(1).isNull()) yield CopDatum.nil();
+                double v = args.get(0).toDouble();
+                int scale = (int) args.get(1).toLong();
+                BigDecimal bd = BigDecimal.valueOf(v).setScale(scale, RoundingMode.DOWN);
+                yield scale == 0 ? CopDatum.of(bd.longValue()) : CopDatum.of(bd.doubleValue());
+            }
             case "MOD" -> {
                 if (args.size() < 2 || args.get(0).isNull() || args.get(1).isNull()) yield CopDatum.nil();
                 long b = args.get(1).toLong();
                 yield b == 0 ? CopDatum.nil() : CopDatum.of(args.get(0).toLong() % b);
             }
+            case "SQRT" -> nullSafe1(args, d -> {
+                double v = d.toDouble();
+                return v < 0 ? CopDatum.nil() : CopDatum.of(Math.sqrt(v));
+            });
+            case "POW", "POWER" -> {
+                if (args.size() < 2 || args.get(0).isNull() || args.get(1).isNull()) yield CopDatum.nil();
+                yield CopDatum.of(Math.pow(args.get(0).toDouble(), args.get(1).toDouble()));
+            }
+            case "LOG" -> {
+                if (args.isEmpty() || args.get(0).isNull()) yield CopDatum.nil();
+                if (args.size() >= 2) {
+                    if (args.get(1).isNull()) yield CopDatum.nil();
+                    double base = args.get(0).toDouble();
+                    double val = args.get(1).toDouble();
+                    yield (base <= 0 || base == 1 || val <= 0) ? CopDatum.nil() : CopDatum.of(Math.log(val) / Math.log(base));
+                }
+                double val = args.get(0).toDouble();
+                yield val <= 0 ? CopDatum.nil() : CopDatum.of(Math.log(val));
+            }
+            case "LOG2" -> nullSafe1(args, d -> {
+                double v = d.toDouble();
+                return v <= 0 ? CopDatum.nil() : CopDatum.of(Math.log(v) / Math.log(2));
+            });
+            case "LOG10", "LOG_10" -> nullSafe1(args, d -> {
+                double v = d.toDouble();
+                return v <= 0 ? CopDatum.nil() : CopDatum.of(Math.log10(v));
+            });
+            case "EXP" -> nullSafe1(args, d -> CopDatum.of(Math.exp(d.toDouble())));
+            case "SIGN" -> nullSafe1(args, d -> {
+                double v = d.toDouble();
+                return CopDatum.of(v > 0 ? 1L : v < 0 ? -1L : 0L);
+            });
+            case "PI" -> CopDatum.of(Math.PI);
+            case "RAND" -> CopDatum.of(ThreadLocalRandom.current().nextDouble());
+            case "CRC32" -> nullSafe1(args, d -> {
+                CRC32 crc = new CRC32();
+                crc.update(d.toStringValue().getBytes());
+                return CopDatum.of(crc.getValue());
+            });
+            case "GREATEST" -> {
+                CopDatum max = null;
+                for (CopDatum d : args) {
+                    if (d.isNull()) yield CopDatum.nil();
+                    if (max == null || CopDatumComparator.compare(d, max) > 0) max = d;
+                }
+                yield max == null ? CopDatum.nil() : max;
+            }
+            case "LEAST" -> {
+                CopDatum min = null;
+                for (CopDatum d : args) {
+                    if (d.isNull()) yield CopDatum.nil();
+                    if (min == null || CopDatumComparator.compare(d, min) < 0) min = d;
+                }
+                yield min == null ? CopDatum.nil() : min;
+            }
+
+            // --- Date/time functions ---
             case "NOW", "CURRENT_TIMESTAMP" -> CopDatum.of(LocalDateTime.now());
+            case "CURDATE", "CURRENT_DATE" -> CopDatum.of(LocalDate.now().atStartOfDay());
+            case "CURTIME", "CURRENT_TIME" -> CopDatum.of(LocalTime.now().toString());
+            case "YEAR" -> nullSafe1(args, d -> CopDatum.of((long) toDateTime(d).getYear()));
+            case "MONTH" -> nullSafe1(args, d -> CopDatum.of((long) toDateTime(d).getMonthValue()));
+            case "DAY", "DAYOFMONTH" -> nullSafe1(args, d -> CopDatum.of((long) toDateTime(d).getDayOfMonth()));
+            case "HOUR" -> nullSafe1(args, d -> CopDatum.of((long) toDateTime(d).getHour()));
+            case "MINUTE" -> nullSafe1(args, d -> CopDatum.of((long) toDateTime(d).getMinute()));
+            case "SECOND" -> nullSafe1(args, d -> CopDatum.of((long) toDateTime(d).getSecond()));
+            case "DAYOFWEEK" -> nullSafe1(args, d -> CopDatum.of((long) (toDateTime(d).getDayOfWeek().getValue() % 7) + 1));
+            case "DAYOFYEAR" -> nullSafe1(args, d -> CopDatum.of((long) toDateTime(d).getDayOfYear()));
+            case "DATEDIFF" -> {
+                if (args.size() < 2 || args.get(0).isNull() || args.get(1).isNull()) yield CopDatum.nil();
+                LocalDateTime a = toDateTime(args.get(0));
+                LocalDateTime b = toDateTime(args.get(1));
+                yield CopDatum.of(ChronoUnit.DAYS.between(b.toLocalDate(), a.toLocalDate()));
+            }
+            case "DATE_ADD", "ADDDATE" -> {
+                if (args.size() < 2 || args.get(0).isNull() || args.get(1).isNull()) yield CopDatum.nil();
+                LocalDateTime dt = toDateTime(args.get(0));
+                long days = args.get(1).toLong();
+                yield CopDatum.of(dt.plusDays(days));
+            }
+            case "DATE_SUB", "SUBDATE" -> {
+                if (args.size() < 2 || args.get(0).isNull() || args.get(1).isNull()) yield CopDatum.nil();
+                LocalDateTime dt = toDateTime(args.get(0));
+                long days = args.get(1).toLong();
+                yield CopDatum.of(dt.minusDays(days));
+            }
+            case "UNIX_TIMESTAMP" -> {
+                if (args.isEmpty()) yield CopDatum.of(System.currentTimeMillis() / 1000L);
+                if (args.get(0).isNull()) yield CopDatum.nil();
+                LocalDateTime dt = toDateTime(args.get(0));
+                yield CopDatum.of(dt.atZone(java.time.ZoneId.systemDefault()).toEpochSecond());
+            }
+            case "FROM_UNIXTIME" -> nullSafe1(args, d -> CopDatum.of(
+                    LocalDateTime.ofInstant(java.time.Instant.ofEpochSecond(d.toLong()),
+                            java.time.ZoneId.systemDefault())));
+            case "DATE_FORMAT" -> {
+                if (args.size() < 2 || args.get(0).isNull() || args.get(1).isNull()) yield CopDatum.nil();
+                LocalDateTime dt = toDateTime(args.get(0));
+                String fmt = mysqlToJavaDateFormat(args.get(1).toStringValue());
+                yield CopDatum.of(dt.format(DateTimeFormatter.ofPattern(fmt)));
+            }
+
+            // --- Info functions ---
             case "VERSION" -> CopDatum.of("8.0.30-x-db");
+            case "DATABASE", "SCHEMA" -> CopDatum.nil();
+            case "USER", "CURRENT_USER" -> CopDatum.of("root@localhost");
+            case "CONNECTION_ID" -> CopDatum.of(0L);
+
             default -> throw new UnsupportedOperationException("Unknown function: " + name);
         };
+    }
+
+    private static LocalDateTime toDateTime(CopDatum d) {
+        if (d instanceof CopDatum.DateTimeVal dt) return dt.value();
+        try {
+            return LocalDateTime.parse(d.toStringValue().trim(),
+                    DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+        } catch (DateTimeParseException e) {
+            try {
+                return LocalDate.parse(d.toStringValue().trim()).atStartOfDay();
+            } catch (DateTimeParseException e2) {
+                return LocalDateTime.of(2000, 1, 1, 0, 0);
+            }
+        }
+    }
+
+    private static String mysqlToJavaDateFormat(String mysql) {
+        return mysql.replace("%Y", "yyyy").replace("%y", "yy")
+                .replace("%m", "MM").replace("%d", "dd")
+                .replace("%H", "HH").replace("%i", "mm")
+                .replace("%s", "ss").replace("%S", "ss")
+                .replace("%M", "MMMM").replace("%b", "MMM")
+                .replace("%W", "EEEE").replace("%a", "EEE")
+                .replace("%j", "DDD").replace("%T", "HH:mm:ss")
+                .replace("%r", "hh:mm:ss a");
     }
 
     @FunctionalInterface

@@ -17,21 +17,29 @@ import java.util.PriorityQueue;
 public final class VecTopNOp implements VecOperator {
 
     private static final int MAX_HEAP_SIZE = 65536;
+    private static final int EST_ROW_BYTES = 256;
 
     private final VecOperator child;
     private final List<Tipb.ByItem> orderByItems;
     private final int heapSize;
     private final int offset;
+    private final CopMemTracker memTracker;
 
     private List<ScoredRecord> sorted;
     private int pos;
 
     public VecTopNOp(VecOperator child, List<Tipb.ByItem> orderByItems,
                       long topNLimit, long topNOffset) {
+        this(child, orderByItems, topNLimit, topNOffset, null);
+    }
+
+    public VecTopNOp(VecOperator child, List<Tipb.ByItem> orderByItems,
+                      long topNLimit, long topNOffset, CopMemTracker memTracker) {
         this.child = child;
         this.orderByItems = orderByItems;
         this.heapSize = (int) Math.min(topNLimit + topNOffset, MAX_HEAP_SIZE);
         this.offset = (int) topNOffset;
+        this.memTracker = memTracker;
     }
 
     @Override
@@ -51,7 +59,11 @@ public final class VecTopNOp implements VecOperator {
                     sortKeys[j] = ExprEvaluator.eval(orderByItems.get(j).getExpr(), record.row());
                 }
                 heap.offer(new ScoredRecord(record, sortKeys));
-                if (heap.size() > heapSize) heap.poll();
+                if (heap.size() > heapSize) {
+                    heap.poll();
+                } else if (memTracker != null) {
+                    memTracker.track(EST_ROW_BYTES);
+                }
             }
         }
 

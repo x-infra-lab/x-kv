@@ -1,22 +1,41 @@
 package io.github.xinfra.lab.xkv.test;
 
 import com.google.protobuf.ByteString;
-import io.github.xinfra.lab.xkv.pd.state.InMemoryPdStateMachine;
 import io.github.xinfra.lab.xkv.pd.state.OperatorControllerImpl;
+import io.github.xinfra.lab.xkv.pd.state.RocksDbPdStateMachine;
 import io.github.xinfra.lab.xkv.pd.state.RuleCheckerScheduler;
 import io.github.xinfra.lab.xkv.pd.state.SimpleOperator;
 import io.github.xinfra.lab.xkv.pd.state.StoreStatsCache;
 import io.github.xinfra.lab.xkv.proto.Metapb;
 import io.github.xinfra.lab.xkv.proto.Pdpb;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.nio.file.Path;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 final class RuleCheckerSchedulerTest {
 
+    @TempDir
+    Path tempDir;
+
+    private RocksDbPdStateMachine state;
+
+    @BeforeEach
+    void setUp() {
+        state = new RocksDbPdStateMachine(tempDir.resolve("pd-state"));
+    }
+
+    @AfterEach
+    void tearDown() {
+        state.close();
+    }
+
     @Test
     void addsReplicaForUnderReplicatedRegion() {
-        var state = new InMemoryPdStateMachine();
         for (long s = 1; s <= 3; s++) {
             state.putStore(Metapb.Store.newBuilder()
                     .setId(s).setState(Metapb.StoreState.Up).build());
@@ -62,7 +81,6 @@ final class RuleCheckerSchedulerTest {
 
     @Test
     void removesPeerForOverReplicatedRegion() {
-        var state = new InMemoryPdStateMachine();
         for (long s = 1; s <= 4; s++) {
             state.putStore(Metapb.Store.newBuilder()
                     .setId(s).setState(Metapb.StoreState.Up).build());
@@ -107,7 +125,6 @@ final class RuleCheckerSchedulerTest {
 
     @Test
     void removesDownStorePeer() {
-        var state = new InMemoryPdStateMachine();
         state.putStore(Metapb.Store.newBuilder()
                 .setId(1).setState(Metapb.StoreState.Up).build());
         state.putStore(Metapb.Store.newBuilder()
@@ -155,7 +172,6 @@ final class RuleCheckerSchedulerTest {
 
     @Test
     void noActionWhenProperlyreplicated() {
-        var state = new InMemoryPdStateMachine();
         for (long s = 1; s <= 3; s++) {
             state.putStore(Metapb.Store.newBuilder()
                     .setId(s).setState(Metapb.StoreState.Up).build());

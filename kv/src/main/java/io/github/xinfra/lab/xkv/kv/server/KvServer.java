@@ -113,6 +113,8 @@ public final class KvServer {
     private final io.github.xinfra.lab.xkv.kv.cdc.RegionResolvedTsTracker resolvedTsTracker =
             new io.github.xinfra.lab.xkv.kv.cdc.RegionResolvedTsTracker();
     private io.github.xinfra.lab.xkv.kv.config.ConfigManager configManager;
+    private CoprocessorService copService;
+    private TikvServiceImpl tikvService;
 
     public KvServer(KvConfig config) {
         this.config = config;
@@ -217,12 +219,13 @@ public final class KvServer {
         var splitDriver = new SplitDriver(pdManager.blockingStub(), PROPOSE_TIMEOUT_MS);
 
         // 9) Build CoprocessorService and start client-facing gRPC server.
-        var copService = new CoprocessorService();
+        copService = new CoprocessorService();
         copService.register(new TableScanCoprocessor(engine));
         copService.register(new io.github.xinfra.lab.xkv.kv.coprocessor.SQLScanCoprocessor(engine));
         copService.register(new io.github.xinfra.lab.xkv.kv.coprocessor.AnalyzeCoprocessor(engine));
         copService.register(new io.github.xinfra.lab.xkv.kv.coprocessor.IndexScanCoprocessor(engine));
         copService.register(new io.github.xinfra.lab.xkv.kv.coprocessor.SplitKeysCoprocessor(engine));
+        copService.register(new io.github.xinfra.lab.xkv.kv.coprocessor.ChecksumCoprocessor(engine));
 
         // CDC service — resolved TS uses the store-level CM.
         cdcService = new ChangeDataServiceImpl(cdcEventBus, engine, () -> storeCm.maxTs().current(), resolvedTsTracker);
@@ -231,7 +234,7 @@ public final class KvServer {
         var c = GrpcChannelFactory.parseHostPort(config.clientAddress());
         var clientServerBuilder = GrpcChannelFactory.serverBuilder(
                         new InetSocketAddress(c.host(), c.port()), config.clientTls())
-                .addService(buildTikvService(rawKvService, txnService, copService, splitDriver, locator))
+                .addService(tikvService = buildTikvService(rawKvService, txnService, copService, splitDriver, locator))
                 .addService(cdcService);
         if (config.enableDebugService()) {
             clientServerBuilder.addService(
@@ -457,11 +460,11 @@ public final class KvServer {
                                               ConcurrencyManager cm) {
         long peerId = findSelfPeerId(region);
 
-        var transport = new GrpcRaftTransport(region.getId(), peerId, config.raftTls());
+        var transport = new GrpcRaftTransport(region.getId(), peerId, config.storeId(), config.raftTls());
         for (var peer : region.getPeersList()) {
             if (peer.getId() == peerId) continue;
             var addr = peerAddrs.get(peer.getId());
-            if (addr != null) transport.addPeer(peer.getId(), addr);
+            if (addr != null) transport.addPeer(peer.getId(), addr, peer.getStoreId());
         }
 
         var raftPeers = new ArrayList<Peer>();
@@ -537,12 +540,12 @@ public final class KvServer {
         long childRegionId = childRegion.getId();
         var childRaftEngine = new PerRegionRaftEngine(engine, childRegionId);
 
-        var childTransport = new GrpcRaftTransport(childRegionId, childPeerId, config.raftTls());
+        var childTransport = new GrpcRaftTransport(childRegionId, childPeerId, config.storeId(), config.raftTls());
         for (var cpe : childRegion.getPeersList()) {
             if (cpe.getId() == childPeerId) continue;
             var addr = peerAddrs.get(cpe.getStoreId());
             if (addr == null) addr = peerAddrs.get(cpe.getId());
-            if (addr != null) childTransport.addPeer(cpe.getId(), addr);
+            if (addr != null) childTransport.addPeer(cpe.getId(), addr, cpe.getStoreId());
         }
 
         var childPeers = new ArrayList<Peer>();
@@ -580,6 +583,7 @@ public final class KvServer {
             startHeartbeater(childPeer);
         }
 
+        if (copService != null) copService.invalidateCache();
         log.info("Spawned child peer region={} peer={}", childRegionId, childPeerId);
     }
 
@@ -799,6 +803,9 @@ public final class KvServer {
                 Thread.currentThread().interrupt();
             }
         }
+
+        // 2b) Shut down coprocessor thread pool.
+        if (tikvService != null) tikvService.shutdown();
 
         // 3) Shut down all peers.
         for (var peer : peers) {

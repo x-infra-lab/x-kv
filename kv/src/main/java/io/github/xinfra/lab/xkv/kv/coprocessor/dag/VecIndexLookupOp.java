@@ -15,6 +15,8 @@ import java.util.ArrayList;
  */
 public final class VecIndexLookupOp implements VecOperator {
 
+    private static final int MAX_EMPTY_ROUNDS = 10_000;
+
     private final VecOperator child;
     private final MvccReader reader;
     private final Tipb.DAGRequest dagReq;
@@ -37,7 +39,7 @@ public final class VecIndexLookupOp implements VecOperator {
 
     @Override
     public CopChunk nextChunk(int batchSize) {
-        while (true) {
+        for (int attempts = 0; attempts < MAX_EMPTY_ROUNDS; attempts++) {
             CopChunk indexChunk = child.nextChunk(batchSize);
             if (indexChunk == null) return null;
 
@@ -60,6 +62,7 @@ public final class VecIndexLookupOp implements VecOperator {
                 return new CopChunk(result);
             }
         }
+        return null;
     }
 
     @Override

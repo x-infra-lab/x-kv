@@ -222,32 +222,52 @@ final class PdLeaderFailoverE2ETest {
                 .until(() -> servers.stream().anyMatch(s ->
                         s.raftNode() != null && s.raftNode().isLeader()));
 
-        // Query getMembers from each node.
+        // Find the leader's port and query getMembers (linearizable read — leader only).
+        int leaderIdx = -1;
         for (int i = 0; i < 3; i++) {
-            var ch = io.grpc.ManagedChannelBuilder
+            if (servers.get(i).raftNode().isLeader()) { leaderIdx = i; break; }
+        }
+        assertThat(leaderIdx).isGreaterThanOrEqualTo(0);
+
+        var ch = io.grpc.ManagedChannelBuilder
+                .forAddress("127.0.0.1", clientPorts[leaderIdx])
+                .usePlaintext()
+                .build();
+        try {
+            var stub = PDGrpc.newBlockingStub(ch);
+            var resp = stub.getMembers(Pdpb.GetMembersRequest.newBuilder().build());
+
+            assertThat(resp.getMembersCount())
+                    .as("leader should return all 3 members")
+                    .isEqualTo(3);
+
+            for (var member : resp.getMembersList()) {
+                assertThat(member.getClientUrlsCount())
+                        .as("member %d should have client URL", member.getMemberId())
+                        .isGreaterThan(0);
+            }
+
+            assertThat(resp.hasLeader()).isTrue();
+            assertThat(resp.getLeader().getClientUrlsCount()).isGreaterThan(0);
+        } finally {
+            ch.shutdownNow().awaitTermination(2, TimeUnit.SECONDS);
+        }
+
+        // Followers must reject getMembers with UNAVAILABLE.
+        for (int i = 0; i < 3; i++) {
+            if (i == leaderIdx) continue;
+            var fch = io.grpc.ManagedChannelBuilder
                     .forAddress("127.0.0.1", clientPorts[i])
                     .usePlaintext()
                     .build();
             try {
-                var stub = PDGrpc.newBlockingStub(ch);
-                var resp = stub.getMembers(Pdpb.GetMembersRequest.newBuilder().build());
-
-                assertThat(resp.getMembersCount())
-                        .as("node %d should return all 3 members", i + 1)
-                        .isEqualTo(3);
-
-                // Each member should have a client URL.
-                for (var member : resp.getMembersList()) {
-                    assertThat(member.getClientUrlsCount())
-                            .as("member %d should have client URL", member.getMemberId())
-                            .isGreaterThan(0);
-                }
-
-                // Leader should be set and have a client URL.
-                assertThat(resp.hasLeader()).isTrue();
-                assertThat(resp.getLeader().getClientUrlsCount()).isGreaterThan(0);
+                var fstub = PDGrpc.newBlockingStub(fch);
+                org.assertj.core.api.Assertions.assertThatThrownBy(
+                        () -> fstub.getMembers(Pdpb.GetMembersRequest.newBuilder().build()))
+                        .isInstanceOf(io.grpc.StatusRuntimeException.class)
+                        .hasMessageContaining("UNAVAILABLE");
             } finally {
-                ch.shutdownNow().awaitTermination(2, TimeUnit.SECONDS);
+                fch.shutdownNow().awaitTermination(2, TimeUnit.SECONDS);
             }
         }
     }

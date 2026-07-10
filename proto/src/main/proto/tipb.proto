@@ -76,6 +76,12 @@ message DAGRequest {
     int64 index_id = 10;
     repeated ColumnInfo index_columns = 11;
     bool index_lookup = 12;
+    // Projection: compute derived columns (SELECT a+b, UPPER(c), ...)
+    repeated Expr projections = 13;
+    // Reverse scan: iterate from end_key to start_key
+    bool desc_scan = 14;
+    // Collation: 0=binary, 1=utf8_general_ci, 2=utf8_unicode_ci
+    int32 collation = 15;
 }
 
 message PartialAggState {
@@ -115,4 +121,15 @@ message AnalyzeColumnResult {
 message AnalyzeResult {
     int64 row_count = 1;
     repeated AnalyzeColumnResult column_results = 2;
+}
+
+message ChecksumRequest {
+    int64 table_id = 1;
+    int32 algorithm = 2;
+}
+
+message ChecksumResponse {
+    uint64 checksum = 1;
+    int64 total_kvs = 2;
+    int64 total_bytes = 3;
 }

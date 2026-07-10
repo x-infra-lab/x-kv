@@ -273,6 +273,136 @@ public final class ClusterHarness implements AutoCloseable {
         releaseAllPorts();
     }
 
+    /**
+     * Dynamically add a new KV store to the running cluster. The store is
+     * registered in PD but does NOT initially host any region. When PD's
+     * {@code RegionBalanceScheduler} schedules an AddPeer operator targeting
+     * this store, the heartbeat response delivers the conf-change to the
+     * region leader. Once committed, the leader sends raft messages to the
+     * new peer_id — the dispatcher's {@code missingHandler} fires
+     * {@link #spawnOnDemand}, which queries PD for the region descriptor
+     * and spawns a local {@link RegionPeerImpl}.
+     *
+     * <p>Existing nodes' transports and peerAddrs are updated so they can
+     * reach the new store when sending raft messages to newly-added peers.
+     */
+    public KvNode addStore(long storeId) throws Exception {
+        int clientPort = freePort();
+        int raftPort = freePort();
+        String raftAddr = "127.0.0.1:" + raftPort;
+
+        var pdChannel = NettyChannelBuilder.forAddress("127.0.0.1", pdPort)
+                .usePlaintext().build();
+        try {
+            var pdStub = PDGrpc.newBlockingStub(pdChannel);
+            var store = Metapb.Store.newBuilder()
+                    .setId(storeId).setAddress("127.0.0.1:" + clientPort)
+                    .setPeerAddress(raftAddr)
+                    .setState(Metapb.StoreState.Up)
+                    .build();
+            pdStub.putStore(Pdpb.PutStoreRequest.newBuilder().setStore(store).build());
+        } finally {
+            pdChannel.shutdownNow().awaitTermination(2, TimeUnit.SECONDS);
+        }
+
+        var peerAddrs = new java.util.HashMap<Long, String>();
+        for (var n : kvNodes) {
+            peerAddrs.put(n.peerId, "127.0.0.1:" + n.raftPort);
+        }
+        peerAddrs.put(storeId, raftAddr);
+
+        var node = buildEmptyStore(storeId, clientPort, raftPort, peerAddrs);
+
+        for (var existing : kvNodes) {
+            existing.transport.addPeer(storeId, raftAddr);
+            existing.peerAddrs.put(storeId, raftAddr);
+        }
+
+        kvNodes.add(node);
+        log.info("addStore: store={} client=127.0.0.1:{} raft={}", storeId, clientPort, raftAddr);
+        return node;
+    }
+
+    /**
+     * Build a KV node that has all infrastructure (engine, gRPC servers,
+     * dispatcher, store routing, tikv service) but NO initial region peer.
+     * Peers are created on-demand via {@link #spawnOnDemand} when raft
+     * messages arrive for unknown regions.
+     */
+    private KvNode buildEmptyStore(long storeId, int clientPort, int raftPort,
+                                    java.util.Map<Long, String> peerAddrs) throws Exception {
+        var dataDir = baseDir.resolve("kv-" + storeId);
+        Files.createDirectories(dataDir);
+
+        var engine = RocksStorageEngine.open(dataDir, KvConfig.EngineConfig.defaults());
+
+        var dispatcher = new RaftMessageDispatcher();
+        var transport = new GrpcRaftTransport(bootstrapRegionId, storeId, storeId);
+        for (var e : peerAddrs.entrySet()) {
+            if (e.getKey() != storeId) transport.addPeer(e.getKey(), e.getValue());
+        }
+
+        var nodeHolder = new java.util.concurrent.atomic.AtomicReference<KvNode>();
+        dispatcher.setMissingHandler((unknownRegionId, firstMsg) -> {
+            var n = nodeHolder.get();
+            if (n == null) {
+                dispatcher.onSpawnDone(unknownRegionId);
+                return;
+            }
+            spawnOnDemand(n, unknownRegionId);
+        });
+
+        var raftService = new KvRaftServiceImpl(dispatcher);
+        releasePort(raftPort);
+        var raftServer = startServerWithRetry(
+                port -> NettyServerBuilder.forPort(port).addService(raftService),
+                raftPort, 3);
+
+        var store = new io.github.xinfra.lab.xkv.kv.store.StoreImpl(storeId,
+                Metapb.Store.newBuilder().setId(storeId).build());
+
+        var cm = new io.github.xinfra.lab.xkv.kv.mvcc.ConcurrencyManager(
+                new io.github.xinfra.lab.xkv.kv.mvcc.MaxTsTracker(0));
+        var rawKv = new RawKvService(engine,
+                key -> store.peerForKey(key).orElse(null), 10_000);
+        var txn = new TransactionService(engine,
+                key -> store.peerForKey(key).orElse(null), 10_000, cm);
+
+        var pdChannelForSplit = NettyChannelBuilder.forAddress("127.0.0.1", pdPort)
+                .usePlaintext().build();
+        var splitPdStub = PDGrpc.newBlockingStub(pdChannelForSplit);
+        var splitDriver = new io.github.xinfra.lab.xkv.kv.store.SplitDriver(splitPdStub, 10_000);
+
+        var pdChannelForDeadlock = NettyChannelBuilder.forAddress("127.0.0.1", pdPort)
+                .usePlaintext().build();
+        var deadlockPdStub = PDGrpc.newBlockingStub(pdChannelForDeadlock);
+        var deadlockClient = new io.github.xinfra.lab.xkv.kv.transport.DeadlockClient(
+                deadlockPdStub, 1L);
+        txn.setDeadlockClient(deadlockClient);
+
+        var tikvService = new TikvServiceImpl(rawKv, txn, splitDriver,
+                key -> store.peerForKey(key).orElse(null));
+        releasePort(clientPort);
+        var clientServer = startServerWithRetry(
+                port -> NettyServerBuilder.forPort(port).addService(tikvService),
+                clientPort, 3);
+
+        var node = new KvNode(storeId, clientPort, raftPort, engine, null,
+                raftServer, clientServer, transport);
+        node.store = store;
+        node.dispatcher = dispatcher;
+        node.peerAddrs = new java.util.HashMap<>(peerAddrs);
+        node.pdChannels.add(pdChannelForSplit);
+        node.pdChannels.add(pdChannelForDeadlock);
+        nodeHolder.set(node);
+
+        var pdAsyncChannel = NettyChannelBuilder.forAddress("127.0.0.1", pdPort)
+                .usePlaintext().build();
+        node.pdChannels.add(pdAsyncChannel);
+
+        return node;
+    }
+
     private KvNode buildNode(long peerId, Metapb.Region region,
                              int clientPort, int raftPort,
                              java.util.Map<Long, String> peerAddrs) throws Exception {
@@ -283,7 +413,7 @@ public final class ClusterHarness implements AutoCloseable {
         var raftEngine = new PerRegionRaftEngine(engine, region.getId());
 
         var dispatcher = new RaftMessageDispatcher();
-        var transport = new GrpcRaftTransport(region.getId(), peerId);
+        var transport = new GrpcRaftTransport(region.getId(), peerId, peerId);
         for (var e : peerAddrs.entrySet()) {
             if (e.getKey() != peerId) transport.addPeer(e.getKey(), e.getValue());
         }
@@ -342,7 +472,7 @@ public final class ClusterHarness implements AutoCloseable {
                                 .filter(pe -> pe.getStoreId() == peerId)
                                 .findFirst();
                         if (childSelfOpt.isEmpty()) continue;
-                        try { spawnChildPeer(n, child, childSelfOpt.get()); }
+                        try { spawnChildPeer(n, child, childSelfOpt.get(), true); }
                         catch (Exception e) {
                             throw new RuntimeException(e);
                         }
@@ -357,7 +487,7 @@ public final class ClusterHarness implements AutoCloseable {
                     // Destroy source peer locally. It's either the main peer
                     // (rare — source = parent) or in childPeers (common —
                     // source was a split child).
-                    if (n.peer.regionId() == sourceRegion.getId()) {
+                    if (n.peer != null && n.peer.regionId() == sourceRegion.getId()) {
                         // Cannot destroy ourselves — would shut down the
                         // node. Should never happen if merge target ≠ source.
                         log.warn("merge observer asked to destroy node's main peer");
@@ -385,6 +515,19 @@ public final class ClusterHarness implements AutoCloseable {
                 snapshotEngine);
         peerHolder.set(peer);
         dispatcher.register(region.getId(), transport);
+
+        peer.setChangePeerObserver((type, changedPeer, updatedRegion) -> {
+            if (type == io.github.xinfra.lab.raft.proto.Eraftpb.ConfChangeType.ConfChangeAddNode
+                    || type == io.github.xinfra.lab.raft.proto.Eraftpb.ConfChangeType.ConfChangeAddLearnerNode) {
+                var n = nodeHolder.get();
+                if (n != null) {
+                    var addr = n.peerAddrs.get(changedPeer.getStoreId());
+                    if (addr != null) {
+                        transport.addPeer(changedPeer.getId(), addr);
+                    }
+                }
+            }
+        });
 
         // Store routes by key — split children registered via the observer
         // become visible to subsequent RPCs without further wiring.
@@ -473,7 +616,7 @@ public final class ClusterHarness implements AutoCloseable {
                     return;
                 }
                 if (hostNode.store.peerForRegion(regionId).isPresent()) return;     // race
-                spawnChildPeer(hostNode, regionDesc, selfPeer);
+                spawnChildPeer(hostNode, regionDesc, selfPeer, false);
                 log.info("on-demand spawn: region={} peer={} on store={} created",
                         regionId, selfPeer.getId(), hostNode.peerId);
             } catch (Throwable err) {
@@ -488,14 +631,17 @@ public final class ClusterHarness implements AutoCloseable {
 
     private void spawnChildPeer(KvNode parentNode,
                                 Metapb.Region childRegion,
-                                Metapb.Peer childSelf) throws Exception {
+                                Metapb.Peer childSelf,
+                                boolean bootstrap) throws Exception {
         long childPeerId = childSelf.getId();
         long childRegionId = childRegion.getId();
         var childRaftEngine = new PerRegionRaftEngine(parentNode.engine, childRegionId);
         var childPeers = new ArrayList<Peer>();
-        for (var pe : childRegion.getPeersList()) childPeers.add(new Peer(pe.getId()));
+        if (bootstrap) {
+            for (var pe : childRegion.getPeersList()) childPeers.add(new Peer(pe.getId()));
+        }
 
-        var childTransport = new GrpcRaftTransport(childRegionId, childPeerId);
+        var childTransport = new GrpcRaftTransport(childRegionId, childPeerId, childPeerId);
         // The child's peers' store_ids match the parent's, so we look up
         // each child peer's store address via the parent's peerAddrs map
         // (peerId == storeId in this harness).
@@ -515,7 +661,7 @@ public final class ClusterHarness implements AutoCloseable {
                     var cp = childPeerHolder.get();
                     if (cp != null) cp.updateRegion(mergedTarget);
                     // Destroy the source peer on this store.
-                    if (parentNode.peer.regionId() == sourceRegion.getId()) {
+                    if (parentNode.peer != null && parentNode.peer.regionId() == sourceRegion.getId()) {
                         // Source is the node's main peer — rare; production
                         // would tombstone it via raft destroy. For tests
                         // we'd never merge the main peer away mid-flight.
@@ -531,8 +677,23 @@ public final class ClusterHarness implements AutoCloseable {
                         });
                     }
                 };
+        var childSplitObserver = (io.github.xinfra.lab.xkv.kv.raft.AdminApplyHandler.SplitObserver)
+                (updatedParent, children) -> {
+                    var cp = childPeerHolder.get();
+                    if (cp != null) cp.updateRegion(updatedParent);
+                    for (var grandchild : children) {
+                        var gcSelfOpt = grandchild.getPeersList().stream()
+                                .filter(pe -> pe.getStoreId() == parentNode.peerId)
+                                .findFirst();
+                        if (gcSelfOpt.isEmpty()) continue;
+                        try { spawnChildPeer(parentNode, grandchild, gcSelfOpt.get(), true); }
+                        catch (Exception e) {
+                            throw new RuntimeException(e);
+                        }
+                    }
+                };
         var childHandler = CompositeApplyHandler.defaultFor(parentNode.engine, childCm)
-                .withAdmin(childRaftEngine, parentNode.engine, (p, ch) -> {}, childMergeObserver);
+                .withAdmin(childRaftEngine, parentNode.engine, childSplitObserver, childMergeObserver);
         var childPeer = new RegionPeerImpl(
                 parentNode.engine, childRaftEngine, childRegion, childSelf, childPeers,
                 childTransport,
@@ -540,6 +701,15 @@ public final class ClusterHarness implements AutoCloseable {
                 new RegionPeerImpl.Settings(10, 1, 30),
                 childCm);
         childPeerHolder.set(childPeer);
+        childPeer.setChangePeerObserver((type, changedPeer, updatedRegion) -> {
+            if (type == io.github.xinfra.lab.raft.proto.Eraftpb.ConfChangeType.ConfChangeAddNode
+                    || type == io.github.xinfra.lab.raft.proto.Eraftpb.ConfChangeType.ConfChangeAddLearnerNode) {
+                var addr = parentNode.peerAddrs.get(changedPeer.getStoreId());
+                if (addr != null) {
+                    childTransport.addPeer(changedPeer.getId(), addr);
+                }
+            }
+        });
         parentNode.dispatcher.register(childRegionId, childTransport);
         parentNode.store.registerPeer(childPeer);
         parentNode.childPeers.add(childPeer);
@@ -624,7 +794,7 @@ public final class ClusterHarness implements AutoCloseable {
         public final int clientPort;
         public final int raftPort;
         public final RocksStorageEngine engine;
-        public final RegionPeerImpl peer;
+        public volatile RegionPeerImpl peer;
         public final Server raftServer;
         public final Server clientServer;
         public final GrpcRaftTransport transport;
@@ -683,8 +853,10 @@ public final class ClusterHarness implements AutoCloseable {
             try { raftServer.shutdownNow().awaitTermination(2, TimeUnit.SECONDS); } catch (Exception e) {
                 log.warn("raftServer shutdown failed: {}", e.getMessage(), e);
             }
-            try { peer.shutdown(); } catch (Exception e) {
-                log.warn("peer shutdown failed: {}", e.getMessage(), e);
+            if (peer != null) {
+                try { peer.shutdown(); } catch (Exception e) {
+                    log.warn("peer shutdown failed: {}", e.getMessage(), e);
+                }
             }
             for (var child : childPeers) {
                 try { child.shutdown(); } catch (Throwable e) {
@@ -701,7 +873,7 @@ public final class ClusterHarness implements AutoCloseable {
             }
             long deadline = System.nanoTime() + 10_000_000_000L;
             while (System.nanoTime() < deadline) {
-                boolean anyAlive = peer.readyThreadAlive();
+                boolean anyAlive = peer != null && peer.readyThreadAlive();
                 if (!anyAlive) {
                     anyAlive = childPeers.stream().anyMatch(RegionPeerImpl::readyThreadAlive);
                 }
@@ -711,7 +883,7 @@ public final class ClusterHarness implements AutoCloseable {
                     break;
                 }
             }
-            if (peer.readyThreadAlive() || childPeers.stream().anyMatch(RegionPeerImpl::readyThreadAlive)) {
+            if ((peer != null && peer.readyThreadAlive()) || childPeers.stream().anyMatch(RegionPeerImpl::readyThreadAlive)) {
                 log.warn("some peer ready-loop threads still alive after 10s; proceeding with engine close");
             }
             try { engine.close(); } catch (Exception e) {

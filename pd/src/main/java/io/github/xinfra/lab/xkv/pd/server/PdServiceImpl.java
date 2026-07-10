@@ -1,7 +1,8 @@
 package io.github.xinfra.lab.xkv.pd.server;
 
+import io.github.xinfra.lab.raft.Transport;
+import io.github.xinfra.lab.raft.proto.Eraftpb;
 import io.github.xinfra.lab.xkv.pd.state.DeadlockDetector;
-import io.github.xinfra.lab.xkv.pd.state.InMemoryPdStateMachine;
 import io.github.xinfra.lab.xkv.pd.state.PdStateMachine;
 import io.github.xinfra.lab.xkv.pd.state.SafePointService;
 import io.github.xinfra.lab.xkv.pd.state.StoreStatsCache;
@@ -73,23 +74,21 @@ import io.grpc.stub.StreamObserver;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * gRPC frontend for the PD service.
  *
- * <p>When a {@link io.github.xinfra.lab.xkv.pd.raft.PdRaftNode} is wired
- * (multi-PD mode), mutating RPCs (bootstrap, putStore, allocID, etc.) are
- * proposed through raft and applied deterministically on every PD node.
- * Read-only RPCs (getRegion, getStore, scanRegions) go to the local state.
- *
- * <p>When no raft node is wired (single-PD mode), mutations go directly
- * to the state machine for backward compatibility with tests and demos.
+ * <p>All mutating RPCs are proposed through raft and applied deterministically
+ * on every PD node. All read RPCs require linearizable read (readIndex) to
+ * guarantee the serving node is still the authoritative leader.
  */
 public final class PdServiceImpl extends PDGrpc.PDImplBase {
     private static final Logger log = LoggerFactory.getLogger(PdServiceImpl.class);
 
     private static final long RAFT_PROPOSE_TIMEOUT_MS = 5_000;
+    private static final long READ_INDEX_TIMEOUT_MS = 5_000;
 
     private final PdStateMachine state;
     private final Tso tso;
@@ -97,42 +96,13 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
     private final DeadlockDetector deadlock;
     private final long clusterId;
     private final long nodeId;
-    private final String clientAddress;
-    private final java.util.List<MemberInfo> members;
     private final StoreStatsCache storeStatsCache;
     private final io.github.xinfra.lab.xkv.pd.state.placement.PlacementRuleManager placementRuleManager;
-    /** Persisted cluster GC safe-point separate from per-service. */
     private final AtomicLong gcSafePoint = new AtomicLong(0);
 
-    /**
-     * Optional raft node for multi-PD replication. When non-null, all
-     * mutating RPCs are proposed through raft; when null, mutations go
-     * directly to the state machine (single-node mode).
-     */
     private volatile io.github.xinfra.lab.xkv.pd.raft.PdRaftNode raftNode;
-
+    private volatile Transport transport;
     private volatile io.github.xinfra.lab.xkv.pd.state.OperatorController operatorController;
-
-    public record MemberInfo(long id, String name, String clientAddress) {}
-
-    public PdServiceImpl(PdStateMachine state,
-                         Tso tso,
-                         SafePointService safePoint,
-                         long clusterId,
-                         long nodeId) {
-        this(state, tso, safePoint, new DeadlockDetector(), clusterId, nodeId,
-                "", java.util.List.of(), new StoreStatsCache(), null);
-    }
-
-    public PdServiceImpl(PdStateMachine state,
-                         Tso tso,
-                         SafePointService safePoint,
-                         DeadlockDetector deadlock,
-                         long clusterId,
-                         long nodeId) {
-        this(state, tso, safePoint, deadlock, clusterId, nodeId,
-                "", java.util.List.of(), new StoreStatsCache(), null);
-    }
 
     public PdServiceImpl(PdStateMachine state,
                          Tso tso,
@@ -140,8 +110,6 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
                          DeadlockDetector deadlock,
                          long clusterId,
                          long nodeId,
-                         String clientAddress,
-                         java.util.List<MemberInfo> members,
                          StoreStatsCache storeStatsCache,
                          io.github.xinfra.lab.xkv.pd.state.placement.PlacementRuleManager placementRuleManager) {
         this.state = state;
@@ -150,21 +118,19 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
         this.deadlock = deadlock;
         this.clusterId = clusterId;
         this.nodeId = nodeId;
-        this.clientAddress = clientAddress;
-        this.members = java.util.List.copyOf(members);
         this.storeStatsCache = storeStatsCache;
         this.placementRuleManager = placementRuleManager;
     }
 
-    public PdServiceImpl() {
-        this(new InMemoryPdStateMachine(), null, null, 1, 1);
-    }
 
     public StoreStatsCache storeStatsCache() { return storeStatsCache; }
 
-    /** Wire the raft node for multi-PD replication. */
     public void setRaftNode(io.github.xinfra.lab.xkv.pd.raft.PdRaftNode node) {
         this.raftNode = node;
+    }
+
+    public void setTransport(Transport transport) {
+        this.transport = transport;
     }
 
     public void setOperatorController(io.github.xinfra.lab.xkv.pd.state.OperatorController oc) {
@@ -209,6 +175,30 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
         }
     }
 
+    /**
+     * Ensure linearizable read: if raft is wired, confirm leadership via ReadIndex
+     * before serving a read. Returns true if read is safe to proceed. On failure,
+     * sends an error via the observer and returns false.
+     */
+    private <T> boolean ensureLinearizableRead(StreamObserver<T> obs) {
+        var rn = raftNode;
+        if (rn == null) return true;
+        if (!rn.isLeader()) {
+            obs.onError(Status.UNAVAILABLE
+                    .withDescription("not PD leader").asRuntimeException());
+            return false;
+        }
+        try {
+            rn.readIndex().get(READ_INDEX_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            return true;
+        } catch (Exception e) {
+            obs.onError(Status.UNAVAILABLE
+                    .withDescription("readIndex failed: " + e.getMessage())
+                    .asRuntimeException());
+            return false;
+        }
+    }
+
     private ResponseHeader header() {
         return ResponseHeader.newBuilder().setClusterId(clusterId).build();
     }
@@ -227,50 +217,30 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
 
     @Override
     public void getMembers(GetMembersRequest req, StreamObserver<GetMembersResponse> obs) {
+        if (!ensureLinearizableRead(obs)) return;
         var b = GetMembersResponse.newBuilder().setHeader(header());
-        if (members.isEmpty()) {
-            var self = Member.newBuilder()
-                    .setMemberId(nodeId)
-                    .setName("pd-" + nodeId);
-            if (!clientAddress.isEmpty()) self.addClientUrls(clientAddress);
-            b.addMembers(self.build()).setLeader(self.build());
-        } else {
-            for (var m : members) {
-                var mb = Member.newBuilder()
-                        .setMemberId(m.id())
-                        .setName(m.name());
-                if (!m.clientAddress().isEmpty()) mb.addClientUrls(m.clientAddress());
-                b.addMembers(mb.build());
-            }
-            var rn = raftNode;
-            boolean rnIsLeader = rn != null && rn.isLeader();
-            long leaderId = rnIsLeader ? nodeId : findLeaderMemberId();
-            if (rn != null && !rnIsLeader && leaderId == nodeId) {
-                leaderId = 0;
-            }
-            for (var m : members) {
-                if (m.id() == leaderId) {
-                    var lb = Member.newBuilder()
-                            .setMemberId(m.id())
-                            .setName(m.name());
-                    if (!m.clientAddress().isEmpty()) lb.addClientUrls(m.clientAddress());
-                    b.setLeader(lb.build());
-                    break;
-                }
+        for (var m : state.allMembers()) {
+            var mb = Member.newBuilder()
+                    .setMemberId(m.id())
+                    .setName(m.name());
+            if (!m.clientAddress().isEmpty()) mb.addClientUrls(m.clientAddress());
+            if (!m.raftAddress().isEmpty()) mb.addPeerUrls(m.raftAddress());
+            b.addMembers(mb.build());
+        }
+        long leaderId = raftNode != null ? raftNode.leaderNodeId() : nodeId;
+        for (var mb : b.getMembersList()) {
+            if (mb.getMemberId() == leaderId) {
+                b.setLeader(mb);
+                break;
             }
         }
         obs.onNext(b.build());
         obs.onCompleted();
     }
 
-    private long findLeaderMemberId() {
-        var rn = raftNode;
-        if (rn != null) return rn.leaderNodeId();
-        return nodeId;
-    }
-
     @Override
     public void getClusterInfo(GetClusterInfoRequest req, StreamObserver<GetClusterInfoResponse> obs) {
+        if (!ensureLinearizableRead(obs)) return;
         var c = state.cluster();
         var b = GetClusterInfoResponse.newBuilder().setHeader(header());
         if (c != null) b.setCluster(c);
@@ -306,6 +276,7 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
 
     @Override
     public void isBootstrapped(IsBootstrappedRequest req, StreamObserver<IsBootstrappedResponse> obs) {
+        if (!ensureLinearizableRead(obs)) return;
         obs.onNext(IsBootstrappedResponse.newBuilder()
                 .setHeader(header())
                 .setBootstrapped(state.isBootstrapped())
@@ -319,9 +290,13 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
 
     @Override
     public void allocID(AllocIDRequest req, StreamObserver<AllocIDResponse> obs) {
+        var rn = raftNode;
+        if (rn != null && !rn.isLeader()) {
+            obs.onError(Status.UNAVAILABLE
+                    .withDescription("not PD leader").asRuntimeException());
+            return;
+        }
         int count = req.getCount() <= 0 ? 1 : req.getCount();
-        // allocId pre-allocates on the leader, then proposes so followers
-        // advance their allocator past the consumed range.
         long first = state.allocId(count);
         var cmd = io.github.xinfra.lab.xkv.proto.PdInternalpb.PdCommand.newBuilder()
                 .setType(io.github.xinfra.lab.xkv.proto.PdInternalpb.CommandType.CMD_ALLOC_ID)
@@ -354,6 +329,15 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
         return new io.grpc.stub.StreamObserver<>() {
             @Override
             public void onNext(TsoRequest req) {
+                var rn = raftNode;
+                if (rn != null && !rn.isLeader()) {
+                    resp.onNext(TsoResponse.newBuilder()
+                            .setHeader(errorHeader(
+                                    io.github.xinfra.lab.xkv.proto.Pdpb.Error.ErrorType.UNKNOWN,
+                                    "not PD leader"))
+                            .build());
+                    return;
+                }
                 int count = req.getCount() <= 0 ? 1 : req.getCount();
                 try {
                     long firstTs = tso.alloc(count);
@@ -399,6 +383,7 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
 
     @Override
     public void getStore(GetStoreRequest req, StreamObserver<GetStoreResponse> obs) {
+        if (!ensureLinearizableRead(obs)) return;
         var b = GetStoreResponse.newBuilder().setHeader(header());
         state.getStore(req.getStoreId()).ifPresent(b::setStore);
         storeStatsCache.get(req.getStoreId()).ifPresent(b::setStats);
@@ -408,6 +393,7 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
 
     @Override
     public void getAllStores(GetAllStoresRequest req, StreamObserver<GetAllStoresResponse> obs) {
+        if (!ensureLinearizableRead(obs)) return;
         var b = GetAllStoresResponse.newBuilder().setHeader(header());
         for (var s : state.allStores()) b.addStores(s);
         obs.onNext(b.build()); obs.onCompleted();
@@ -415,6 +401,12 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
 
     @Override
     public void storeHeartbeat(StoreHeartbeatRequest req, StreamObserver<StoreHeartbeatResponse> obs) {
+        var rn = raftNode;
+        if (rn != null && !rn.isLeader()) {
+            obs.onError(Status.UNAVAILABLE
+                    .withDescription("not PD leader").asRuntimeException());
+            return;
+        }
         if (req.hasStats()) {
             storeStatsCache.update(req.getStats());
         }
@@ -429,7 +421,9 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
             public void onNext(RegionHeartbeatRequest hb) {
                 if (hb.hasRegion() && shouldUpdateRegion(hb.getRegion())) {
                     var rn = raftNode;
-                    if (rn != null && rn.isLeader()) {
+                    if (rn == null) {
+                        state.updateRegion(hb.getRegion());
+                    } else if (rn.isLeader()) {
                         var cmd = io.github.xinfra.lab.xkv.proto.PdInternalpb.PdCommand.newBuilder()
                                 .setType(io.github.xinfra.lab.xkv.proto.PdInternalpb.CommandType.CMD_UPDATE_REGION)
                                 .setRegion(hb.getRegion())
@@ -440,8 +434,6 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
                         } catch (Exception e) {
                             log.debug("heartbeat region update propose failed: {}", e.getMessage());
                         }
-                    } else {
-                        state.updateRegion(hb.getRegion());
                     }
                 }
                 // Record region stats from heartbeat.
@@ -477,6 +469,7 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
 
     @Override
     public void getRegion(GetRegionRequest req, StreamObserver<GetRegionResponse> obs) {
+        if (!ensureLinearizableRead(obs)) return;
         var b = GetRegionResponse.newBuilder().setHeader(header());
         state.getRegionByKey(req.getRegionKey().toByteArray()).ifPresent(r -> {
             b.setRegion(r);
@@ -489,6 +482,7 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
 
     @Override
     public void getRegionByID(GetRegionByIDRequest req, StreamObserver<GetRegionResponse> obs) {
+        if (!ensureLinearizableRead(obs)) return;
         var b = GetRegionResponse.newBuilder().setHeader(header());
         state.getRegion(req.getRegionId()).ifPresent(r -> {
             b.setRegion(r);
@@ -501,6 +495,7 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
 
     @Override
     public void scanRegions(ScanRegionsRequest req, StreamObserver<ScanRegionsResponse> obs) {
+        if (!ensureLinearizableRead(obs)) return;
         var b = ScanRegionsResponse.newBuilder().setHeader(header());
         int limit = req.getLimit() <= 0 ? 100 : req.getLimit();
         for (var r : state.scanRegions(req.getStartKey().toByteArray(),
@@ -522,39 +517,66 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
                     .withDescription("region required").asRuntimeException());
             return;
         }
-        int peerCount = req.getRegion().getPeersCount();
-        long regionId = state.allocId(1);
-        var b = AskSplitResponse.newBuilder()
-                .setHeader(header())
-                .setNewRegionId(regionId);
-        for (int p = 0; p < peerCount; p++) {
-            b.addNewPeerIds(state.allocId(1));
+        var rn = raftNode;
+        if (rn != null && !rn.isLeader()) {
+            obs.onError(Status.UNAVAILABLE
+                    .withDescription("not PD leader").asRuntimeException());
+            return;
         }
-        obs.onNext(b.build());
-        obs.onCompleted();
+        int peerCount = req.getRegion().getPeersCount();
+        int totalIds = 1 + peerCount;
+        long base = state.allocId(totalIds);
+        var cmd = io.github.xinfra.lab.xkv.proto.PdInternalpb.PdCommand.newBuilder()
+                .setType(io.github.xinfra.lab.xkv.proto.PdInternalpb.CommandType.CMD_ALLOC_ID)
+                .setAllocId(io.github.xinfra.lab.xkv.proto.PdInternalpb.AllocIdPayload.newBuilder()
+                        .setCount(totalIds)
+                        .setBaseId(base))
+                .build();
+        proposeOrApply(cmd, obs, () -> {
+            var b = AskSplitResponse.newBuilder()
+                    .setHeader(header())
+                    .setNewRegionId(base);
+            for (int p = 0; p < peerCount; p++) {
+                b.addNewPeerIds(base + 1 + p);
+            }
+            return b.build();
+        });
     }
     @Override
     public void askBatchSplit(AskBatchSplitRequest req, StreamObserver<AskBatchSplitResponse> obs) {
-        // Allocate (split_count) new region IDs and per region (peers_count)
-        // new peer IDs. PD's AllocID is monotonic so children get IDs > parent.
         int splitCount = req.getSplitCount();
         if (splitCount <= 0) {
             obs.onError(io.grpc.Status.INVALID_ARGUMENT
                     .withDescription("split_count must be > 0").asRuntimeException());
             return;
         }
-        int peerCount = req.getRegion().getPeersCount();
-        var b = AskBatchSplitResponse.newBuilder().setHeader(header());
-        for (int i = 0; i < splitCount; i++) {
-            long regionId = state.allocId(1);
-            var sb = SplitID.newBuilder().setNewRegionId(regionId);
-            for (int p = 0; p < peerCount; p++) {
-                sb.addNewPeerIds(state.allocId(1));
-            }
-            b.addIds(sb.build());
+        var rn = raftNode;
+        if (rn != null && !rn.isLeader()) {
+            obs.onError(Status.UNAVAILABLE
+                    .withDescription("not PD leader").asRuntimeException());
+            return;
         }
-        obs.onNext(b.build());
-        obs.onCompleted();
+        int peerCount = req.getRegion().getPeersCount();
+        int totalIds = splitCount * (1 + peerCount);
+        long base = state.allocId(totalIds);
+        var cmd = io.github.xinfra.lab.xkv.proto.PdInternalpb.PdCommand.newBuilder()
+                .setType(io.github.xinfra.lab.xkv.proto.PdInternalpb.CommandType.CMD_ALLOC_ID)
+                .setAllocId(io.github.xinfra.lab.xkv.proto.PdInternalpb.AllocIdPayload.newBuilder()
+                        .setCount(totalIds)
+                        .setBaseId(base))
+                .build();
+        proposeOrApply(cmd, obs, () -> {
+            var b = AskBatchSplitResponse.newBuilder().setHeader(header());
+            long cursor = base;
+            for (int i = 0; i < splitCount; i++) {
+                var sb = SplitID.newBuilder().setNewRegionId(cursor++);
+                for (int p = 0; p < peerCount; p++) {
+                    sb.addNewPeerIds(cursor++);
+                }
+                b.addIds(sb.build());
+            }
+            return b.build();
+        });
     }
     @Override public void reportSplit(ReportSplitRequest r, StreamObserver<ReportSplitResponse> o) {
         o.onNext(ReportSplitResponse.newBuilder().setHeader(header()).build()); o.onCompleted();
@@ -632,6 +654,7 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
 
     @Override
     public void getGCSafePoint(GetGCSafePointRequest req, StreamObserver<GetGCSafePointResponse> obs) {
+        if (!ensureLinearizableRead(obs)) return;
         long sp = safePoint == null ? gcSafePoint.get() : safePoint.currentSafePoint();
         obs.onNext(GetGCSafePointResponse.newBuilder()
                 .setHeader(header())
@@ -679,6 +702,7 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
     @Override
     public void getAllServiceGCSafePoints(GetAllServiceGCSafePointsRequest req,
                                           StreamObserver<GetAllServiceGCSafePointsResponse> obs) {
+        if (!ensureLinearizableRead(obs)) return;
         var b = GetAllServiceGCSafePointsResponse.newBuilder().setHeader(header());
         if (safePoint != null) {
             for (var e : safePoint.listServiceSafePoints()) {
@@ -772,6 +796,7 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
     public void getPlacementRules(
             io.github.xinfra.lab.xkv.proto.Pdpb.GetPlacementRulesRequest req,
             StreamObserver<io.github.xinfra.lab.xkv.proto.Pdpb.GetPlacementRulesResponse> obs) {
+        if (!ensureLinearizableRead(obs)) return;
         var b = io.github.xinfra.lab.xkv.proto.Pdpb.GetPlacementRulesResponse.newBuilder()
                 .setHeader(header());
         if (placementRuleManager != null) {
@@ -824,6 +849,7 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
     public void loadKeyspace(
             io.github.xinfra.lab.xkv.proto.Pdpb.LoadKeyspaceRequest req,
             StreamObserver<io.github.xinfra.lab.xkv.proto.Pdpb.LoadKeyspaceResponse> obs) {
+        if (!ensureLinearizableRead(obs)) return;
         var ksm = state.keyspaceManager();
         if (ksm == null) {
             obs.onError(Status.UNIMPLEMENTED.withDescription("keyspace not enabled").asRuntimeException());
@@ -867,6 +893,7 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
     public void listKeyspaces(
             io.github.xinfra.lab.xkv.proto.Pdpb.ListKeyspacesRequest req,
             StreamObserver<io.github.xinfra.lab.xkv.proto.Pdpb.ListKeyspacesResponse> obs) {
+        if (!ensureLinearizableRead(obs)) return;
         var ksm = state.keyspaceManager();
         if (ksm == null) {
             obs.onError(Status.UNIMPLEMENTED.withDescription("keyspace not enabled").asRuntimeException());
@@ -889,6 +916,7 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
     public void getResourceGroup(
             io.github.xinfra.lab.xkv.proto.Pdpb.GetResourceGroupRequest req,
             StreamObserver<io.github.xinfra.lab.xkv.proto.Pdpb.GetResourceGroupResponse> obs) {
+        if (!ensureLinearizableRead(obs)) return;
         var rgm = state.resourceGroupManager();
         if (rgm == null) {
             obs.onError(Status.UNIMPLEMENTED.withDescription("resource group not enabled").asRuntimeException());
@@ -997,6 +1025,7 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
     public void listResourceGroups(
             io.github.xinfra.lab.xkv.proto.Pdpb.ListResourceGroupsRequest req,
             StreamObserver<io.github.xinfra.lab.xkv.proto.Pdpb.ListResourceGroupsResponse> obs) {
+        if (!ensureLinearizableRead(obs)) return;
         var rgm = state.resourceGroupManager();
         if (rgm == null) {
             obs.onError(Status.UNIMPLEMENTED.withDescription("resource group not enabled").asRuntimeException());
@@ -1006,6 +1035,147 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
         for (var g : rgm.listGroups()) b.addGroups(g);
         obs.onNext(b.build());
         obs.onCompleted();
+    }
+
+    // =====================================================================
+    // Dynamic membership
+    // =====================================================================
+
+    @Override
+    public void addMember(io.github.xinfra.lab.xkv.proto.Pdpb.AddMemberRequest req,
+                          StreamObserver<io.github.xinfra.lab.xkv.proto.Pdpb.AddMemberResponse> obs) {
+        var rn = raftNode;
+        if (rn == null) {
+            obs.onError(Status.UNAVAILABLE
+                    .withDescription("single-PD mode does not support membership change")
+                    .asRuntimeException());
+            return;
+        }
+        if (!rn.isLeader()) {
+            obs.onError(Status.UNAVAILABLE
+                    .withDescription("not PD leader").asRuntimeException());
+            return;
+        }
+        if (!req.hasMember()) {
+            obs.onError(Status.INVALID_ARGUMENT
+                    .withDescription("member required").asRuntimeException());
+            return;
+        }
+        long memberId = req.getMember().getMemberId();
+        if (state.getMember(memberId).isPresent()) {
+            obs.onError(Status.ALREADY_EXISTS
+                    .withDescription("member " + memberId + " already exists")
+                    .asRuntimeException());
+            return;
+        }
+        try {
+            // Step 1: propose ConfChange (AddNode) through raft.
+            var cc = Eraftpb.ConfChangeV2.newBuilder()
+                    .addChanges(Eraftpb.ConfChangeSingle.newBuilder()
+                            .setType(Eraftpb.ConfChangeType.ConfChangeAddNode)
+                            .setNodeId(memberId))
+                    .build();
+            rn.proposeConfChange(cc).get(RAFT_PROPOSE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+
+            // Step 2: propose CMD_ADD_MEMBER to persist member metadata.
+            String raftAddr = req.getRaftUrl().isEmpty()
+                    ? (req.getMember().getPeerUrlsCount() > 0 ? req.getMember().getPeerUrls(0) : "")
+                    : req.getRaftUrl();
+            String clientAddr = req.getMember().getClientUrlsCount() > 0
+                    ? req.getMember().getClientUrls(0) : "";
+            var cmd = io.github.xinfra.lab.xkv.proto.PdInternalpb.PdCommand.newBuilder()
+                    .setType(io.github.xinfra.lab.xkv.proto.PdInternalpb.CommandType.CMD_ADD_MEMBER)
+                    .setMemberChange(io.github.xinfra.lab.xkv.proto.PdInternalpb.MemberChangePayload.newBuilder()
+                            .setMemberId(memberId)
+                            .setName(req.getMember().getName())
+                            .setRaftAddress(raftAddr)
+                            .setClientAddress(clientAddr))
+                    .build();
+            rn.propose(cmd.toByteArray()).get(RAFT_PROPOSE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+
+            // Step 3: update transport with the new peer.
+            if (!raftAddr.isEmpty()) {
+                transport.addPeer(memberId, raftAddr);
+            }
+
+            // Return updated member list.
+            var b = io.github.xinfra.lab.xkv.proto.Pdpb.AddMemberResponse.newBuilder()
+                    .setHeader(header());
+            for (var m : state.allMembers()) {
+                b.addMembers(Member.newBuilder()
+                        .setMemberId(m.id())
+                        .setName(m.name())
+                        .addClientUrls(m.clientAddress())
+                        .addPeerUrls(m.raftAddress()));
+            }
+            obs.onNext(b.build());
+            obs.onCompleted();
+        } catch (Exception e) {
+            obs.onError(Status.INTERNAL
+                    .withDescription("addMember failed: " + e.getMessage())
+                    .asRuntimeException());
+        }
+    }
+
+    @Override
+    public void removeMember(io.github.xinfra.lab.xkv.proto.Pdpb.RemoveMemberRequest req,
+                             StreamObserver<io.github.xinfra.lab.xkv.proto.Pdpb.RemoveMemberResponse> obs) {
+        var rn = raftNode;
+        if (rn == null) {
+            obs.onError(Status.UNAVAILABLE
+                    .withDescription("single-PD mode does not support membership change")
+                    .asRuntimeException());
+            return;
+        }
+        if (!rn.isLeader()) {
+            obs.onError(Status.UNAVAILABLE
+                    .withDescription("not PD leader").asRuntimeException());
+            return;
+        }
+        long memberId = req.getMemberId();
+        if (state.getMember(memberId).isEmpty()) {
+            obs.onError(Status.NOT_FOUND
+                    .withDescription("member " + memberId + " not found")
+                    .asRuntimeException());
+            return;
+        }
+        try {
+            // Step 1: propose CMD_REMOVE_MEMBER to remove metadata.
+            var cmd = io.github.xinfra.lab.xkv.proto.PdInternalpb.PdCommand.newBuilder()
+                    .setType(io.github.xinfra.lab.xkv.proto.PdInternalpb.CommandType.CMD_REMOVE_MEMBER)
+                    .setMemberChange(io.github.xinfra.lab.xkv.proto.PdInternalpb.MemberChangePayload.newBuilder()
+                            .setMemberId(memberId))
+                    .build();
+            rn.propose(cmd.toByteArray()).get(RAFT_PROPOSE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+
+            // Step 2: propose ConfChange (RemoveNode) through raft.
+            var cc = Eraftpb.ConfChangeV2.newBuilder()
+                    .addChanges(Eraftpb.ConfChangeSingle.newBuilder()
+                            .setType(Eraftpb.ConfChangeType.ConfChangeRemoveNode)
+                            .setNodeId(memberId))
+                    .build();
+            rn.proposeConfChange(cc).get(RAFT_PROPOSE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+
+            // Step 3: update transport.
+            transport.removePeer(memberId);
+
+            // Return updated member list.
+            var b = io.github.xinfra.lab.xkv.proto.Pdpb.RemoveMemberResponse.newBuilder()
+                    .setHeader(header());
+            for (var m : state.allMembers()) {
+                b.addMembers(Member.newBuilder()
+                        .setMemberId(m.id())
+                        .setName(m.name())
+                        .addClientUrls(m.clientAddress())
+                        .addPeerUrls(m.raftAddress()));
+            }
+            obs.onNext(b.build());
+            obs.onCompleted();
+        } catch (Exception e) {
+            obs.onError(Status.INTERNAL
+                    .withDescription("removeMember failed: " + e.getMessage())
+                    .asRuntimeException());
+        }
     }
 
     /** Stable 64-bit hash for the lock-key — matches TiKV's deadlock_key_hash. */

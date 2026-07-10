@@ -1,16 +1,20 @@
 package io.github.xinfra.lab.xkv.kv.coprocessor;
 
 import com.google.protobuf.ByteString;
+import com.google.protobuf.ByteString;
+import io.github.xinfra.lab.xkv.kv.coprocessor.dag.VecDeadlineOp;
 import io.github.xinfra.lab.xkv.kv.coprocessor.eval.CopDatum;
 import io.github.xinfra.lab.xkv.kv.coprocessor.eval.CopDatumComparator;
 import io.github.xinfra.lab.xkv.kv.coprocessor.eval.CopRow;
 import io.github.xinfra.lab.xkv.kv.coprocessor.eval.CopRowDecoder;
 import io.github.xinfra.lab.xkv.kv.coprocessor.eval.ExprEvaluator;
 import io.github.xinfra.lab.xkv.kv.engine.StorageEngine;
+import io.github.xinfra.lab.xkv.kv.mvcc.KeyLockedException;
 import io.github.xinfra.lab.xkv.kv.mvcc.MvccReader;
 import io.github.xinfra.lab.xkv.proto.Coprocessor.Request;
 import io.github.xinfra.lab.xkv.proto.Coprocessor.Response;
 import io.github.xinfra.lab.xkv.proto.Coprocessor.StreamResponse;
+import io.github.xinfra.lab.xkv.proto.Kvrpcpb;
 import io.github.xinfra.lab.xkv.proto.Tipb;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -26,6 +30,7 @@ public final class AnalyzeCoprocessor implements Coprocessor {
     private static final Logger log = LoggerFactory.getLogger(AnalyzeCoprocessor.class);
 
     private static final int DEFAULT_SAMPLE_SIZE = 10_000;
+    private static final int MAX_DISTINCT = 100_000;
     private static final int SCAN_BATCH_SIZE = 1024;
 
     private final StorageEngine engine;
@@ -42,13 +47,17 @@ public final class AnalyzeCoprocessor implements Coprocessor {
     @Override
     public Response handle(Request req) {
         long startTs = req.getStartTs();
+        long deadlineMs = SQLScanCoprocessor.extractDeadlineMs(req);
+        long startNanos = System.nanoTime();
+        long deadlineNanos = deadlineMs > 0 ? deadlineMs * 1_000_000L : 0;
 
         try (var snapshot = engine.newSnapshot();
              var reader = new MvccReader(engine, snapshot, false)) {
 
             Tipb.AnalyzeReq analyzeReq = Tipb.AnalyzeReq.parseFrom(req.getData().toByteArray());
             int sampleSize = analyzeReq.getSampleSize() > 0
-                    ? analyzeReq.getSampleSize() : DEFAULT_SAMPLE_SIZE;
+                    ? Math.min(analyzeReq.getSampleSize(), DEFAULT_SAMPLE_SIZE)
+                    : DEFAULT_SAMPLE_SIZE;
 
             Tipb.DAGRequest dagReq = buildDAGRequest(analyzeReq);
             int colCount = analyzeReq.getOutputColumnIndicesCount();
@@ -58,12 +67,17 @@ public final class AnalyzeCoprocessor implements Coprocessor {
                 accumulators[i] = new ColumnAccumulator(sampleSize);
             }
 
+            KeyLockedException lockErr = null;
             long rowCount = 0;
             for (var range : req.getRangesList()) {
                 byte[] cursor = range.getStart().toByteArray();
                 byte[] end = range.getEnd().toByteArray();
 
                 while (cursor != null) {
+                    if (deadlineNanos > 0 && System.nanoTime() - startNanos > deadlineNanos) {
+                        throw new VecDeadlineOp.DeadlineExceededException(deadlineMs);
+                    }
+
                     MvccReader.ScanResult result = reader.scan(cursor, end, SCAN_BATCH_SIZE, startTs);
 
                     for (var pair : result.pairs()) {
@@ -75,6 +89,12 @@ public final class AnalyzeCoprocessor implements Coprocessor {
                         }
                     }
 
+                    if (result.lockError() != null) {
+                        lockErr = result.lockError();
+                        cursor = null;
+                        break;
+                    }
+
                     if (result.pairs().size() < SCAN_BATCH_SIZE) {
                         cursor = null;
                     } else {
@@ -82,6 +102,7 @@ public final class AnalyzeCoprocessor implements Coprocessor {
                         cursor = nextKey(lastKey);
                     }
                 }
+                if (lockErr != null) break;
             }
 
             Tipb.AnalyzeResult.Builder resultBuilder = Tipb.AnalyzeResult.newBuilder()
@@ -94,9 +115,16 @@ public final class AnalyzeCoprocessor implements Coprocessor {
             }
 
             byte[] data = resultBuilder.build().toByteArray();
-            return Response.newBuilder()
+            Response.Builder respBuilder = Response.newBuilder()
                     .setData(ByteString.copyFrom(data))
-                    .build();
+                    .setExecDetailsMs((System.nanoTime() - startNanos) / 1_000_000L);
+
+            if (lockErr != null) {
+                respBuilder.setLocked(Kvrpcpb.KeyError.newBuilder()
+                        .setLocked(SQLScanCoprocessor.toLockInfo(lockErr)));
+            }
+
+            return respBuilder.build();
 
         } catch (Throwable t) {
             log.warn("AnalyzeCoprocessor error", t);
@@ -151,7 +179,9 @@ public final class AnalyzeCoprocessor implements Coprocessor {
                 return;
             }
 
-            distinctValues.add(value.toStringValue());
+            if (distinctValues.size() < MAX_DISTINCT) {
+                distinctValues.add(value.toStringValue());
+            }
 
             if (min == null || CopDatumComparator.compare(value, min) < 0) {
                 min = value;

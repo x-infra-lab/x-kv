@@ -1,22 +1,41 @@
 package io.github.xinfra.lab.xkv.test;
 
 import com.google.protobuf.ByteString;
-import io.github.xinfra.lab.xkv.pd.state.InMemoryPdStateMachine;
 import io.github.xinfra.lab.xkv.pd.state.LeaderBalanceScheduler;
 import io.github.xinfra.lab.xkv.pd.state.OperatorControllerImpl;
+import io.github.xinfra.lab.xkv.pd.state.PdStateMachine;
+import io.github.xinfra.lab.xkv.pd.state.RocksDbPdStateMachine;
 import io.github.xinfra.lab.xkv.pd.state.SimpleOperator;
 import io.github.xinfra.lab.xkv.proto.Metapb;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.file.Path;
 import java.util.HashMap;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 final class LeaderBalanceSchedulerTest {
 
+    @TempDir
+    Path tempDir;
+
+    private RocksDbPdStateMachine state;
+
+    @BeforeEach
+    void setUp() {
+        state = new RocksDbPdStateMachine(tempDir.resolve("pd-state"));
+    }
+
+    @AfterEach
+    void tearDown() {
+        state.close();
+    }
+
     @Test
     void enqueuesTransferLeadersUntilLoadIsWithinOne() {
-        var state = new InMemoryPdStateMachine();
         for (long s = 1; s <= 3; s++) {
             state.putStore(Metapb.Store.newBuilder().setId(s).build());
         }
@@ -72,7 +91,7 @@ final class LeaderBalanceSchedulerTest {
         }
     }
 
-    private void applyTransfers(InMemoryPdStateMachine state, OperatorControllerImpl controller) {
+    private void applyTransfers(PdStateMachine state, OperatorControllerImpl controller) {
         for (long regionId = 100; regionId < 106; regionId++) {
             var op = controller.getOperator(regionId);
             if (op.isEmpty()) continue;

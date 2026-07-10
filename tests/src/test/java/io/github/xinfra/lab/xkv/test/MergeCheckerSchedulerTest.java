@@ -1,12 +1,17 @@
 package io.github.xinfra.lab.xkv.test;
 
 import com.google.protobuf.ByteString;
-import io.github.xinfra.lab.xkv.pd.state.InMemoryPdStateMachine;
 import io.github.xinfra.lab.xkv.pd.state.MergeCheckerScheduler;
 import io.github.xinfra.lab.xkv.pd.state.OperatorControllerImpl;
+import io.github.xinfra.lab.xkv.pd.state.RocksDbPdStateMachine;
 import io.github.xinfra.lab.xkv.pd.state.SimpleOperator;
 import io.github.xinfra.lab.xkv.proto.Metapb;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.nio.file.Path;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -14,9 +19,23 @@ final class MergeCheckerSchedulerTest {
 
     private static final long MERGE_THRESHOLD = 1024 * 1024;
 
+    @TempDir
+    Path tempDir;
+
+    private RocksDbPdStateMachine state;
+
+    @BeforeEach
+    void setUp() {
+        state = new RocksDbPdStateMachine(tempDir.resolve("pd-state"));
+    }
+
+    @AfterEach
+    void tearDown() {
+        state.close();
+    }
+
     @Test
     void mergesAdjacentSmallRegions() {
-        var state = new InMemoryPdStateMachine();
         for (long s = 1; s <= 3; s++) {
             state.putStore(Metapb.Store.newBuilder().setId(s).build());
         }
@@ -70,7 +89,6 @@ final class MergeCheckerSchedulerTest {
 
     @Test
     void noMergeWhenRegionsAboveThreshold() {
-        var state = new InMemoryPdStateMachine();
         state.putStore(Metapb.Store.newBuilder().setId(1).build());
         state.bootstrap(
                 Metapb.Store.newBuilder().setId(1).build(),
@@ -111,7 +129,6 @@ final class MergeCheckerSchedulerTest {
 
     @Test
     void noMergeWhenRegionsNotAdjacent() {
-        var state = new InMemoryPdStateMachine();
         state.putStore(Metapb.Store.newBuilder().setId(1).build());
         state.bootstrap(
                 Metapb.Store.newBuilder().setId(1).build(),
@@ -152,7 +169,6 @@ final class MergeCheckerSchedulerTest {
 
     @Test
     void noMergeWhenDifferentStores() {
-        var state = new InMemoryPdStateMachine();
         for (long s = 1; s <= 3; s++) {
             state.putStore(Metapb.Store.newBuilder().setId(s).build());
         }

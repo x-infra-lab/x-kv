@@ -202,7 +202,7 @@ final class MultiPeerRaftE2ETest {
         var raftEngine = new PerRegionRaftEngine(engine, region.getId());
 
         var dispatcher = new RaftMessageDispatcher();
-        var transport = new GrpcRaftTransport(region.getId(), peerId);
+        var transport = new GrpcRaftTransport(region.getId(), peerId, peerId);
         for (var e : peerAddrs.entrySet()) {
             if (e.getKey() != peerId) transport.addPeer(e.getKey(), e.getValue());
         }

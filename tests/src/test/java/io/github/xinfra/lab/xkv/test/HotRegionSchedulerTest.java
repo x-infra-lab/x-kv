@@ -2,20 +2,39 @@ package io.github.xinfra.lab.xkv.test;
 
 import com.google.protobuf.ByteString;
 import io.github.xinfra.lab.xkv.pd.state.HotRegionScheduler;
-import io.github.xinfra.lab.xkv.pd.state.InMemoryPdStateMachine;
 import io.github.xinfra.lab.xkv.pd.state.OperatorControllerImpl;
+import io.github.xinfra.lab.xkv.pd.state.RocksDbPdStateMachine;
 import io.github.xinfra.lab.xkv.pd.state.SimpleOperator;
 import io.github.xinfra.lab.xkv.pd.state.StoreStatsCache;
 import io.github.xinfra.lab.xkv.proto.Metapb;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.nio.file.Path;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 final class HotRegionSchedulerTest {
 
+    @TempDir
+    Path tempDir;
+
+    private RocksDbPdStateMachine state;
+
+    @BeforeEach
+    void setUp() {
+        state = new RocksDbPdStateMachine(tempDir.resolve("pd-state"));
+    }
+
+    @AfterEach
+    void tearDown() {
+        state.close();
+    }
+
     @Test
     void transfersHotRegionLeadersToLessHotStores() {
-        var state = new InMemoryPdStateMachine();
         for (long s = 1; s <= 3; s++) {
             state.putStore(Metapb.Store.newBuilder().setId(s).build());
         }
@@ -78,7 +97,6 @@ final class HotRegionSchedulerTest {
 
     @Test
     void noTransfersWhenNoHotRegions() {
-        var state = new InMemoryPdStateMachine();
         for (long s = 1; s <= 3; s++) {
             state.putStore(Metapb.Store.newBuilder().setId(s).build());
         }

@@ -14,12 +14,17 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -52,6 +57,7 @@ public final class PdRaftNode implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(PdRaftNode.class);
 
     private static final int SNAPSHOT_INTERVAL = 100;
+    private static final long PENDING_FUTURE_TIMEOUT_MS = 10_000;
 
     private final long nodeId;
     private final Node node;
@@ -61,6 +67,9 @@ public final class PdRaftNode implements AutoCloseable {
 
     private final AtomicLong proposeSeq = new AtomicLong(1);
     private final ConcurrentMap<Long, CompletableFuture<byte[]>> pendingProposals = new ConcurrentHashMap<>();
+    private final ConcurrentMap<ByteBuffer, CompletableFuture<Void>> pendingReadIndices = new ConcurrentHashMap<>();
+    private final ConcurrentSkipListMap<Long, List<CompletableFuture<Void>>> readIndexWaiters = new ConcurrentSkipListMap<>();
+    private final List<CompletableFuture<Void>> pendingConfChanges = new java.util.concurrent.CopyOnWriteArrayList<>();
 
     private final AtomicBoolean leader = new AtomicBoolean(false);
     private volatile long currentLeaderId;
@@ -77,6 +86,16 @@ public final class PdRaftNode implements AutoCloseable {
                       Transport transport,
                       long heartbeatTickMs,
                       Path dataDir) throws IOException {
+        this(nodeId, peers, stateMachine, transport, heartbeatTickMs, dataDir, false);
+    }
+
+    public PdRaftNode(long nodeId,
+                      List<Peer> peers,
+                      PdStateMachine stateMachine,
+                      Transport transport,
+                      long heartbeatTickMs,
+                      Path dataDir,
+                      boolean joinMode) throws IOException {
         this.nodeId = nodeId;
         this.stateMachine = stateMachine;
         this.transport = transport;
@@ -92,6 +111,18 @@ public final class PdRaftNode implements AutoCloseable {
         this.appliedIndex = storage.getApplied();
         boolean restart = storage.lastIndex() > 0;
 
+        // Joining node with fresh storage: pre-seed confState so raft knows
+        // the cluster membership. Without this, restartNode on empty storage
+        // creates an isolated node with no voters that incorrectly self-elects.
+        if (joinMode && !restart) {
+            var csBuilder = Eraftpb.ConfState.newBuilder();
+            for (var p : peers) csBuilder.addVoters(p.id());
+            if (peers.stream().noneMatch(p -> p.id() == nodeId)) {
+                csBuilder.addVoters(nodeId);
+            }
+            storage.setConfState(csBuilder.build());
+        }
+
         var config = Config.builder()
                 .id(nodeId)
                 .electionTick(10)
@@ -104,11 +135,11 @@ public final class PdRaftNode implements AutoCloseable {
                 .preVote(true)
                 .build();
 
-        if (restart) {
-            log.info("pd-raft node={} restarting from persistent state (applied={})",
-                    nodeId, appliedIndex);
+        if (restart || joinMode) {
+            log.info("pd-raft node={} {} (applied={})",
+                    nodeId, joinMode ? "joining existing cluster" : "restarting from persistent state",
+                    appliedIndex);
             this.node = Node.restartNode(config);
-            restoreStateMachine();
         } else {
             log.info("pd-raft node={} fresh start with {} peers", nodeId, peers.size());
             this.node = Node.startNode(config, peers);
@@ -116,7 +147,8 @@ public final class PdRaftNode implements AutoCloseable {
 
         transport.setReceiver(msg -> {
             try { this.node.step(msg); }
-            catch (Exception e) { log.warn("pd-raft step failed", e); }
+            catch (Exception e) { log.warn("pd-raft step failed: from={} to={} type={}",
+                    msg.getFrom(), msg.getTo(), msg.getMsgType()); }
         });
         transport.start();
 
@@ -150,55 +182,6 @@ public final class PdRaftNode implements AutoCloseable {
         });
         this.tickTimer.scheduleAtFixedRate(this::tickSafely,
                 heartbeatTickMs, heartbeatTickMs, TimeUnit.MILLISECONDS);
-    }
-
-    private void restoreStateMachine() {
-        long replayFrom = storage.firstIndex();
-
-        try {
-            var snap = storage.snapshot();
-            if (snap.hasMetadata() && snap.getMetadata().getIndex() > 0) {
-                stateMachine.installSnapshot(snap.getData().toByteArray());
-                replayFrom = snap.getMetadata().getIndex() + 1;
-                log.info("pd-raft state machine restored from snapshot at index={}",
-                        snap.getMetadata().getIndex());
-            }
-        } catch (RaftException e) {
-            log.info("pd-raft no snapshot available — rebuilding from entry replay");
-        }
-
-        if (replayFrom <= appliedIndex) {
-            int replayed = 0;
-            try {
-                var entries = storage.entries(replayFrom, appliedIndex + 1, Long.MAX_VALUE);
-                for (var entry : entries) {
-                    if (entry.getData().size() == 0) continue;
-                    replayEntry(entry);
-                    replayed++;
-                }
-            } catch (RaftException e) {
-                log.warn("pd-raft entry replay from {} to {} failed: {}",
-                        replayFrom, appliedIndex, e.getMessage());
-            }
-            log.info("pd-raft replayed {} entries [{}, {}]", replayed, replayFrom, appliedIndex);
-        }
-    }
-
-    private void replayEntry(Eraftpb.Entry entry) {
-        if (entry.getEntryType() == Eraftpb.EntryType.EntryConfChange
-                || entry.getEntryType() == Eraftpb.EntryType.EntryConfChangeV2) {
-            return;
-        }
-        byte[] data = entry.getData().toByteArray();
-        if (data.length < 8) return;
-        byte[] command = new byte[data.length - 8];
-        System.arraycopy(data, 8, command, 0, command.length);
-        try {
-            stateMachine.applyCommand(command);
-        } catch (Throwable t) {
-            log.warn("pd-raft replay entry at index={} failed: {}",
-                    entry.getIndex(), t.getMessage());
-        }
     }
 
     public void setLeaderObserver(java.util.function.Consumer<Boolean> observer) {
@@ -239,10 +222,56 @@ public final class PdRaftNode implements AutoCloseable {
         byte[] envelope = withSeq(command, seq);
         var fut = new CompletableFuture<byte[]>();
         pendingProposals.put(seq, fut);
+        fut.orTimeout(PENDING_FUTURE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        fut.whenComplete((v, ex) -> pendingProposals.remove(seq));
         try {
             node.propose(envelope);
         } catch (RaftException | InterruptedException e) {
             pendingProposals.remove(seq);
+            fut.completeExceptionally(e);
+            if (e instanceof InterruptedException) Thread.currentThread().interrupt();
+        }
+        return fut;
+    }
+
+    /**
+     * Linearizable read: confirm leadership via quorum heartbeat before serving.
+     * The returned future resolves once the applied index reaches the read index.
+     */
+    public CompletableFuture<Void> readIndex() {
+        var fut = new CompletableFuture<Void>();
+        byte[] ctx = UUID.randomUUID().toString().getBytes(StandardCharsets.UTF_8);
+        var key = ByteBuffer.wrap(ctx);
+        pendingReadIndices.put(key, fut);
+        fut.orTimeout(PENDING_FUTURE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        fut.whenComplete((v, ex) -> pendingReadIndices.remove(key));
+        try {
+            node.readIndex(ctx);
+        } catch (RaftException | InterruptedException e) {
+            pendingReadIndices.remove(key);
+            fut.completeExceptionally(e);
+            if (e instanceof InterruptedException) Thread.currentThread().interrupt();
+        }
+        return fut;
+    }
+
+    /**
+     * Propose a ConfChangeV2 through raft. The returned future resolves
+     * once the conf-change entry is applied.
+     */
+    public CompletableFuture<Void> proposeConfChange(Eraftpb.ConfChangeV2 cc) {
+        if (!isLeader()) {
+            return CompletableFuture.failedFuture(
+                    new RaftException(RaftException.Code.PROPOSAL_DROPPED, "not leader"));
+        }
+        var fut = new CompletableFuture<Void>();
+        pendingConfChanges.add(fut);
+        fut.orTimeout(PENDING_FUTURE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        fut.whenComplete((v, ex) -> pendingConfChanges.remove(fut));
+        try {
+            node.proposeConfChange(cc);
+        } catch (RaftException | InterruptedException e) {
+            pendingConfChanges.remove(fut);
             fut.completeExceptionally(e);
             if (e instanceof InterruptedException) Thread.currentThread().interrupt();
         }
@@ -292,6 +321,21 @@ public final class PdRaftNode implements AutoCloseable {
             }
         }
 
+        // Process readStates (readIndex responses from raft).
+        if (ready.readStates() != null) {
+            for (var rs : ready.readStates()) {
+                var key = ByteBuffer.wrap(rs.requestCtx());
+                var readFut = pendingReadIndices.remove(key);
+                if (readFut == null || readFut.isDone()) continue;
+                long targetIndex = rs.index();
+                if (appliedIndex >= targetIndex) {
+                    readFut.complete(null);
+                } else {
+                    readIndexWaiters.computeIfAbsent(targetIndex, k -> new ArrayList<>()).add(readFut);
+                }
+            }
+        }
+
         // Install snapshot into state machine (apply phase).
         if (snap != null) {
             try {
@@ -311,14 +355,24 @@ public final class PdRaftNode implements AutoCloseable {
                 if (entry.getData().size() == 0) {
                     appliedIndex = entry.getIndex();
                     storage.setApplied(appliedIndex);
+                    drainReadIndexWaiters();
                     continue;
                 }
                 applyEntry(entry);
                 appliedIndex = entry.getIndex();
                 storage.setApplied(appliedIndex);
+                drainReadIndexWaiters();
                 maybeSnapshot();
             }
         }
+    }
+
+    private void drainReadIndexWaiters() {
+        var headMap = readIndexWaiters.headMap(appliedIndex, true);
+        for (var entry : headMap.entrySet()) {
+            for (var f : entry.getValue()) f.complete(null);
+        }
+        headMap.clear();
     }
 
     private void maybeSnapshot() {
@@ -358,6 +412,11 @@ public final class PdRaftNode implements AutoCloseable {
                 }
             } catch (Exception e) {
                 log.warn("pd-raft conf-change apply failed: {}", e.getMessage());
+            }
+            // Resolve the first pending conf-change future (FIFO order).
+            if (!pendingConfChanges.isEmpty()) {
+                var fut = pendingConfChanges.remove(0);
+                fut.complete(null);
             }
             return;
         }
@@ -403,6 +462,14 @@ public final class PdRaftNode implements AutoCloseable {
         var shutdownEx = RaftException.ErrStopped;
         for (var e : pendingProposals.values()) e.completeExceptionally(shutdownEx);
         pendingProposals.clear();
+        for (var e : pendingReadIndices.values()) e.completeExceptionally(shutdownEx);
+        pendingReadIndices.clear();
+        for (var waiters : readIndexWaiters.values()) {
+            for (var f : waiters) f.completeExceptionally(shutdownEx);
+        }
+        readIndexWaiters.clear();
+        for (var f : pendingConfChanges) f.completeExceptionally(shutdownEx);
+        pendingConfChanges.clear();
     }
 
     // ---- Envelope: 8-byte seq prefix ----

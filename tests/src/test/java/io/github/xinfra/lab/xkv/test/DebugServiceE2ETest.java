@@ -56,7 +56,7 @@ final class DebugServiceE2ETest {
                 .build();
         var self = region.getPeers(0);
 
-        transport = new GrpcRaftTransport(1, 1);
+        transport = new GrpcRaftTransport(1, 1, 1);
         var cm = new io.github.xinfra.lab.xkv.kv.mvcc.ConcurrencyManager(
                 new io.github.xinfra.lab.xkv.kv.mvcc.MaxTsTracker(0));
         peer = new RegionPeerImpl(

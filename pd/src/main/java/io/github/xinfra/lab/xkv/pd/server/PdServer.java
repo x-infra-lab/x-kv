@@ -86,11 +86,21 @@ public final class PdServer {
         long savedBound = state.loadTsoBound();
         tso = new HlcTsoOracle(savedBound,
                 target -> {
+                    var rn = raftNode;
+                    if (rn != null && rn.isLeader()) {
+                        var cmd = io.github.xinfra.lab.xkv.proto.PdInternalpb.PdCommand.newBuilder()
+                                .setType(io.github.xinfra.lab.xkv.proto.PdInternalpb.CommandType.CMD_EXTEND_TSO_BOUND)
+                                .setTsoBound(target)
+                                .build();
+                        return rn.propose(cmd.toByteArray())
+                                .thenApply(bytes -> target);
+                    }
                     state.saveTsoBound(target);
                     return CompletableFuture.completedFuture(target);
                 },
                 System::currentTimeMillis,
                 config.tso().savedIntervalMs());
+        state.setTsoBoundListener(tso::onPhysicalBoundApplied);
         safePoint = new InMemorySafePointService();
         deadlock = new io.github.xinfra.lab.xkv.pd.state.DeadlockDetector();
         storeStatsCache = new StoreStatsCache();
@@ -98,10 +108,15 @@ public final class PdServer {
         scheduleConfigManager = new io.github.xinfra.lab.xkv.pd.config.PdScheduleConfigManager(config.scheduler());
 
         var addr = GrpcChannelFactory.parseHostPort(config.clientAddress());
-        var memberInfos = buildMemberInfos();
         service = new PdServiceImpl(state, tso, safePoint, deadlock,
-                config.clusterId(), config.nodeId(), config.clientAddress(), memberInfos,
+                config.clusterId(), config.nodeId(),
                 storeStatsCache, state.placementRuleManager());
+
+        // Bootstrap self as a member — skip for joining nodes (they receive
+        // member data via raft snapshot from the existing cluster).
+        if (!config.joinMode()) {
+            bootstrapMembers();
+        }
 
         // Multi-PD raft: if peers are configured, start the raft group.
         if (!config.peers().isEmpty()) {
@@ -246,17 +261,42 @@ public final class PdServer {
         // Build the peer list for raft initialization.
         var raftPeers = new ArrayList<Peer>();
         for (var p : config.peers()) raftPeers.add(new Peer(p.id()));
-        // Include self if not already in the list.
         if (config.peers().stream().noneMatch(p -> p.id() == config.nodeId())) {
             raftPeers.add(new Peer(config.nodeId()));
         }
 
         raftNode = new PdRaftNode(config.nodeId(), raftPeers, state, raftTransport, 100,
-                config.dataDir());
+                config.dataDir(), config.joinMode());
         service.setRaftNode(raftNode);
+        service.setTransport(raftTransport);
+
+        state.setMemberAddListener((memberId, peerRaftAddr) -> {
+            if (memberId != config.nodeId()) {
+                raftTransport.addPeer(memberId, peerRaftAddr);
+            }
+        });
 
         log.info("PD raft group started: node={} peers={}", config.nodeId(),
                 config.peers().stream().map(p -> p.id() + "@" + p.raftAddress()).toList());
+    }
+
+    private void bootstrapMembers() {
+        if (!state.allMembers().isEmpty()) return;
+        for (var peer : config.peers()) {
+            String clientAddr = peer.clientAddress().isEmpty() ? "" : peer.clientAddress();
+            if (peer.id() == config.nodeId()) {
+                clientAddr = config.clientAddress();
+            }
+            state.putMember(new io.github.xinfra.lab.xkv.pd.state.PdStateMachine.MemberInfo(
+                    peer.id(), "pd-" + peer.id(), peer.raftAddress(), clientAddr));
+        }
+        boolean selfIncluded = config.peers().stream().anyMatch(p -> p.id() == config.nodeId());
+        if (!selfIncluded) {
+            state.putMember(new io.github.xinfra.lab.xkv.pd.state.PdStateMachine.MemberInfo(
+                    config.nodeId(), "pd-" + config.nodeId(),
+                    config.raftAddress(), config.clientAddress()));
+        }
+        log.info("PD initial members bootstrapped: {} entries", state.allMembers().size());
     }
 
     private final io.micrometer.core.instrument.Counter bgErrorCounter =
@@ -331,23 +371,5 @@ public final class PdServer {
         srv.awaitTermination();
     }
 
-    private List<PdServiceImpl.MemberInfo> buildMemberInfos() {
-        var infos = new ArrayList<PdServiceImpl.MemberInfo>();
-        boolean selfIncluded = false;
-        for (var peer : config.peers()) {
-            String clientAddr = peer.clientAddress().isEmpty()
-                    ? "" : peer.clientAddress();
-            if (peer.id() == config.nodeId()) {
-                clientAddr = config.clientAddress();
-                selfIncluded = true;
-            }
-            infos.add(new PdServiceImpl.MemberInfo(peer.id(), "pd-" + peer.id(), clientAddr));
-        }
-        if (!selfIncluded) {
-            infos.add(new PdServiceImpl.MemberInfo(config.nodeId(),
-                    "pd-" + config.nodeId(), config.clientAddress()));
-        }
-        return infos;
-    }
 
 }

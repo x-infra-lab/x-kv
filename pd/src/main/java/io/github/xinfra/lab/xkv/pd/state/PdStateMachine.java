@@ -85,6 +85,18 @@ public interface PdStateMachine {
 
     default java.util.Map<Long, RegionStats> allRegionStats() { return java.util.Map.of(); }
 
+    // ---- Members (PD cluster membership) ----
+
+    record MemberInfo(long id, String name, String raftAddress, String clientAddress) {}
+
+    default void putMember(MemberInfo member) {}
+
+    default void removeMember(long memberId) {}
+
+    default Optional<MemberInfo> getMember(long memberId) { return Optional.empty(); }
+
+    default java.util.List<MemberInfo> allMembers() { return java.util.List.of(); }
+
     // ---- ID alloc ----
 
     /** Allocate {@code count} consecutive ids; advances persisted counter. */

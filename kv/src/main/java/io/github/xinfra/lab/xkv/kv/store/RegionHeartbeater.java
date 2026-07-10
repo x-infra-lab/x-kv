@@ -38,6 +38,7 @@ public final class RegionHeartbeater implements AutoCloseable {
     private final SplitTrigger splitTrigger;
     private final StorageEngine engine;
     private final Counter errorCounter = XKvMetrics.errorCounter("region_heartbeater", "tick");
+    private volatile java.util.concurrent.CompletableFuture<?> confChangeInFlight;
 
     public RegionHeartbeater(PDGrpc.PDStub asyncStub, RegionPeer peer, long intervalMs) {
         this(asyncStub, peer, intervalMs, null, null);
@@ -197,6 +198,13 @@ public final class RegionHeartbeater implements AutoCloseable {
      * so the apply path can update the region descriptor.
      */
     private void proposeChangePeers(java.util.List<Pdpb.ChangePeer> changes) {
+        var prev = confChangeInFlight;
+        if (prev != null && !prev.isDone()) {
+            log.debug("heartbeat: skipping conf-change on region={} — previous still in-flight",
+                    peer.regionId());
+            return;
+        }
+
         var v2 = io.github.xinfra.lab.raft.proto.Eraftpb.ConfChangeV2.newBuilder();
         var ctx = io.github.xinfra.lab.xkv.proto.KvServerpb.ConfChangeContext.newBuilder();
         for (var cp : changes) {
@@ -209,7 +217,10 @@ public final class RegionHeartbeater implements AutoCloseable {
         v2.setContext(com.google.protobuf.ByteString.copyFrom(ctx.build().toByteArray()));
         log.info("heartbeat: PD ordered conf-change on region={} ({} changes)",
                 peer.regionId(), changes.size());
-        peer.proposeConfChange(v2.build()).whenComplete((r, err) -> {
+        var fut = peer.proposeConfChange(v2.build());
+        confChangeInFlight = fut;
+        fut.whenComplete((r, err) -> {
+            confChangeInFlight = null;
             if (err != null || (r != null && !r.success())) {
                 log.warn("PD-ordered conf-change on region={} failed: {}",
                         peer.regionId(),

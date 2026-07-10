@@ -40,6 +40,7 @@ public final class GrpcRaftTransport implements Transport {
     private final long regionId;
     /** id of THIS peer; outbound messages where to == self are dropped. */
     private final long selfPeerId;
+    private final long selfStoreId;
     private final TlsConfig tls;
 
     /** Per-target-peer outbound state. Keyed by peer id; address is required to open. */
@@ -48,18 +49,22 @@ public final class GrpcRaftTransport implements Transport {
     /** peerId → "host:port". Refreshed via {@link #addPeer}. */
     private final ConcurrentHashMap<Long, String> addresses = new ConcurrentHashMap<>();
 
+    /** peerId → storeId. Populated via {@link #addPeer(long, String, long)}. */
+    private final ConcurrentHashMap<Long, Long> peerStoreIds = new ConcurrentHashMap<>();
+
     private volatile MessageReceiver receiver;
     private volatile boolean closed = false;
     private final Counter sendErrorCounter = XKvMetrics.errorCounter("raft_transport", "send");
     private final java.util.concurrent.ExecutorService snapshotSender;
 
-    public GrpcRaftTransport(long regionId, long selfPeerId) {
-        this(regionId, selfPeerId, null);
+    public GrpcRaftTransport(long regionId, long selfPeerId, long selfStoreId) {
+        this(regionId, selfPeerId, selfStoreId, null);
     }
 
-    public GrpcRaftTransport(long regionId, long selfPeerId, TlsConfig tls) {
+    public GrpcRaftTransport(long regionId, long selfPeerId, long selfStoreId, TlsConfig tls) {
         this.regionId = regionId;
         this.selfPeerId = selfPeerId;
+        this.selfStoreId = selfStoreId;
         this.tls = tls;
         this.snapshotSender = java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
             var t = new Thread(r, "snap-send-" + regionId);
@@ -85,11 +90,14 @@ public final class GrpcRaftTransport implements Transport {
 
     @Override
     public void addPeer(long id, String address) {
+        addPeer(id, address, 0);
+    }
+
+    public void addPeer(long id, String address, long storeId) {
         if (address == null || address.isEmpty()) return;
+        if (storeId != 0) peerStoreIds.put(id, storeId);
         var prev = addresses.put(id, address);
         if (prev != null && !prev.equals(address)) {
-            // Address changed (PD scheduled the peer to a different store);
-            // close the stale outbound link so the next send dials fresh.
             var link = outbound.remove(id);
             if (link != null) link.close();
         }
@@ -98,6 +106,7 @@ public final class GrpcRaftTransport implements Transport {
     @Override
     public void removePeer(long id) {
         addresses.remove(id);
+        peerStoreIds.remove(id);
         var link = outbound.remove(id);
         if (link != null) link.close();
     }
@@ -124,6 +133,7 @@ public final class GrpcRaftTransport implements Transport {
         for (var link : outbound.values()) link.close();
         outbound.clear();
         addresses.clear();
+        peerStoreIds.clear();
     }
 
     // =====================================================================
@@ -158,9 +168,10 @@ public final class GrpcRaftTransport implements Transport {
                 var wire = KvServerpb.RaftMessage.newBuilder()
                         .setRegionId(regionId)
                         .setFromPeer(io.github.xinfra.lab.xkv.proto.Metapb.Peer.newBuilder()
-                                .setId(selfPeerId).setStoreId(0))
+                                .setId(selfPeerId).setStoreId(selfStoreId))
                         .setToPeer(io.github.xinfra.lab.xkv.proto.Metapb.Peer.newBuilder()
-                                .setId(targetPeerId).setStoreId(0))
+                                .setId(targetPeerId)
+                                .setStoreId(peerStoreIds.getOrDefault(targetPeerId, 0L)))
                         .setMessage(ByteString.copyFrom(msg.toByteArray()))
                         .build();
                 s.onNext(wire);

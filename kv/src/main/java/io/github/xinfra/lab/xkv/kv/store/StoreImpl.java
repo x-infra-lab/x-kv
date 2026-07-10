@@ -18,7 +18,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * <p>Holds the local set of {@link RegionPeer}s plus a side index by
  * {@code start_key} so {@link #peerForKey} is O(log N). v1's equivalent
  * did a linear scan; the v2 indexing is the same trick we apply on the
- * PD side ({@link io.github.xinfra.lab.xkv.pd.state.InMemoryPdStateMachine}).
+ * PD side ({@link io.github.xinfra.lab.xkv.pd.state.RocksDbPdStateMachine}).
  *
  * <p>Add / remove operations grab the write lock; reads take the read lock.
  * Per-peer state machines are otherwise lock-free — region peer mutex

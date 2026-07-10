@@ -5,15 +5,19 @@ import io.github.xinfra.lab.xkv.kv.coprocessor.dag.CopChunk;
 import io.github.xinfra.lab.xkv.kv.coprocessor.dag.CopRecord;
 import io.github.xinfra.lab.xkv.kv.coprocessor.dag.VecIndexLookupOp;
 import io.github.xinfra.lab.xkv.kv.coprocessor.dag.VecIndexScanOp;
+import io.github.xinfra.lab.xkv.kv.coprocessor.eval.CopDatumComparator;
 import io.github.xinfra.lab.xkv.kv.coprocessor.dag.VecLimitOp;
 import io.github.xinfra.lab.xkv.kv.coprocessor.dag.VecOperator;
+import io.github.xinfra.lab.xkv.kv.coprocessor.dag.VecProjectionOp;
 import io.github.xinfra.lab.xkv.kv.coprocessor.dag.VecSelectionOp;
 import io.github.xinfra.lab.xkv.kv.coprocessor.dag.VecTopNOp;
 import io.github.xinfra.lab.xkv.kv.engine.StorageEngine;
+import io.github.xinfra.lab.xkv.kv.mvcc.KeyLockedException;
 import io.github.xinfra.lab.xkv.kv.mvcc.MvccReader;
 import io.github.xinfra.lab.xkv.proto.Coprocessor.Request;
 import io.github.xinfra.lab.xkv.proto.Coprocessor.Response;
 import io.github.xinfra.lab.xkv.proto.Coprocessor.StreamResponse;
+import io.github.xinfra.lab.xkv.proto.Kvrpcpb;
 import io.github.xinfra.lab.xkv.proto.Tipb;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -37,6 +41,7 @@ public final class IndexScanCoprocessor implements Coprocessor {
     private static final int DEFAULT_SCAN_LIMIT = 10_000;
     private static final int DEFAULT_SCAN_BATCH_SIZE = 1024;
     private static final int STREAM_CHUNK_SIZE = 256;
+    private static final int MAX_STREAM_CHUNKS = 4096;
 
     private final StorageEngine engine;
     private final int scanBatchSize;
@@ -58,14 +63,17 @@ public final class IndexScanCoprocessor implements Coprocessor {
     @Override
     public Response handle(Request req) {
         long startTs = req.getStartTs();
+        long deadlineMs = SQLScanCoprocessor.extractDeadlineMs(req);
         try (var snapshot = engine.newSnapshot();
              var reader = new MvccReader(engine, snapshot, false)) {
 
             Tipb.DAGRequest dagReq = Tipb.DAGRequest.parseFrom(req.getData().toByteArray());
+            CopDatumComparator.setCollation(dagReq.getCollation());
             int limit = req.getPagingSize() > 0 ? (int) req.getPagingSize() : DEFAULT_SCAN_LIMIT;
             boolean hasTopN = dagReq.getTopnLimit() > 0;
 
-            VecOperator pipeline = buildVecPipeline(reader, dagReq, req, startTs);
+            PipelineResult pr = buildVecPipeline(reader, dagReq, req, startTs);
+            VecOperator pipeline = pr.pipeline();
 
             if (hasTopN) {
                 pipeline = new VecTopNOp(pipeline, dagReq.getOrderByList(),
@@ -74,45 +82,56 @@ public final class IndexScanCoprocessor implements Coprocessor {
                 pipeline = new VecLimitOp(pipeline, limit);
             }
 
+            pipeline = SQLScanCoprocessor.wrapDeadline(pipeline, deadlineMs);
             pipeline.open();
             try {
-                return drainToKvPairResponse(pipeline);
+                Response resp = drainToKvPairResponse(pipeline);
+                return withLockError(resp, pr.scanOp().lockError());
             } finally {
                 pipeline.close();
             }
         } catch (Throwable t) {
             log.warn("IndexScanCoprocessor error", t);
             return Response.newBuilder().setOtherError(t.getMessage()).build();
+        } finally {
+            CopDatumComparator.clearCollation();
         }
     }
 
     @Override
     public void handleStream(Request req, Consumer<StreamResponse> sink) {
         long startTs = req.getStartTs();
+        long deadlineMs = SQLScanCoprocessor.extractDeadlineMs(req);
         try (var snapshot = engine.newSnapshot();
              var reader = new MvccReader(engine, snapshot, false)) {
 
             Tipb.DAGRequest dagReq = Tipb.DAGRequest.parseFrom(req.getData().toByteArray());
+            CopDatumComparator.setCollation(dagReq.getCollation());
             boolean hasTopN = dagReq.getTopnLimit() > 0;
             int pagingSize = req.getPagingSize() > 0 ? (int) req.getPagingSize() : Integer.MAX_VALUE;
 
-            VecOperator pipeline = buildVecPipeline(reader, dagReq, req, startTs);
+            PipelineResult pr = buildVecPipeline(reader, dagReq, req, startTs);
+            VecOperator pipeline = pr.pipeline();
 
             if (hasTopN) {
                 pipeline = new VecTopNOp(pipeline, dagReq.getOrderByList(),
                         dagReq.getTopnLimit(), dagReq.getTopnOffset());
+                pipeline = SQLScanCoprocessor.wrapDeadline(pipeline, deadlineMs);
                 pipeline.open();
                 try {
                     Response resp = drainToKvPairResponse(pipeline);
                     sink.accept(StreamResponse.newBuilder().setData(resp.getData()).build());
+                    emitLockErrorStream(pr.scanOp().lockError(), sink);
                 } finally {
                     pipeline.close();
                 }
             } else {
                 pipeline = new VecLimitOp(pipeline, pagingSize);
+                pipeline = SQLScanCoprocessor.wrapDeadline(pipeline, deadlineMs);
                 pipeline.open();
                 try {
                     streamKvPairChunks(pipeline, sink);
+                    emitLockErrorStream(pr.scanOp().lockError(), sink);
                 } finally {
                     pipeline.close();
                 }
@@ -120,12 +139,17 @@ public final class IndexScanCoprocessor implements Coprocessor {
         } catch (Throwable t) {
             log.warn("IndexScanCoprocessor stream error", t);
             sink.accept(StreamResponse.newBuilder().setOtherError(t.getMessage()).build());
+        } finally {
+            CopDatumComparator.clearCollation();
         }
     }
 
-    private VecOperator buildVecPipeline(MvccReader reader, Tipb.DAGRequest dagReq,
-                                          Request req, long startTs) {
-        VecOperator pipeline = new VecIndexScanOp(reader, dagReq, req.getRangesList(), startTs);
+    record PipelineResult(VecOperator pipeline, VecIndexScanOp scanOp) {}
+
+    private PipelineResult buildVecPipeline(MvccReader reader, Tipb.DAGRequest dagReq,
+                                             Request req, long startTs) {
+        var scan = new VecIndexScanOp(reader, dagReq, req.getRangesList(), startTs);
+        VecOperator pipeline = scan;
 
         if (dagReq.getIndexLookup()) {
             pipeline = new VecIndexLookupOp(pipeline, reader, dagReq, startTs);
@@ -135,7 +159,28 @@ public final class IndexScanCoprocessor implements Coprocessor {
             pipeline = new VecSelectionOp(pipeline, dagReq.getConditionsList());
         }
 
-        return pipeline;
+        if (dagReq.getProjectionsCount() > 0) {
+            pipeline = new VecProjectionOp(pipeline, dagReq.getProjectionsList());
+        }
+
+        return new PipelineResult(pipeline, scan);
+    }
+
+    private static Response withLockError(Response resp, KeyLockedException lockErr) {
+        if (lockErr == null) return resp;
+        return resp.toBuilder()
+                .setLocked(Kvrpcpb.KeyError.newBuilder()
+                        .setLocked(SQLScanCoprocessor.toLockInfo(lockErr)))
+                .build();
+    }
+
+    private static void emitLockErrorStream(KeyLockedException lockErr,
+                                             Consumer<StreamResponse> sink) {
+        if (lockErr == null) return;
+        sink.accept(StreamResponse.newBuilder()
+                .setLocked(Kvrpcpb.KeyError.newBuilder()
+                        .setLocked(SQLScanCoprocessor.toLockInfo(lockErr)))
+                .build());
     }
 
     private Response drainToKvPairResponse(VecOperator pipeline) {
@@ -159,21 +204,27 @@ public final class IndexScanCoprocessor implements Coprocessor {
 
     private void streamKvPairChunks(VecOperator pipeline, Consumer<StreamResponse> sink) {
         var encoder = new TableScanCoprocessor.KvPairEncoder();
-        int chunkCount = 0;
+        int recordsInBatch = 0;
+        int chunksEmitted = 0;
         CopChunk chunk;
         while ((chunk = pipeline.nextChunk(STREAM_CHUNK_SIZE)) != null) {
             for (int i = 0; i < chunk.size(); i++) {
                 CopRecord record = chunk.get(i);
                 encoder.add(record.key(), record.value());
-                chunkCount++;
-                if (chunkCount >= STREAM_CHUNK_SIZE) {
+                recordsInBatch++;
+                if (recordsInBatch >= STREAM_CHUNK_SIZE) {
                     emitChunk(encoder, sink);
                     encoder = new TableScanCoprocessor.KvPairEncoder();
-                    chunkCount = 0;
+                    recordsInBatch = 0;
+                    chunksEmitted++;
+                    if (chunksEmitted >= MAX_STREAM_CHUNKS) {
+                        log.warn("stream truncated at {} chunks", MAX_STREAM_CHUNKS);
+                        return;
+                    }
                 }
             }
         }
-        if (chunkCount > 0) {
+        if (recordsInBatch > 0) {
             emitChunk(encoder, sink);
         }
     }

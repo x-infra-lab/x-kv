@@ -12,6 +12,8 @@ import java.util.List;
  */
 public final class VecSelectionOp implements VecOperator {
 
+    private static final int MAX_EMPTY_ROUNDS = 10_000;
+
     private final VecOperator child;
     private final List<Tipb.Expr> conditions;
 
@@ -27,9 +29,10 @@ public final class VecSelectionOp implements VecOperator {
 
     @Override
     public CopChunk nextChunk(int batchSize) {
-        while (true) {
+        for (int attempts = 0; attempts < MAX_EMPTY_ROUNDS; attempts++) {
             CopChunk input = child.nextChunk(batchSize);
             if (input == null) return null;
+            if (input.isEmpty()) continue;
 
             var filtered = new ArrayList<CopRecord>(input.size());
             for (int i = 0; i < input.size(); i++) {
@@ -43,6 +46,7 @@ public final class VecSelectionOp implements VecOperator {
                 return new CopChunk(filtered);
             }
         }
+        return null;
     }
 
     @Override

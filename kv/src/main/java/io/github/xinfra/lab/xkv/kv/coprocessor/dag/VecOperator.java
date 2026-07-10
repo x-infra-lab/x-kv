@@ -1,5 +1,7 @@
 package io.github.xinfra.lab.xkv.kv.coprocessor.dag;
 
+import io.github.xinfra.lab.xkv.kv.mvcc.KeyLockedException;
+
 /**
  * Vectorized (chunk-based) operator interface.
  *
@@ -15,6 +17,8 @@ public interface VecOperator extends AutoCloseable {
      * or {@code null} when the input is exhausted.
      */
     CopChunk nextChunk(int batchSize);
+
+    default KeyLockedException lockError() { return null; }
 
     @Override
     void close();

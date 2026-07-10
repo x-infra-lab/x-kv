@@ -66,6 +66,7 @@ public final class RocksDbPdStateMachine implements PdStateMachine {
     private static final byte PREFIX_STORE = 0x10;
     private static final byte PREFIX_REGION = 0x20;
     private static final byte PREFIX_REGION_START_KEY = 0x30;
+    private static final byte PREFIX_MEMBER = 0x40;
 
     private final RocksDB db;
     private final WriteOptions syncWrite;
@@ -80,6 +81,7 @@ public final class RocksDbPdStateMachine implements PdStateMachine {
     private final AtomicLong idAllocator = new AtomicLong(1000);
     private volatile long tsoBound;
 
+    private final HashMap<Long, MemberInfo> membersMap = new HashMap<>();
     private final HashMap<Long, Metapb.Peer> leaders = new HashMap<>();
     private final ConcurrentHashMap<Long, RegionStats> regionStats = new ConcurrentHashMap<>();
     private final io.github.xinfra.lab.xkv.pd.state.placement.PlacementRuleManager placementRules =
@@ -88,6 +90,8 @@ public final class RocksDbPdStateMachine implements PdStateMachine {
             new io.github.xinfra.lab.xkv.pd.state.keyspace.KeyspaceManager();
     private final io.github.xinfra.lab.xkv.pd.state.keyspace.ResourceGroupManager resourceGroups =
             new io.github.xinfra.lab.xkv.pd.state.keyspace.ResourceGroupManager();
+    private volatile java.util.function.LongConsumer tsoBoundListener;
+    private volatile java.util.function.BiConsumer<Long, String> memberAddListener;
 
     public RocksDbPdStateMachine(Path dataDir) {
         try {
@@ -152,6 +156,17 @@ public final class RocksDbPdStateMachine implements PdStateMachine {
                     var region = Metapb.Region.parseFrom(it.value());
                     regionsById.put(region.getId(), region);
                     regionsByStart.put(region.getStartKey(), region);
+                    it.next();
+                }
+            }
+
+            try (RocksIterator it = db.newIterator()) {
+                it.seek(new byte[]{PREFIX_MEMBER});
+                while (it.isValid() && it.key()[0] == PREFIX_MEMBER) {
+                    var entry = PdInternalpb.MemberEntry.parseFrom(it.value());
+                    membersMap.put(entry.getId(), new MemberInfo(
+                            entry.getId(), entry.getName(),
+                            entry.getRaftAddress(), entry.getClientAddress()));
                     it.next();
                 }
             }
@@ -359,6 +374,52 @@ public final class RocksDbPdStateMachine implements PdStateMachine {
     }
 
     @Override
+    public void putMember(MemberInfo member) {
+        lock.writeLock().lock();
+        try {
+            membersMap.put(member.id(), member);
+            var entry = PdInternalpb.MemberEntry.newBuilder()
+                    .setId(member.id())
+                    .setName(member.name())
+                    .setRaftAddress(member.raftAddress())
+                    .setClientAddress(member.clientAddress())
+                    .build();
+            db.put(syncWrite, memberKey(member.id()), entry.toByteArray());
+        } catch (RocksDBException e) {
+            throw new RuntimeException("putMember write failed", e);
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    @Override
+    public void removeMember(long memberId) {
+        lock.writeLock().lock();
+        try {
+            membersMap.remove(memberId);
+            db.delete(syncWrite, memberKey(memberId));
+        } catch (RocksDBException e) {
+            throw new RuntimeException("removeMember write failed", e);
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    @Override
+    public Optional<MemberInfo> getMember(long memberId) {
+        lock.readLock().lock();
+        try { return Optional.ofNullable(membersMap.get(memberId)); }
+        finally { lock.readLock().unlock(); }
+    }
+
+    @Override
+    public java.util.List<MemberInfo> allMembers() {
+        lock.readLock().lock();
+        try { return new ArrayList<>(membersMap.values()); }
+        finally { lock.readLock().unlock(); }
+    }
+
+    @Override
     public long allocId(int count) {
         if (count <= 0) throw new IllegalArgumentException();
         long base = idAllocator.getAndAdd(count);
@@ -400,6 +461,12 @@ public final class RocksDbPdStateMachine implements PdStateMachine {
             for (var rule : placementRules.getRules()) snap.addPlacementRules(rule.toProto());
             for (var ks : keyspaces.encode()) snap.addKeyspaces(ks);
             for (var rg : resourceGroups.encode()) snap.addResourceGroups(rg);
+            for (var m : membersMap.values()) {
+                snap.addMembers(PdInternalpb.MemberEntry.newBuilder()
+                        .setId(m.id()).setName(m.name())
+                        .setRaftAddress(m.raftAddress())
+                        .setClientAddress(m.clientAddress()));
+            }
             return snap.build().toByteArray();
         } finally {
             lock.readLock().unlock();
@@ -415,6 +482,7 @@ public final class RocksDbPdStateMachine implements PdStateMachine {
             stores.clear();
             regionsById.clear();
             regionsByStart.clear();
+            membersMap.clear();
 
             bootstrapped = snap.getBootstrapped();
             cluster = snap.hasCluster() ? snap.getCluster() : null;
@@ -439,6 +507,10 @@ public final class RocksDbPdStateMachine implements PdStateMachine {
             }
             if (snap.getResourceGroupsCount() > 0) {
                 resourceGroups.decode(snap.getResourceGroupsList());
+            }
+            for (var me : snap.getMembersList()) {
+                membersMap.put(me.getId(), new MemberInfo(
+                        me.getId(), me.getName(), me.getRaftAddress(), me.getClientAddress()));
             }
             clearAndWriteAll();
             log.info("PD snapshot installed: {} stores, {} regions, {} rules, {} keyspaces, {} resource_groups, idAlloc={}",
@@ -478,6 +550,14 @@ public final class RocksDbPdStateMachine implements PdStateMachine {
                 batch.put(regionKey(r.getId()), r.toByteArray());
                 batch.put(regionStartKeyKey(r.getStartKey()),
                         encodeLong(r.getId()));
+            }
+            for (var m : membersMap.values()) {
+                var entry = PdInternalpb.MemberEntry.newBuilder()
+                        .setId(m.id()).setName(m.name())
+                        .setRaftAddress(m.raftAddress())
+                        .setClientAddress(m.clientAddress())
+                        .build();
+                batch.put(memberKey(m.id()), entry.toByteArray());
             }
             db.write(syncWrite, batch);
         }
@@ -535,6 +615,27 @@ public final class RocksDbPdStateMachine implements PdStateMachine {
                     var payload = cmd.getResourceGroup();
                     resourceGroups.deleteGroup(payload.getName());
                 }
+                case CMD_ADD_MEMBER -> {
+                    var payload = cmd.getMemberChange();
+                    putMember(new MemberInfo(payload.getMemberId(), payload.getName(),
+                            payload.getRaftAddress(), payload.getClientAddress()));
+                    var mal = memberAddListener;
+                    if (mal != null && !payload.getRaftAddress().isEmpty()) {
+                        mal.accept(payload.getMemberId(), payload.getRaftAddress());
+                    }
+                }
+                case CMD_REMOVE_MEMBER -> {
+                    var payload = cmd.getMemberChange();
+                    removeMember(payload.getMemberId());
+                }
+                case CMD_EXTEND_TSO_BOUND -> {
+                    long newBound = cmd.getTsoBound();
+                    if (newBound > tsoBound) {
+                        saveTsoBound(newBound);
+                        var listener = tsoBoundListener;
+                        if (listener != null) listener.accept(newBound);
+                    }
+                }
                 default -> log.warn("unknown PD command type: {}", cmd.getType());
             }
         } catch (Exception e) {
@@ -553,6 +654,14 @@ public final class RocksDbPdStateMachine implements PdStateMachine {
 
     public long loadTsoBound() {
         return tsoBound;
+    }
+
+    public void setTsoBoundListener(java.util.function.LongConsumer listener) {
+        this.tsoBoundListener = listener;
+    }
+
+    public void setMemberAddListener(java.util.function.BiConsumer<Long, String> listener) {
+        this.memberAddListener = listener;
     }
 
     @Override public void onBecomeLeader() {}
@@ -611,6 +720,13 @@ public final class RocksDbPdStateMachine implements PdStateMachine {
         byte[] key = new byte[9];
         key[0] = PREFIX_REGION;
         putLong(key, 1, regionId);
+        return key;
+    }
+
+    private static byte[] memberKey(long memberId) {
+        byte[] key = new byte[9];
+        key[0] = PREFIX_MEMBER;
+        putLong(key, 1, memberId);
         return key;
     }
 

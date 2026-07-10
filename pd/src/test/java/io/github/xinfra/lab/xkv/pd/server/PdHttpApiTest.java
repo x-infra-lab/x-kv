@@ -2,32 +2,37 @@ package io.github.xinfra.lab.xkv.pd.server;
 
 import io.github.xinfra.lab.xkv.common.metrics.MetricsHttpServer;
 import io.github.xinfra.lab.xkv.pd.config.PdScheduleConfigManager;
-import io.github.xinfra.lab.xkv.pd.state.InMemoryPdStateMachine;
 import io.github.xinfra.lab.xkv.pd.state.LeaderBalanceScheduler;
 import io.github.xinfra.lab.xkv.pd.state.OperatorControllerImpl;
 import io.github.xinfra.lab.xkv.pd.state.RegionBalanceScheduler;
+import io.github.xinfra.lab.xkv.pd.state.RocksDbPdStateMachine;
 import io.github.xinfra.lab.xkv.pd.state.SchedulerManager;
 import io.micrometer.prometheusmetrics.PrometheusConfig;
 import io.micrometer.prometheusmetrics.PrometheusMeterRegistry;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.file.Path;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 class PdHttpApiTest {
 
+    @TempDir
+    Path tempDir;
+
     private MetricsHttpServer httpServer;
     private SchedulerManager schedulerManager;
     private PdScheduleConfigManager configManager;
-    private InMemoryPdStateMachine state;
+    private RocksDbPdStateMachine state;
     private HttpClient client;
     private int port;
 
@@ -36,7 +41,7 @@ class PdHttpApiTest {
 
     @BeforeEach
     void setUp() throws IOException {
-        state = new InMemoryPdStateMachine();
+        state = new RocksDbPdStateMachine(tempDir.resolve("pd-state"));
         schedulerManager = new SchedulerManager();
         configManager = new PdScheduleConfigManager();
 
@@ -61,6 +66,7 @@ class PdHttpApiTest {
         leaderBalance.close();
         regionBalance.close();
         httpServer.close();
+        state.close();
     }
 
     @Test

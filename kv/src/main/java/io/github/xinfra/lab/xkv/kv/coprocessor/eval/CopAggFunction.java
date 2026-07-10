@@ -190,6 +190,8 @@ public sealed interface CopAggFunction permits
     }
 
     final class GroupConcatAgg implements CopAggFunction {
+        private static final int MAX_CONCAT_LEN = 1_048_576;
+
         private final boolean dist;
         private final StringBuilder sb = new StringBuilder();
         private boolean first = true;
@@ -201,6 +203,7 @@ public sealed interface CopAggFunction permits
         @Override public boolean distinct() { return dist; }
         @Override public void update(CopDatum value) {
             if (value.isNull()) return;
+            if (sb.length() >= MAX_CONCAT_LEN) return;
             if (dist && !seen.add(value.toStringValue())) return;
             if (!first) sb.append(",");
             sb.append(value.toStringValue());
@@ -209,6 +212,7 @@ public sealed interface CopAggFunction permits
         @Override public void merge(CopAggFunction other) {
             GroupConcatAgg o = (GroupConcatAgg) other;
             if (!o.first) {
+                if (sb.length() >= MAX_CONCAT_LEN) return;
                 if (!first) sb.append(",");
                 sb.append(o.sb);
                 first = false;

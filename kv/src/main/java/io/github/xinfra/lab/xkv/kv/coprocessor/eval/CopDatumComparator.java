@@ -6,6 +6,16 @@ import java.util.Arrays;
 public final class CopDatumComparator {
     private CopDatumComparator() {}
 
+    public static final int COLLATION_BINARY = 0;
+    public static final int COLLATION_UTF8_GENERAL_CI = 1;
+    public static final int COLLATION_UTF8_UNICODE_CI = 2;
+
+    private static final ThreadLocal<Integer> COLLATION = ThreadLocal.withInitial(() -> COLLATION_BINARY);
+
+    public static void setCollation(int collation) { COLLATION.set(collation); }
+    public static int getCollation() { return COLLATION.get(); }
+    public static void clearCollation() { COLLATION.remove(); }
+
     public static int compare(CopDatum a, CopDatum b) {
         if (a.isNull() && b.isNull()) return 0;
         if (a.isNull()) return -1;
@@ -18,7 +28,7 @@ public final class CopDatumComparator {
         if (a instanceof CopDatum.DecimalVal ad && b instanceof CopDatum.DecimalVal bd)
             return ad.value().compareTo(bd.value());
         if (a instanceof CopDatum.StringVal as && b instanceof CopDatum.StringVal bs)
-            return as.value().compareTo(bs.value());
+            return compareStrings(as.value(), bs.value());
         if (a instanceof CopDatum.DateTimeVal ad && b instanceof CopDatum.DateTimeVal bd)
             return ad.value().compareTo(bd.value());
         if (a instanceof CopDatum.BytesVal ab && b instanceof CopDatum.BytesVal bb)
@@ -34,7 +44,15 @@ public final class CopDatumComparator {
             return Long.compare(a.toLong(), b.toLong());
         }
 
-        return a.toStringValue().compareTo(b.toStringValue());
+        return compareStrings(a.toStringValue(), b.toStringValue());
+    }
+
+    private static int compareStrings(String a, String b) {
+        int collation = COLLATION.get();
+        if (collation == COLLATION_UTF8_GENERAL_CI || collation == COLLATION_UTF8_UNICODE_CI) {
+            return a.compareToIgnoreCase(b);
+        }
+        return a.compareTo(b);
     }
 
     private static boolean isNumeric(CopDatum d) {

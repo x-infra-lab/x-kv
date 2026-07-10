@@ -1,22 +1,35 @@
 package io.github.xinfra.lab.xkv.pd.state;
 
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.nio.file.Path;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 class SchedulerManagerTest {
 
+    @TempDir
+    Path tempDir;
+
     private SchedulerManager mgr;
+    private RocksDbPdStateMachine state;
 
     @BeforeEach
     void setUp() {
         mgr = new SchedulerManager();
+        state = new RocksDbPdStateMachine(tempDir.resolve("pd-state"));
+    }
+
+    @AfterEach
+    void tearDown() {
+        state.close();
     }
 
     @Test
     void registerAndList() {
-        var state = new InMemoryPdStateMachine();
         var controller = new OperatorControllerImpl(5, 600_000);
         var scheduler = new LeaderBalanceScheduler(state, controller, 60_000);
 
@@ -33,7 +46,6 @@ class SchedulerManagerTest {
 
     @Test
     void pauseAndResume() {
-        var state = new InMemoryPdStateMachine();
         var controller = new OperatorControllerImpl(5, 600_000);
         var scheduler = new LeaderBalanceScheduler(state, controller, 60_000);
 
@@ -58,7 +70,6 @@ class SchedulerManagerTest {
 
     @Test
     void unregisterRemovesEntry() {
-        var state = new InMemoryPdStateMachine();
         var controller = new OperatorControllerImpl(5, 600_000);
         var scheduler = new LeaderBalanceScheduler(state, controller, 60_000);
 
@@ -74,7 +85,6 @@ class SchedulerManagerTest {
 
     @Test
     void unregisterAll() {
-        var state = new InMemoryPdStateMachine();
         var controller = new OperatorControllerImpl(5, 600_000);
         var s1 = new LeaderBalanceScheduler(state, controller, 60_000);
         var s2 = new RegionBalanceScheduler(state, controller, 60_000);
@@ -92,7 +102,6 @@ class SchedulerManagerTest {
 
     @Test
     void listSortedByName() {
-        var state = new InMemoryPdStateMachine();
         var controller = new OperatorControllerImpl(5, 600_000);
         var s1 = new RegionBalanceScheduler(state, controller, 60_000);
         var s2 = new LeaderBalanceScheduler(state, controller, 60_000);

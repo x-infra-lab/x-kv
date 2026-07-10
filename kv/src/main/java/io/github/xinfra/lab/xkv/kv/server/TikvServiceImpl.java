@@ -1,5 +1,6 @@
 package io.github.xinfra.lab.xkv.kv.server;
 
+import com.google.protobuf.ByteString;
 import io.github.xinfra.lab.xkv.proto.Coprocessor;
 import io.github.xinfra.lab.xkv.proto.Kvrpcpb.*;
 import io.github.xinfra.lab.xkv.proto.TikvGrpc;
@@ -10,10 +11,28 @@ import io.grpc.stub.StreamObserver;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.github.xinfra.lab.xkv.kv.coprocessor.eval.CopDatumComparator;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.PriorityBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 public final class TikvServiceImpl extends TikvGrpc.TikvImplBase {
     private static final Logger log = LoggerFactory.getLogger(TikvServiceImpl.class);
+
+    private static final int COP_POOL_CORE = 4;
+    private static final int COP_POOL_MAX = 16;
+    private static final long COP_POOL_KEEPALIVE_SEC = 60;
+    private static final int COP_MAX_PENDING = 1024;
 
     private final RawKvService rawKv;
     private final TransactionService txn;
@@ -24,6 +43,8 @@ public final class TikvServiceImpl extends TikvGrpc.TikvImplBase {
     private volatile io.github.xinfra.lab.xkv.kv.backup.RestoreManager restoreManager;
 
     private final AtomicLong batchPending = new AtomicLong();
+    private final ExecutorService copExecutor;
+    private final Semaphore copPendingPermits = new Semaphore(COP_MAX_PENDING);
 
     public TikvServiceImpl() { this(null, null, null, null, null); }
 
@@ -48,6 +69,20 @@ public final class TikvServiceImpl extends TikvGrpc.TikvImplBase {
         this.cop = cop;
         this.splitDriver = splitDriver;
         this.splitLocator = splitLocator;
+
+        AtomicLong copThreadId = new AtomicLong();
+        ThreadFactory copTf = r1 -> {
+            Thread t = new Thread(r1, "cop-worker-" + copThreadId.getAndIncrement());
+            t.setDaemon(true);
+            return t;
+        };
+        this.copExecutor = new ThreadPoolExecutor(
+                COP_POOL_CORE, COP_POOL_MAX, COP_POOL_KEEPALIVE_SEC, TimeUnit.SECONDS,
+                new PriorityBlockingQueue<>(64), copTf, new ThreadPoolExecutor.CallerRunsPolicy());
+    }
+
+    public void shutdown() {
+        copExecutor.shutdownNow();
     }
 
     public void setBackupManager(io.github.xinfra.lab.xkv.kv.backup.BackupManager bm) {
@@ -166,34 +201,88 @@ public final class TikvServiceImpl extends TikvGrpc.TikvImplBase {
     @Override
     public void coprocessor(Coprocessor.Request r, StreamObserver<Coprocessor.Response> o) {
         if (cop == null) { unimpl(o); return; }
-        try {
-            o.onNext(cop.handle(r));
+        if (!copPendingPermits.tryAcquire()) {
+            o.onNext(Coprocessor.Response.newBuilder()
+                    .setRegionError(io.github.xinfra.lab.xkv.proto.Errorpb.Error.newBuilder()
+                            .setMessage("server is busy")
+                            .setServerIsBusy(io.github.xinfra.lab.xkv.proto.Errorpb.ServerIsBusy.newBuilder()
+                                    .setReason("coprocessor pool pending queue full"))
+                            .build())
+                    .build());
             o.onCompleted();
-        } catch (Throwable t) {
-            o.onError(Status.INTERNAL.withDescription(t.getMessage()).asRuntimeException());
+            return;
         }
+        copExecutor.execute(prioritized(extractPriority(r), () -> {
+            try {
+                var checked = validateAndClipCopRegion(r);
+                if (checked.error() != null) {
+                    o.onNext(Coprocessor.Response.newBuilder().setRegionError(checked.error()).build());
+                    o.onCompleted();
+                    return;
+                }
+                o.onNext(cop.handle(checked.request()));
+                o.onCompleted();
+            } catch (Throwable t) {
+                o.onError(Status.INTERNAL.withDescription(t.getMessage()).asRuntimeException());
+            } finally {
+                copPendingPermits.release();
+            }
+        }));
     }
 
     @Override
     public void coprocessorStream(Coprocessor.Request r, StreamObserver<Coprocessor.StreamResponse> o) {
         if (cop == null) { unimpl(o); return; }
-        try {
-            cop.handleStream(r, o::onNext);
+        if (!copPendingPermits.tryAcquire()) {
+            o.onNext(Coprocessor.StreamResponse.newBuilder()
+                    .setRegionError(io.github.xinfra.lab.xkv.proto.Errorpb.Error.newBuilder()
+                            .setMessage("server is busy")
+                            .setServerIsBusy(io.github.xinfra.lab.xkv.proto.Errorpb.ServerIsBusy.newBuilder()
+                                    .setReason("coprocessor pool pending queue full"))
+                            .build())
+                    .build());
             o.onCompleted();
-        } catch (Throwable t) {
-            o.onError(Status.INTERNAL.withDescription(t.getMessage()).asRuntimeException());
+            return;
         }
+        copExecutor.execute(prioritized(extractPriority(r), () -> {
+            try {
+                var checked = validateAndClipCopRegion(r);
+                if (checked.error() != null) {
+                    o.onNext(Coprocessor.StreamResponse.newBuilder().setRegionError(checked.error()).build());
+                    o.onCompleted();
+                    return;
+                }
+                cop.handleStream(checked.request(), o::onNext);
+                o.onCompleted();
+            } catch (Throwable t) {
+                o.onError(Status.INTERNAL.withDescription(t.getMessage()).asRuntimeException());
+            } finally {
+                copPendingPermits.release();
+            }
+        }));
     }
 
     @Override
     public void batchCoprocessor(Coprocessor.BatchRequest r, StreamObserver<Coprocessor.BatchResponse> o) {
         if (cop == null) { unimpl(o); return; }
-        try {
-            cop.handleBatch(r, o::onNext);
-            o.onCompleted();
-        } catch (Throwable t) {
-            o.onError(Status.INTERNAL.withDescription(t.getMessage()).asRuntimeException());
+        if (!copPendingPermits.tryAcquire()) {
+            o.onError(Status.RESOURCE_EXHAUSTED
+                    .withDescription("coprocessor pool pending queue full").asRuntimeException());
+            return;
         }
+        copExecutor.execute(prioritized(0, () -> {
+            try {
+                cop.handleBatch(r, o::onNext, singleReq -> {
+                    var checked = validateAndClipCopRegion(singleReq);
+                    return new CoprocessorService.RegionCheckResult(checked.error(), checked.request());
+                });
+                o.onCompleted();
+            } catch (Throwable t) {
+                o.onError(Status.INTERNAL.withDescription(t.getMessage()).asRuntimeException());
+            } finally {
+                copPendingPermits.release();
+            }
+        }));
     }
 
     // ---- Region admin ----
@@ -418,6 +507,95 @@ public final class TikvServiceImpl extends TikvGrpc.TikvImplBase {
         o.onError(Status.UNIMPLEMENTED.withDescription("phase 0 stub").asRuntimeException());
     }
 
+    record CopRegionCheck(io.github.xinfra.lab.xkv.proto.Errorpb.Error error,
+                          Coprocessor.Request request) {}
+
+    private CopRegionCheck validateAndClipCopRegion(Coprocessor.Request r) {
+        if (splitLocator == null) return new CopRegionCheck(null, r);
+        if (r.getRangesCount() == 0) return new CopRegionCheck(null, r);
+        byte[] key = r.getRanges(0).getStart().toByteArray();
+        if (key.length == 0) return new CopRegionCheck(null, r);
+        var peer = splitLocator.peerForKey(key);
+        if (peer == null) {
+            return new CopRegionCheck(
+                    io.github.xinfra.lab.xkv.proto.Errorpb.Error.newBuilder()
+                            .setMessage("region not found").build(), null);
+        }
+        var region = peer.region();
+        if (r.hasContext() && r.getContext().hasRegionEpoch()) {
+            var reqEpoch = r.getContext().getRegionEpoch();
+            var liveEpoch = region.getRegionEpoch();
+            if (reqEpoch.getVersion() != liveEpoch.getVersion()
+                    || reqEpoch.getConfVer() != liveEpoch.getConfVer()) {
+                return new CopRegionCheck(
+                        io.github.xinfra.lab.xkv.proto.Errorpb.Error.newBuilder()
+                                .setMessage("epoch not match")
+                                .setEpochNotMatch(io.github.xinfra.lab.xkv.proto.Errorpb.EpochNotMatch.newBuilder()
+                                        .addCurrentRegions(region))
+                                .build(), null);
+            }
+        }
+
+        byte[] regionStart = region.getStartKey().toByteArray();
+        byte[] regionEnd = region.getEndKey().toByteArray();
+
+        List<Coprocessor.KeyRange> clipped = new ArrayList<>();
+        for (Coprocessor.KeyRange range : r.getRangesList()) {
+            byte[] s = range.getStart().toByteArray();
+            byte[] e = range.getEnd().toByteArray();
+            if (regionStart.length > 0 && compareBytes(s, regionStart) < 0) {
+                s = regionStart;
+            }
+            if (regionEnd.length > 0 && (e.length == 0 || compareBytes(e, regionEnd) > 0)) {
+                e = regionEnd;
+            }
+            if (e.length > 0 && compareBytes(s, e) >= 0) {
+                continue;
+            }
+            clipped.add(Coprocessor.KeyRange.newBuilder()
+                    .setStart(ByteString.copyFrom(s))
+                    .setEnd(ByteString.copyFrom(e))
+                    .build());
+        }
+
+        if (clipped.isEmpty()) {
+            return new CopRegionCheck(
+                    io.github.xinfra.lab.xkv.proto.Errorpb.Error.newBuilder()
+                            .setMessage("key not in region")
+                            .setKeyNotInRegion(io.github.xinfra.lab.xkv.proto.Errorpb.KeyNotInRegion.newBuilder()
+                                    .setRegionId(region.getId())
+                                    .setStartKey(region.getStartKey())
+                                    .setEndKey(region.getEndKey()))
+                            .build(), null);
+        }
+
+        if (clipped.size() == r.getRangesCount()) {
+            boolean unchanged = true;
+            for (int i = 0; i < clipped.size(); i++) {
+                var orig = r.getRanges(i);
+                var clip = clipped.get(i);
+                if (!orig.getStart().equals(clip.getStart())
+                        || !orig.getEnd().equals(clip.getEnd())) {
+                    unchanged = false;
+                    break;
+                }
+            }
+            if (unchanged) return new CopRegionCheck(null, r);
+        }
+
+        var clippedReq = r.toBuilder().clearRanges().addAllRanges(clipped).build();
+        return new CopRegionCheck(null, clippedReq);
+    }
+
+    static int compareBytes(byte[] a, byte[] b) {
+        int len = Math.min(a.length, b.length);
+        for (int i = 0; i < len; i++) {
+            int cmp = (a[i] & 0xFF) - (b[i] & 0xFF);
+            if (cmp != 0) return cmp;
+        }
+        return a.length - b.length;
+    }
+
     private <T> void dispatchRaw(StreamObserver<T> o, java.util.function.Supplier<T> work) {
         if (rawKv == null) { unimpl(o); return; }
         try {
@@ -435,6 +613,61 @@ public final class TikvServiceImpl extends TikvGrpc.TikvImplBase {
             o.onCompleted();
         } catch (Throwable t) {
             o.onError(Status.INTERNAL.withDescription(t.getMessage()).asRuntimeException());
+        }
+    }
+
+    // ---- Priority queue helpers ----
+
+    private static final AtomicLong TASK_SEQ = new AtomicLong();
+
+    private static int extractPriority(Coprocessor.Request r) {
+        if (r.hasContext()) {
+            return r.getContext().getPriorityValue();
+        }
+        return 0;
+    }
+
+    private static PrioritizedTask prioritized(int priority, Runnable task) {
+        return new PrioritizedTask(priority, TASK_SEQ.getAndIncrement(), task);
+    }
+
+    static final class PrioritizedTask implements Comparable<PrioritizedTask>, Runnable {
+        private final int priority;
+        private final long seqNo;
+        private final Runnable task;
+
+        PrioritizedTask(int priority, long seqNo, Runnable task) {
+            this.priority = priority;
+            this.seqNo = seqNo;
+            this.task = task;
+        }
+
+        @Override
+        public void run() {
+            try {
+                task.run();
+            } finally {
+                CopDatumComparator.clearCollation();
+            }
+        }
+
+        @Override
+        public int compareTo(PrioritizedTask other) {
+            // High(2) before Normal(0) before Low(1)
+            int cmp = Integer.compare(toOrdinal(other.priority), toOrdinal(this.priority));
+            if (cmp != 0) return cmp;
+            return Long.compare(this.seqNo, other.seqNo);
+        }
+
+        private static int toOrdinal(int commandPri) {
+            // CommandPri: Normal=0, Low=1, High=2
+            // Desired order: High first, Normal second, Low last
+            return switch (commandPri) {
+                case 2 -> 2;  // High
+                case 0 -> 1;  // Normal
+                case 1 -> 0;  // Low
+                default -> 1; // treat unknown as Normal
+            };
         }
     }
 

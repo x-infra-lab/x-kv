@@ -86,6 +86,10 @@ service PD {
     rpc ModifyResourceGroup(ModifyResourceGroupRequest) returns (ModifyResourceGroupResponse);
     rpc DeleteResourceGroup(DeleteResourceGroupRequest) returns (DeleteResourceGroupResponse);
     rpc ListResourceGroups(ListResourceGroupsRequest) returns (ListResourceGroupsResponse);
+
+    // ----- Dynamic membership -----
+    rpc AddMember(AddMemberRequest) returns (AddMemberResponse);
+    rpc RemoveMember(RemoveMemberRequest) returns (RemoveMemberResponse);
 }
 
 // ---- Common envelope ----
@@ -666,4 +670,26 @@ message ListResourceGroupsRequest {
 message ListResourceGroupsResponse {
     ResponseHeader header = 1;
     repeated ResourceGroup groups = 2;
+}
+
+// ===========================================================================
+// Dynamic membership — add / remove PD nodes at runtime
+// ===========================================================================
+message AddMemberRequest {
+    RequestHeader header = 1;
+    Member member = 2;
+    string raft_url = 3;
+}
+message AddMemberResponse {
+    ResponseHeader header = 1;
+    repeated Member members = 2;
+}
+
+message RemoveMemberRequest {
+    RequestHeader header = 1;
+    uint64 member_id = 2;
+}
+message RemoveMemberResponse {
+    ResponseHeader header = 1;
+    repeated Member members = 2;
 }

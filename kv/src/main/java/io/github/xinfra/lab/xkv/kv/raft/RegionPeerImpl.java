@@ -206,7 +206,12 @@ public final class RegionPeerImpl implements RegionPeer {
                 && raftEngine.appliedIndex() == 0
                 && raftEngine.lastSnapshotMeta() == null;
 
-        this.node = fresh
+        // startNode bootstraps a new cluster (creates ConfChange entries for
+        // each peer at indices 1..N). It must only be used for initial cluster
+        // formation. Dynamically-added peers (joining via conf-change) pass an
+        // empty peers list; they use restartNode so the leader can replicate
+        // its log without conflicting bootstrap entries.
+        this.node = (fresh && !peers.isEmpty())
                 ? Node.startNode(config, peers)
                 : Node.restartNode(config);
 
@@ -379,8 +384,12 @@ public final class RegionPeerImpl implements RegionPeer {
         var fut = new CompletableFuture<ApplyResult>();
         pendingConfChanges.add(fut);
         try {
+            log.info("region={} proposeConfChange: changes={} isLeader={}",
+                    regionId, cc.getChangesCount(), isLeader());
             node.proposeConfChange(cc);
+            log.info("region={} proposeConfChange: accepted by raft", regionId);
         } catch (RaftException | InterruptedException e) {
+            log.warn("region={} proposeConfChange: REJECTED: {}", regionId, e.getMessage());
             pendingConfChanges.remove(fut);
             fut.complete(ApplyResult.err(e.getMessage()));
             if (e instanceof InterruptedException) Thread.currentThread().interrupt();
@@ -522,9 +531,16 @@ public final class RegionPeerImpl implements RegionPeer {
         raftStorage.updateCachedHardState(ready.hardState());
 
         // === Send raft messages (log durable, safe to ack) ===
-        if (ready.messages() != null) {
+        if (ready.messages() != null && !ready.messages().isEmpty()) {
             for (var msg : ready.messages()) {
                 if (msg.getTo() == self.getId()) continue;
+                if (log.isDebugEnabled()
+                        && msg.getMsgType() != Eraftpb.MessageType.MsgHeartbeat
+                        && msg.getMsgType() != Eraftpb.MessageType.MsgHeartbeatResponse) {
+                    log.debug("region={} send {} to peer={} index={} logTerm={} commit={}",
+                            regionId, msg.getMsgType(), msg.getTo(),
+                            msg.getIndex(), msg.getLogTerm(), msg.getCommit());
+                }
                 transport.send(msg.getTo(), msg);
             }
         }
@@ -775,6 +791,9 @@ public final class RegionPeerImpl implements RegionPeer {
             if (fut != null) fut.complete(ApplyResult.err(e.getMessage()));
             return;
         }
+        log.debug("region={} applyConfChange: changes={} voters={} voters_outgoing={} learners={}",
+                regionId, cc.getChangesCount(),
+                newCs.getVotersList(), newCs.getVotersOutgoingList(), newCs.getLearnersList());
 
         // Parse context to recover the affected metapb.Peer entries — one per
         // ConfChangeSingle in change-order. If the context is missing/malformed

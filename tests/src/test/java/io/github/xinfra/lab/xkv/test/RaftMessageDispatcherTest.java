@@ -60,7 +60,7 @@ final class RaftMessageDispatcherTest {
         // but capture deliveries into our queue. The dispatcher needs a
         // GrpcRaftTransport for the type signature; we can build a minimal
         // one with a custom receiver.
-        var t = new io.github.xinfra.lab.xkv.kv.transport.GrpcRaftTransport(42, 1);
+        var t = new io.github.xinfra.lab.xkv.kv.transport.GrpcRaftTransport(42, 1, 1);
         t.setReceiver(delivered::offer);
         dispatcher.register(42, t);
 

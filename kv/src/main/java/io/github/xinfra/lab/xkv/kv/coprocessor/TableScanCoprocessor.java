@@ -1,6 +1,7 @@
 package io.github.xinfra.lab.xkv.kv.coprocessor;
 
 import com.google.protobuf.ByteString;
+import io.github.xinfra.lab.xkv.kv.coprocessor.dag.VecDeadlineOp;
 import io.github.xinfra.lab.xkv.kv.engine.StorageEngine;
 import io.github.xinfra.lab.xkv.kv.mvcc.MvccReader;
 import io.github.xinfra.lab.xkv.proto.Coprocessor.Request;
@@ -45,6 +46,9 @@ public final class TableScanCoprocessor implements Coprocessor {
     public Response handle(Request req) {
         long startTs = req.getStartTs();
         int limit = req.getPagingSize() > 0 ? (int) req.getPagingSize() : DEFAULT_SCAN_LIMIT;
+        long deadlineMs = SQLScanCoprocessor.extractDeadlineMs(req);
+        long startNanos = System.nanoTime();
+        long deadlineNanos = deadlineMs > 0 ? deadlineMs * 1_000_000L : 0;
 
         try (var snapshot = engine.newSnapshot();
              var reader = new MvccReader(engine, snapshot, false)) {
@@ -53,6 +57,9 @@ public final class TableScanCoprocessor implements Coprocessor {
             int total = 0;
             for (var range : req.getRangesList()) {
                 if (total >= limit) break;
+                if (deadlineNanos > 0 && System.nanoTime() - startNanos > deadlineNanos) {
+                    throw new VecDeadlineOp.DeadlineExceededException(deadlineMs);
+                }
                 byte[] start = range.getStart().toByteArray();
                 byte[] end = range.getEnd().toByteArray();
                 int rangeLimit = limit - total;
@@ -67,12 +74,14 @@ public final class TableScanCoprocessor implements Coprocessor {
                             .setData(ByteString.copyFrom(dataBuilder.encode()))
                             .setLocked(Kvrpcpb.KeyError.newBuilder()
                                     .setLocked(toLockInfo(e.key(), e.lock())))
+                            .setExecDetailsMs((System.nanoTime() - startNanos) / 1_000_000L)
                             .build();
                 }
             }
 
             return Response.newBuilder()
                     .setData(ByteString.copyFrom(dataBuilder.encode()))
+                    .setExecDetailsMs((System.nanoTime() - startNanos) / 1_000_000L)
                     .build();
         } catch (Throwable t) {
             return Response.newBuilder()

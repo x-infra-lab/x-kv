@@ -50,8 +50,10 @@ message PdCommand {
     PlacementRulePayload placement_rule = 8;
     KeyspacePayload keyspace = 9;
     ResourceGroupPayload resource_group = 10;
+    MemberChangePayload member_change = 11;
+    uint64 tso_bound = 12;
 
-    reserved 11 to 30;
+    reserved 13 to 30;
 }
 
 enum CommandType {
@@ -67,8 +69,11 @@ enum CommandType {
     CMD_SET_KEYSPACE = 9;
     CMD_SET_RESOURCE_GROUP = 10;
     CMD_DELETE_RESOURCE_GROUP = 11;
+    CMD_ADD_MEMBER = 12;
+    CMD_REMOVE_MEMBER = 13;
+    CMD_EXTEND_TSO_BOUND = 14;
 
-    reserved 12 to 30;
+    reserved 15 to 30;
 }
 
 message BootstrapPayload {
@@ -106,6 +111,13 @@ message ResourceGroupPayload {
     string name = 2;
 }
 
+message MemberChangePayload {
+    uint64 member_id = 1;
+    string name = 2;
+    string raft_address = 3;
+    string client_address = 4;
+}
+
 // ===========================================================================
 // Snapshot payload — the full serialized PD state for raft snapshot install.
 // PD state is small (typically <1MB), so a single message suffices.
@@ -126,6 +138,14 @@ message PdSnapshot {
     reserved 12 to 30;
 
     uint64 tso_physical_bound = 31;
+    repeated MemberEntry members = 32;
+}
+
+message MemberEntry {
+    uint64 id = 1;
+    string name = 2;
+    string raft_address = 3;
+    string client_address = 4;
 }
 
 message RegionStatsEntry {

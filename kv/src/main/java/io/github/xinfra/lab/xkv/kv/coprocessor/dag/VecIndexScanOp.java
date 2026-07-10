@@ -3,6 +3,7 @@ package io.github.xinfra.lab.xkv.kv.coprocessor.dag;
 import io.github.xinfra.lab.xkv.kv.coprocessor.eval.CopDatum;
 import io.github.xinfra.lab.xkv.kv.coprocessor.eval.CopRow;
 import io.github.xinfra.lab.xkv.kv.coprocessor.eval.TidbKeyCodec;
+import io.github.xinfra.lab.xkv.kv.mvcc.KeyLockedException;
 import io.github.xinfra.lab.xkv.kv.mvcc.MvccReader;
 import io.github.xinfra.lab.xkv.proto.Coprocessor;
 import io.github.xinfra.lab.xkv.proto.Tipb;
@@ -19,11 +20,13 @@ public final class VecIndexScanOp implements VecOperator {
     private final Tipb.DAGRequest dagReq;
     private final List<Coprocessor.KeyRange> ranges;
     private final long startTs;
+    private final boolean descScan;
 
     private int rangeIdx;
     private byte[] cursor;
     private byte[] rangeEnd;
     private boolean exhausted;
+    private KeyLockedException lockErr;
 
     public VecIndexScanOp(MvccReader reader, Tipb.DAGRequest dagReq,
                            List<Coprocessor.KeyRange> ranges, long startTs) {
@@ -31,11 +34,12 @@ public final class VecIndexScanOp implements VecOperator {
         this.dagReq = dagReq;
         this.ranges = ranges;
         this.startTs = startTs;
+        this.descScan = dagReq.getDescScan();
     }
 
     @Override
     public void open() {
-        rangeIdx = 0;
+        rangeIdx = descScan ? ranges.size() - 1 : 0;
         exhausted = false;
         advanceToNextRange();
     }
@@ -51,8 +55,19 @@ public final class VecIndexScanOp implements VecOperator {
                 continue;
             }
 
-            MvccReader.ScanResult result = reader.scan(cursor, rangeEnd, batchSize, startTs);
+            MvccReader.ScanResult result;
+            if (descScan) {
+                result = reader.reverseScan(cursor, rangeEnd, batchSize, startTs);
+            } else {
+                result = reader.scan(cursor, rangeEnd, batchSize, startTs);
+            }
             List<MvccReader.KvPair> pairs = result.pairs();
+
+            if (result.lockError() != null) {
+                lockErr = result.lockError();
+                exhausted = true;
+                if (pairs.isEmpty()) return null;
+            }
 
             if (pairs.isEmpty()) {
                 cursor = null;
@@ -66,17 +81,26 @@ public final class VecIndexScanOp implements VecOperator {
                 chunk.add(new CopRecord(pair.key(), pair.value(), row));
             }
 
-            if (pairs.size() < batchSize) {
+            if (lockErr != null) {
+                cursor = null;
+            } else if (pairs.size() < batchSize) {
                 cursor = null;
             } else {
                 byte[] lastKey = pairs.get(pairs.size() - 1).key();
-                cursor = nextKey(lastKey);
+                if (descScan) {
+                    cursor = lastKey;
+                } else {
+                    cursor = nextKey(lastKey);
+                }
             }
 
             return chunk;
         }
         return null;
     }
+
+    @Override
+    public KeyLockedException lockError() { return lockErr; }
 
     @Override
     public void close() {
@@ -101,10 +125,17 @@ public final class VecIndexScanOp implements VecOperator {
     }
 
     private boolean advanceToNextRange() {
-        if (rangeIdx >= ranges.size()) return false;
-        Coprocessor.KeyRange range = ranges.get(rangeIdx++);
-        cursor = range.getStart().toByteArray();
-        rangeEnd = range.getEnd().toByteArray();
+        if (descScan) {
+            if (rangeIdx < 0) return false;
+            Coprocessor.KeyRange range = ranges.get(rangeIdx--);
+            cursor = range.getEnd().toByteArray();
+            rangeEnd = range.getStart().toByteArray();
+        } else {
+            if (rangeIdx >= ranges.size()) return false;
+            Coprocessor.KeyRange range = ranges.get(rangeIdx++);
+            cursor = range.getStart().toByteArray();
+            rangeEnd = range.getEnd().toByteArray();
+        }
         return true;
     }
 
