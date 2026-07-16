@@ -515,6 +515,13 @@ public final class KvServer {
                         .withAdmin(raftEngine, engine, splitObserver, mergeObserver),
                 settings, cm, snapshotEngine, raftPoller, tickDriver, applyWorker);
         peerHolder.set(peer);
+        // Wire the raft transport for dynamically-added peers: when a
+        // conf-change (AddPeer) applies, resolve the new peer's raft address
+        // from PD so the leader can actually reach the new replica. Without
+        // this the transport drops messages to unknown peers and the region
+        // never replicates to newly-scheduled stores.
+        peer.setChangePeerObserver((type, changedPeer, updatedRegion) ->
+                onChangePeer(transport, type, changedPeer));
         dispatcher.register(region.getId(), transport);
         return peer;
     }
@@ -526,6 +533,49 @@ public final class KvServer {
         throw new IllegalStateException(
                 "No peer found for store " + config.storeId()
                         + " in region " + region.getId());
+    }
+
+    /**
+     * Conf-change transport wiring. Runs after every applied conf-change on
+     * every peer (leader and followers). On AddNode/AddLearnerNode we resolve
+     * the added peer's raft address from PD and register it in this region's
+     * transport so raft messages can flow to the new replica; on RemoveNode
+     * we drop the peer's outbound link. Self is skipped (no loopback).
+     */
+    private void onChangePeer(GrpcRaftTransport transport,
+                              io.github.xinfra.lab.raft.proto.Eraftpb.ConfChangeType type,
+                              Metapb.Peer changedPeer) {
+        try {
+            switch (type) {
+                case ConfChangeAddNode, ConfChangeAddLearnerNode -> {
+                    if (changedPeer.getStoreId() == config.storeId()) return;
+                    String addr = resolveStoreRaftAddr(changedPeer.getStoreId());
+                    if (addr != null && !addr.isEmpty()) {
+                        transport.addPeer(changedPeer.getId(), addr, changedPeer.getStoreId());
+                        log.info("conf-change: wired peer {} on store {} at {}",
+                                changedPeer.getId(), changedPeer.getStoreId(), addr);
+                    } else {
+                        log.warn("conf-change: could not resolve raft addr for store {}",
+                                changedPeer.getStoreId());
+                    }
+                }
+                case ConfChangeRemoveNode -> transport.removePeer(changedPeer.getId());
+                default -> { }
+            }
+        } catch (Throwable t) {
+            log.warn("conf-change transport wiring failed: {}", t.getMessage());
+        }
+    }
+
+    private String resolveStoreRaftAddr(long storeId) {
+        try {
+            var resp = pdManager.blockingStub().getStore(
+                    Pdpb.GetStoreRequest.newBuilder().setStoreId(storeId).build());
+            if (resp.hasStore()) return resp.getStore().getPeerAddress();
+        } catch (Exception e) {
+            log.warn("resolve store {} raft addr failed: {}", storeId, e.getMessage());
+        }
+        return null;
     }
 
     /**
@@ -575,6 +625,8 @@ public final class KvServer {
                         config.raft().leaseBasedRead()),
                 childCm, snapshotEngine, raftPoller, tickDriver, applyWorker);
         childPeerHolder.set(childPeer);
+        childPeer.setChangePeerObserver((type, changedPeer, updatedRegion) ->
+                onChangePeer(childTransport, type, changedPeer));
         dispatcher.register(childRegionId, childTransport);
         store.registerPeer(childPeer);
         peers.add(childPeer);
