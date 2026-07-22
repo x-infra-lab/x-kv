@@ -688,7 +688,7 @@ public final class TestCluster implements AutoCloseable {
      * True if {@code t}'s cause chain indicates a port-bind conflict
      * (the release→bind race lost to a parallel fork / lingering socket).
      */
-    private static boolean isBindConflict(Throwable t) {
+    public static boolean isBindConflict(Throwable t) {
         for (Throwable c = t; c != null; c = c.getCause()) {
             if (c instanceof java.net.BindException) return true;
             String m = c.getMessage();

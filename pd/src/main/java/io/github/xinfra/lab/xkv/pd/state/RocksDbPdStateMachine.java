@@ -198,12 +198,12 @@ public final class RocksDbPdStateMachine implements PdStateMachine {
     }
 
     @Override
-    public void bootstrap(Metapb.Store firstStore, Metapb.Region firstRegion) {
+    public BootstrapResult bootstrap(Metapb.Store firstStore, Metapb.Region firstRegion) {
         lock.writeLock().lock();
         try {
             if (bootstrapped) {
                 log.info("bootstrap idempotent: cluster already up");
-                return;
+                return new BootstrapResult(false, cluster);
             }
             this.cluster = Metapb.Cluster.newBuilder().setId(1).setMaxPeerCount(3).build();
             this.stores.put(firstStore.getId(), firstStore);
@@ -226,6 +226,7 @@ public final class RocksDbPdStateMachine implements PdStateMachine {
             } catch (RocksDBException e) {
                 throw new RuntimeException("bootstrap write failed", e);
             }
+            return new BootstrapResult(true, cluster);
         } finally {
             lock.writeLock().unlock();
         }
@@ -579,13 +580,13 @@ public final class RocksDbPdStateMachine implements PdStateMachine {
     }
 
     @Override
-    public void applyCommand(byte[] command) {
+    public Object applyCommand(byte[] command) {
         try {
             var cmd = PdInternalpb.PdCommand.parseFrom(command);
             switch (cmd.getType()) {
                 case CMD_BOOTSTRAP -> {
                     var payload = cmd.getBootstrap();
-                    bootstrap(payload.getStore(), payload.getRegion());
+                    return bootstrap(payload.getStore(), payload.getRegion());
                 }
                 case CMD_PUT_STORE -> putStore(cmd.getStore());
                 case CMD_UPDATE_REGION -> updateRegion(cmd.getRegion());
@@ -656,6 +657,7 @@ public final class RocksDbPdStateMachine implements PdStateMachine {
         } catch (Exception e) {
             log.warn("applyCommand failed: {}", e.getMessage());
         }
+        return null;
     }
 
     public void saveTsoBound(long bound) {

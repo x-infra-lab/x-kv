@@ -26,11 +26,22 @@ public interface PdStateMachine {
     boolean isBootstrapped();
 
     /**
-     * Bootstrap the cluster atomically: persist the first store + the first
-     * region in one Raft entry. Idempotent — second call returns the existing
-     * cluster.
+     * Outcome of a {@link #bootstrap} apply. {@code firstBootstrap} is true
+     * only for the single apply that actually transitioned the cluster from
+     * un-bootstrapped to bootstrapped; every later (idempotent) apply returns
+     * false. This lets the proposer distinguish "I bootstrapped the cluster"
+     * from "someone already had" even when concurrent bootstraps race through
+     * raft — apply is serialized, so exactly one entry reports
+     * {@code firstBootstrap == true}.
      */
-    void bootstrap(Metapb.Store firstStore, Metapb.Region firstRegion);
+    record BootstrapResult(boolean firstBootstrap, Metapb.Cluster cluster) {}
+
+    /**
+     * Bootstrap the cluster atomically: persist the first store + the first
+     * region in one Raft entry. Idempotent — a second apply is a no-op and
+     * returns {@code firstBootstrap == false} with the existing cluster.
+     */
+    BootstrapResult bootstrap(Metapb.Store firstStore, Metapb.Region firstRegion);
 
     Metapb.Cluster cluster();
 
@@ -120,8 +131,15 @@ public interface PdStateMachine {
 
     void installSnapshot(byte[] snapshot);
 
-    /** Apply one serialized command (Raft entry payload). */
-    void applyCommand(byte[] command);
+    /**
+     * Apply one serialized command (Raft entry payload) and return its apply
+     * result. The result is deterministic (derived purely from applied state)
+     * and is meaningful only to the node that proposed the entry — the raft
+     * layer resolves that proposer's future with it. Returns {@code null} for
+     * commands without a distinct result (or when apply failed). Currently
+     * only {@code CMD_BOOTSTRAP} returns a value ({@link BootstrapResult}).
+     */
+    Object applyCommand(byte[] command);
 
     /**
      * Notify the state machine that this node has just become leader.

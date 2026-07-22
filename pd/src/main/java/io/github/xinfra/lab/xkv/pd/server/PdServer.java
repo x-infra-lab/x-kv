@@ -91,7 +91,7 @@ public final class PdServer {
                                 .setTsoBound(target)
                                 .build();
                         return rn.propose(cmd.toByteArray())
-                                .thenApply(bytes -> target);
+                                .thenApply(ignored -> target);
                     }
                     state.saveTsoBound(target);
                     return CompletableFuture.completedFuture(target);

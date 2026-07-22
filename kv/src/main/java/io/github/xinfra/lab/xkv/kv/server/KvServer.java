@@ -348,10 +348,23 @@ public final class KvServer {
         var region = prepareBootstrapRegion();
 
         try {
-            pdStub.bootstrap(Pdpb.BootstrapRequest.newBuilder()
+            var resp = pdStub.bootstrap(Pdpb.BootstrapRequest.newBuilder()
                     .setStore(storeMeta)
                     .setRegion(region)
                     .build());
+            // PD signals a lost bootstrap race via an ALREADY_BOOTSTRAPPED error
+            // in the response header (a successful gRPC call, not an exception).
+            // The raft-serialized apply result makes this authoritative even when
+            // our own local isBootstrapped() pre-check said the cluster was empty.
+            if (resp.getHeader().hasError()
+                    && resp.getHeader().getError().getType()
+                        == io.github.xinfra.lab.xkv.proto.Pdpb.Error.ErrorType.ALREADY_BOOTSTRAPPED) {
+                log.info("Another store bootstrapped first, switching to join path");
+                clearPreparedBootstrap();
+                pdStub.putStore(Pdpb.PutStoreRequest.newBuilder()
+                        .setStore(storeMeta).build());
+                return Optional.empty();
+            }
         } catch (StatusRuntimeException e) {
             if (isAlreadyBootstrappedError(e)) {
                 log.info("Another store bootstrapped first, switching to join path");

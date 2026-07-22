@@ -66,7 +66,7 @@ public final class PdRaftNode implements AutoCloseable {
     private final Transport transport;
 
     private final AtomicLong proposeSeq = new AtomicLong(1);
-    private final ConcurrentMap<Long, CompletableFuture<byte[]>> pendingProposals = new ConcurrentHashMap<>();
+    private final ConcurrentMap<Long, CompletableFuture<Object>> pendingProposals = new ConcurrentHashMap<>();
     private final ConcurrentMap<ByteBuffer, CompletableFuture<Void>> pendingReadIndices = new ConcurrentHashMap<>();
     private final ConcurrentSkipListMap<Long, List<CompletableFuture<Void>>> readIndexWaiters = new ConcurrentSkipListMap<>();
     private final List<CompletableFuture<Void>> pendingConfChanges = new java.util.concurrent.CopyOnWriteArrayList<>();
@@ -228,18 +228,20 @@ public final class PdRaftNode implements AutoCloseable {
     }
 
     /**
-     * Propose a PD command through raft. Returns a future that resolves
-     * with the applied result (the serialized PdCommand, potentially enriched
-     * by the apply path — e.g. allocId fills in base_id).
+     * Propose a PD command through raft. Returns a future that resolves with
+     * the apply result produced by {@link PdStateMachine#applyCommand} on this
+     * (proposer) node once the entry is applied locally — e.g. a
+     * {@link PdStateMachine.BootstrapResult} for {@code CMD_BOOTSTRAP}, or
+     * {@code null} for commands without a distinct result.
      */
-    public CompletableFuture<byte[]> propose(byte[] command) {
+    public CompletableFuture<Object> propose(byte[] command) {
         if (!isLeader()) {
             return CompletableFuture.failedFuture(
                     new RaftException(RaftException.Code.PROPOSAL_DROPPED, "not leader"));
         }
         long seq = proposeSeq.getAndIncrement();
         byte[] envelope = withSeq(command, seq);
-        var fut = new CompletableFuture<byte[]>();
+        var fut = new CompletableFuture<Object>();
         pendingProposals.put(seq, fut);
         fut.orTimeout(PENDING_FUTURE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
         fut.whenComplete((v, ex) -> pendingProposals.remove(seq));
@@ -447,15 +449,17 @@ public final class PdRaftNode implements AutoCloseable {
         byte[] command = new byte[data.length - 8];
         System.arraycopy(data, 8, command, 0, command.length);
 
+        Object result = null;
         try {
-            stateMachine.applyCommand(command);
+            result = stateMachine.applyCommand(command);
         } catch (Throwable t) {
             log.warn("pd-raft applyCommand failed: {}", t.getMessage());
         }
 
-        // Resolve the proposer's future (only on the node that proposed).
+        // Resolve the proposer's future with the apply result (only on the node
+        // that proposed). The result is deterministic; on followers fut is null.
         var fut = pendingProposals.remove(seq);
-        if (fut != null) fut.complete(command);
+        if (fut != null) fut.complete(result);
     }
 
     private void tickSafely() {

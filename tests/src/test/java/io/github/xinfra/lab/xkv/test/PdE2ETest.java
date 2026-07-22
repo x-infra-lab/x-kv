@@ -51,19 +51,36 @@ final class PdE2ETest {
 
     @BeforeEach
     void start() throws Exception {
-        pdPort = TestCluster.freePort();
-        int raftPort = TestCluster.freePort();
-        var cfg = PdConfig.builder()
-                .nodeId(1)
-                .clusterId(42)
-                .clientAddress("127.0.0.1:" + pdPort)
-                .raftAddress("127.0.0.1:" + raftPort)
-                .dataDir(dataDir)
-                .build();
-        TestCluster.releasePort(pdPort);
-        TestCluster.releasePort(raftPort);
-        pd = new PdServer(cfg);
-        pd.start();
+        // Fresh-port start with retry: there is an unavoidable release→bind
+        // window in which a lingering socket (e.g. a slow-to-close PD server
+        // from a previous test class in the same JVM) can steal the port
+        // ("Address already in use"), which shows up as a flaky failure only
+        // when the full suite runs. Retry with freshly-allocated ports and a
+        // fresh state dir on a bind conflict.
+        for (int attempt = 1; attempt <= 5; attempt++) {
+            pdPort = TestCluster.freePort();
+            int raftPort = TestCluster.freePort();
+            var cfg = PdConfig.builder()
+                    .nodeId(1)
+                    .clusterId(42)
+                    .clientAddress("127.0.0.1:" + pdPort)
+                    .raftAddress("127.0.0.1:" + raftPort)
+                    .dataDir(dataDir.resolve("pd-" + attempt))
+                    .build();
+            TestCluster.releasePort(pdPort);
+            TestCluster.releasePort(raftPort);
+            var srv = new PdServer(cfg);
+            try {
+                srv.start();
+                pd = srv;
+                break;
+            } catch (Exception e) {
+                // Tear the half-started server down (closes RocksDB + sockets)
+                // so the retry can bind cleanly with fresh ports.
+                try { srv.stop(); } catch (Exception ignore) { }
+                if (!TestCluster.isBindConflict(e) || attempt == 5) throw e;
+            }
+        }
 
         channel = NettyChannelBuilder.forAddress("127.0.0.1", pdPort).usePlaintext().build();
         blocking = PDGrpc.newBlockingStub(channel);
@@ -225,23 +242,33 @@ final class PdE2ETest {
 
     @Test
     void clusterGCSafePointIsMonotonic() {
+        // The PD background advancer ratchets the global safe-point up to the
+        // wall-clock time floor (now - gcLifetime) whenever no operator floor
+        // is set, so a fresh cluster's safe-point is NOT zero. Anchor the test
+        // on the current effective safe-point and use targets well above the
+        // floor's ~1ms/ms drift so the operator-set value wins deterministically.
+        long base = blocking.getGCSafePoint(Pdpb.GetGCSafePointRequest.newBuilder().build())
+                .getSafePoint();
+        long t1 = base + 1_000_000L;   // 1e6 margin dwarfs any time-floor drift during the test
+        long t2 = t1 + 1_000L;
+
         var r1 = blocking.updateGCSafePoint(Pdpb.UpdateGCSafePointRequest.newBuilder()
-                .setSafePoint(1000).build());
-        assertThat(r1.getNewSafePoint()).isEqualTo(1000);
+                .setSafePoint(t1).build());
+        assertThat(r1.getNewSafePoint()).isEqualTo(t1);
 
         var r2 = blocking.updateGCSafePoint(Pdpb.UpdateGCSafePointRequest.newBuilder()
-                .setSafePoint(2000).build());
-        assertThat(r2.getNewSafePoint()).isEqualTo(2000);
+                .setSafePoint(t2).build());
+        assertThat(r2.getNewSafePoint()).isEqualTo(t2);
 
         // Walking backwards is rejected (monotonic-only).
         var r3 = blocking.updateGCSafePoint(Pdpb.UpdateGCSafePointRequest.newBuilder()
-                .setSafePoint(500).build());
-        assertThat(r3.getNewSafePoint()).isEqualTo(2000);
+                .setSafePoint(base).build());
+        assertThat(r3.getNewSafePoint()).isEqualTo(t2);
 
         var r4 = blocking.getGCSafePoint(Pdpb.GetGCSafePointRequest.newBuilder().build());
         // safePoint may be either the cluster-set value or the service-derived
         // value; getGCSafePoint reads from the SafePointService when present.
-        assertThat(r4.getSafePoint()).isGreaterThanOrEqualTo(0);
+        assertThat(r4.getSafePoint()).isGreaterThanOrEqualTo(t2);
     }
 
     // =====================================================================

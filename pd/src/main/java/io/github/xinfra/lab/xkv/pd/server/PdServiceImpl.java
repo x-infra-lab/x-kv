@@ -247,12 +247,18 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
                     .asRuntimeException());
             return;
         }
+        var rn = raftNode;
+        if (!rn.isLeader()) {
+            obs.onError(Status.UNAVAILABLE
+                    .withDescription("not PD leader").asRuntimeException());
+            return;
+        }
+        // Fast path: skip the raft round-trip when the cluster is already up.
+        // This is only an optimization — correctness comes from the apply
+        // result below, which is race-safe because raft serializes concurrent
+        // bootstraps and only ONE apply reports firstBootstrap == true.
         if (state.isBootstrapped()) {
-            obs.onNext(BootstrapResponse.newBuilder()
-                    .setHeader(errorHeader(
-                            io.github.xinfra.lab.xkv.proto.Pdpb.Error.ErrorType.ALREADY_BOOTSTRAPPED,
-                            "cluster already bootstrapped"))
-                    .build());
+            obs.onNext(alreadyBootstrappedResponse());
             obs.onCompleted();
             return;
         }
@@ -262,8 +268,34 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
                         .setStore(req.getStore())
                         .setRegion(req.getRegion()))
                 .build();
-        proposeOrApply(cmd, obs,
-                () -> BootstrapResponse.newBuilder().setHeader(header()).build());
+        try {
+            Object applied = rn.propose(cmd.toByteArray())
+                    .get(RAFT_PROPOSE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            boolean firstBootstrap =
+                    applied instanceof io.github.xinfra.lab.xkv.pd.state.PdStateMachine.BootstrapResult r
+                            && r.firstBootstrap();
+            if (firstBootstrap) {
+                obs.onNext(BootstrapResponse.newBuilder().setHeader(header()).build());
+            } else {
+                // Another store won the race: its bootstrap applied first, and
+                // this entry was an idempotent no-op. Tell the caller so it can
+                // switch to the join path instead of assuming it bootstrapped.
+                obs.onNext(alreadyBootstrappedResponse());
+            }
+            obs.onCompleted();
+        } catch (Exception e) {
+            obs.onError(io.grpc.Status.INTERNAL
+                    .withDescription("raft propose failed: " + e.getMessage())
+                    .asRuntimeException());
+        }
+    }
+
+    private BootstrapResponse alreadyBootstrappedResponse() {
+        return BootstrapResponse.newBuilder()
+                .setHeader(errorHeader(
+                        io.github.xinfra.lab.xkv.proto.Pdpb.Error.ErrorType.ALREADY_BOOTSTRAPPED,
+                        "cluster already bootstrapped"))
+                .build();
     }
 
     @Override
