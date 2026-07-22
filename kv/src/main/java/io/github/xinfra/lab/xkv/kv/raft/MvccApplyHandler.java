@@ -308,6 +308,19 @@ public final class MvccApplyHandler implements ApplyHandler {
                             .build()
                             .toByteArray());
                 }
+                if (oc instanceof MvccTxn.CommitLockMismatch) {
+                    // Our lock is gone and a different txn now holds the key:
+                    // this txn was TTL-expired/resolved out from under us. Report
+                    // it as rolled back so the client retries the txn instead of
+                    // treating a dropped commit as success — the latter silently
+                    // loses the write (observed as a lost increment under
+                    // concurrent read-modify-write contention).
+                    return Result.ok(Kvrpcpb.CommitResponse.newBuilder()
+                            .setError(Kvrpcpb.KeyError.newBuilder()
+                                    .setAbort("txn already rolled back"))
+                            .build()
+                            .toByteArray());
+                }
             }
             // probe close drops staged writes — Pass 2 re-runs on the real batch.
         }

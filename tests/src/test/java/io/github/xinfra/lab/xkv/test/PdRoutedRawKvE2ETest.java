@@ -9,7 +9,6 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
 import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -34,14 +33,14 @@ import static org.assertj.core.api.Assertions.assertThat;
 final class PdRoutedRawKvE2ETest {
 
     @TempDir Path baseDir;
-    private ClusterHarness harness;
+    private TestCluster harness;
     private XKvClient client;
 
     @BeforeEach
     void start() throws Exception {
-        harness = new ClusterHarness(baseDir, 3).start();
+        harness = new TestCluster(baseDir).startReplicated(1, 3);
         client = XKvClient.create(ClientConfig.builder()
-                .pdEndpoints(List.of("127.0.0.1:" + harness.pdPort()))
+                .pdEndpoints(harness.pdEndpoints())
                 .build());
     }
 
@@ -139,21 +138,18 @@ final class PdRoutedRawKvE2ETest {
 
         // Kill the leader. Client's RegionRequestSender must observe the
         // NotLeader error / network drop, refresh leader via PD, and retry.
-        var oldLeader = harness.leader();
-        oldLeader.shutdown();
-        harness.kvNodes().remove(oldLeader);
+        var oldLeader = harness.leaderStoreFor(TestCluster.BOOTSTRAP_REGION_ID);
+        long oldStoreId = oldLeader.storeId;
+        harness.killStore(oldStoreId);
 
-        // The new leader will surface eventually.
-        org.awaitility.Awaitility.await()
-                .atMost(java.time.Duration.ofSeconds(20))
-                .until(() -> harness.kvNodes().stream().anyMatch(n -> n.peer.isLeader()));
+        // A new leader will surface on a surviving store.
+        harness.waitForNewLeaderOtherThan(TestCluster.BOOTSTRAP_REGION_ID, oldStoreId);
 
-        // Refresh PD's view + invalidate client caches so retries find the
-        // new leader and don't keep dialing the dead store.
-        harness.publishLeaderToPd();
+        // Invalidate client caches so retries find the new leader and don't
+        // keep dialing the dead store.
         var impl = (io.github.xinfra.lab.xkv.client.XKvClientImpl) client;
-        impl.regionCache().invalidate(harness.bootstrapRegionId());
-        impl.storeCache().closeStore(oldLeader.peerId);
+        impl.regionCache().invalidate(TestCluster.BOOTSTRAP_REGION_ID);
+        impl.storeCache().closeStore(oldStoreId);
 
         // Earlier write must still be visible.
         assertThat(raw.get("before".getBytes())).map(String::new).contains("yes");

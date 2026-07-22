@@ -34,7 +34,7 @@ import java.util.concurrent.atomic.AtomicLong;
 /**
  * Wraps x-raft-lib's {@link Node} for the PD consensus group.
  *
- * <p>Much simpler than the KV-side {@code RegionPeerImpl}: no per-CF apply,
+ * <p>Much simpler than the KV-side {@code RegionPeer}: no per-CF apply,
  * no MVCC, no split/merge. The PD state is small and all mutations are
  * serialized through raft; the state machine is deterministic.
  *
@@ -152,12 +152,17 @@ public final class PdRaftNode implements AutoCloseable {
         });
         transport.start();
 
-        node.registerLeaderObserver((oldLeader, newLeader) -> {
+        // The raft LeaderObserver callback signature is (newLeader, term) —
+        // NOT (oldLeader, newLeader). Naming the second parameter `newLeader`
+        // silently bound it to the term (both are long), so currentLeaderId
+        // was set to the term and this node never recognised its own
+        // leadership (single-node PD could never satisfy awaitSelfLeadership).
+        node.registerLeaderObserver((newLeader, term) -> {
             currentLeaderId = newLeader;
             boolean isLeader = newLeader == nodeId;
             boolean was = leader.getAndSet(isLeader);
             if (was != isLeader) {
-                log.info("pd-raft node={} isLeader={} (newLeader={})", nodeId, isLeader, newLeader);
+                log.info("pd-raft node={} isLeader={} (newLeader={} term={})", nodeId, isLeader, newLeader, term);
                 if (isLeader) {
                     stateMachine.onBecomeLeader();
                 } else {
@@ -189,23 +194,37 @@ public final class PdRaftNode implements AutoCloseable {
     }
 
     public boolean isLeader() {
+        // Trust the observer-tracked flag first: it is fed by raft's SoftState
+        // leadership notifications and is exactly what drives scheduler /
+        // operator ownership, so it stays consistent with which node actually
+        // serves conf-changes. basicStatus() has been observed to report a
+        // stale StateLeader on a node whose leadership was already superseded
+        // (e.g. when queried from a gRPC thread), which mis-routes region
+        // heartbeats and leader discovery. Fall back to basicStatus() only
+        // before any leadership change has been observed.
+        if (leader.get()) return true;
+        if (currentLeaderId != 0) return false;
         try {
             var st = node.basicStatus();
             return st != null && st.state == RaftStateType.StateLeader;
         } catch (Throwable t) {
-            return leader.get();
+            return false;
         }
     }
 
     public long leaderNodeId() {
+        // Prefer the observer-tracked leader id for the same reason as
+        // isLeader(): it is consistent with operator/scheduler ownership.
+        long id = currentLeaderId;
+        if (id != 0) return id;
+        if (leader.get()) return nodeId;
         try {
             var st = node.basicStatus();
             if (st != null && st.lead != 0) return st.lead;
         } catch (Throwable e) {
             log.debug("leaderNodeId: basicStatus failed: {}", e.getMessage());
         }
-        long id = currentLeaderId;
-        return id != 0 ? id : (leader.get() ? nodeId : 0);
+        return 0;
     }
 
     /**

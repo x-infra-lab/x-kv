@@ -71,6 +71,7 @@ public final class SnapshotEngineImpl implements SnapshotEngine {
                                 long index,
                                 byte[] startKey,
                                 byte[] endKey,
+                                io.github.xinfra.lab.xkv.proto.Metapb.Region region,
                                 Consumer<KvServerpb.SnapshotChunk> chunkSink) {
         long start = System.currentTimeMillis();
         try (var snap = storage.newSnapshot()) {
@@ -81,6 +82,13 @@ public final class SnapshotEngineImpl implements SnapshotEngine {
                     .setStartKey(ByteString.copyFrom(startKey))
                     .setEndKey(endKey == null ? ByteString.EMPTY : ByteString.copyFrom(endKey))
                     .setGeneratedAtMs(start);
+            // Carry the full region descriptor so a peer created uninitialized
+            // from a bare raft message can learn its range/epoch/peers from the
+            // snapshot, without querying PD (TiKV-style).
+            if (region != null) {
+                meta.setRegion(region);
+                meta.setRegionEpoch(region.getRegionEpoch());
+            }
             for (var cfName : DATA_CFS) meta.addCfNames(cfName);
 
             boolean metaEmitted = false;

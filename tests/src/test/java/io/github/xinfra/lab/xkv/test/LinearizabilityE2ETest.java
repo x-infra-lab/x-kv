@@ -13,7 +13,6 @@ import org.slf4j.LoggerFactory;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
@@ -36,21 +35,21 @@ final class LinearizabilityE2ETest {
     private static final Logger log = LoggerFactory.getLogger(LinearizabilityE2ETest.class);
 
     @TempDir Path baseDir;
-    private ClusterHarness harness;
+    private TestCluster cluster;
     private XKvClient client;
 
     @BeforeEach
     void start() throws Exception {
-        harness = new ClusterHarness(baseDir, 3).start();
+        cluster = new TestCluster(baseDir).startReplicated(1, 3);
         client = XKvClient.create(ClientConfig.builder()
-                .pdEndpoints(List.of("127.0.0.1:" + harness.pdPort()))
+                .pdEndpoints(cluster.pdEndpoints())
                 .build());
     }
 
     @AfterEach
     void teardown() {
         if (client != null) client.close();
-        if (harness != null) harness.close();
+        if (cluster != null) cluster.close();
     }
 
     @Test
@@ -158,25 +157,28 @@ final class LinearizabilityE2ETest {
                     catch (InterruptedException e) { return; }
                     if (stopChaos.get()) return;
 
-                    var alive = killLeader
-                            ? harness.kvNodes().stream()
-                                    .filter(n -> n.peer.isLeader()).toList()
-                            : harness.kvNodes().stream()
-                                    .filter(n -> !n.peer.isLeader()).toList();
+                    long regionId = TestCluster.BOOTSTRAP_REGION_ID;
+                    List<TestCluster.StoreNode> alive;
+                    try {
+                        alive = killLeader
+                                ? List.of(cluster.leaderStoreFor(regionId))
+                                : cluster.followerStoresFor(regionId);
+                    } catch (RuntimeException noLeaderYet) {
+                        continue;
+                    }
                     if (alive.isEmpty()) continue;
                     var victim = alive.get(r.nextInt(alive.size()));
+                    long victimId = victim.storeId;
 
                     try {
-                        log.info("CHAOS: killing {} peer={}",
-                                killLeader ? "leader" : "follower", victim.peerId);
-                        Map<Long, String> peerAddrs = victim.peerAddrs;
-                        victim.shutdown();
-                        harness.kvNodes().remove(victim);
+                        log.info("CHAOS: killing {} store={}",
+                                killLeader ? "leader" : "follower", victimId);
+                        cluster.killStore(victimId);
                         killCount.incrementAndGet();
                         Thread.sleep(1500 + r.nextInt(1000));
 
-                        log.info("CHAOS: restarting peer={}", victim.peerId);
-                        harness.restartNode(victim.peerId, peerAddrs);
+                        log.info("CHAOS: restarting store={}", victimId);
+                        cluster.restartStore(victimId);
                     } catch (Exception e) {
                         log.warn("chaos error: {}", e.getMessage());
                     }

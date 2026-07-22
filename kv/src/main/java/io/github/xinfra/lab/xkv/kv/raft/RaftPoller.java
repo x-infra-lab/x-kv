@@ -11,7 +11,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * Fixed-size thread pool that processes Raft Ready cycles for all regions.
  *
  * <p>Replaces the per-region dedicated {@code readyThread} in
- * {@link RegionPeerImpl}. Instead of one thread per region blocking on
+ * the legacy per-region-thread peer. Instead of one thread per region blocking on
  * {@code node.ready()}, a small number of poller threads (default:
  * {@code max(4, availableProcessors())}) pick regions from a shared
  * ready-queue and drive their Raft state machines.

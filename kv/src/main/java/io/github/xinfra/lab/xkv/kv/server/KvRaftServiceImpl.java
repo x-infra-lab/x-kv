@@ -62,7 +62,7 @@ public final class KvRaftServiceImpl extends KvRaftGrpc.KvRaftImplBase {
             public void onNext(RaftMessage wire) {
                 try {
                     var msg = Eraftpb.Message.parseFrom(wire.getMessage());
-                    dispatcher.deliver(wire.getRegionId(), msg);
+                    dispatcher.deliver(wire.getRegionId(), msg, wire.getFromPeer().getStoreId());
                 } catch (Throwable t) {
                     raftParseErrors.increment();
                     log.warn("inbound raft parse failed: {}", t.getMessage());

@@ -1,27 +1,18 @@
 package io.github.xinfra.lab.xkv.test;
 
-import com.google.protobuf.ByteString;
 import io.github.xinfra.lab.xkv.client.TxnClient;
 import io.github.xinfra.lab.xkv.client.config.ClientConfig;
 import io.github.xinfra.lab.xkv.client.txn.Transaction;
-import io.github.xinfra.lab.xkv.kv.raft.RegionPeer;
 import io.github.xinfra.lab.xkv.kv.store.GcWorker;
 import io.github.xinfra.lab.xkv.kv.store.Store;
-import io.github.xinfra.lab.xkv.kv.store.StoreImpl;
-import io.github.xinfra.lab.xkv.proto.Kvrpcpb;
-import io.github.xinfra.lab.xkv.proto.Metapb;
 import io.github.xinfra.lab.xkv.proto.PDGrpc;
 import io.github.xinfra.lab.xkv.proto.Pdpb;
-import io.grpc.ManagedChannel;
-import io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
-import java.util.List;
-import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -38,27 +29,23 @@ import static org.assertj.core.api.Assertions.assertThat;
 final class GcWorkerTest {
 
     @TempDir Path baseDir;
-    private ClusterHarness harness;
+    private TestCluster cluster;
     private TxnClient client;
-    private ManagedChannel pdChannel;
     private PDGrpc.PDBlockingStub pd;
 
     @BeforeEach
     void start() throws Exception {
-        harness = new ClusterHarness(baseDir, 3).start();
+        cluster = new TestCluster(baseDir).startReplicated(1, 3);
         client = TxnClient.create(ClientConfig.builder()
-                .pdEndpoints(List.of("127.0.0.1:" + harness.pdPort()))
+                .pdEndpoints(cluster.pdEndpoints())
                 .build());
-        pdChannel = NettyChannelBuilder.forAddress("127.0.0.1", harness.pdPort())
-                .usePlaintext().build();
-        pd = PDGrpc.newBlockingStub(pdChannel);
+        pd = cluster.pdStub();
     }
 
     @AfterEach
     void stop() throws Exception {
         if (client != null) client.close();
-        if (pdChannel != null) pdChannel.shutdownNow().awaitTermination(2, TimeUnit.SECONDS);
-        if (harness != null) harness.close();
+        if (cluster != null) cluster.close();
     }
 
     @Test
@@ -71,10 +58,9 @@ final class GcWorkerTest {
             }
         }
 
-        // Wrap ALL nodes' peers in a Store. The worker iterates and picks
-        // whichever is currently leader (mirrors production where each
-        // store hosts many region peers).
-        Store store = wrapAllAsStore();
+        // The real leader store hosts the region-1 leader peer; the worker
+        // iterates its peers and proposes GC on whichever is currently leader.
+        Store store = cluster.leaderStoreFor(TestCluster.BOOTSTRAP_REGION_ID).store();
 
         // Move PD's GC safe-point well into the future so v1 + v2 are
         // eligible for collapse. We grab a fresh TSO via begin/rollback as a
@@ -106,7 +92,7 @@ final class GcWorkerTest {
     @Test
     void gcWorkerSkipsWhenSafePointZero() throws Exception {
         // PD safe-point default = 0 — worker must NOT propose anything.
-        Store store = wrapAllAsStore();
+        Store store = cluster.leaderStoreFor(TestCluster.BOOTSTRAP_REGION_ID).store();
         var worker = new GcWorker(store, pd, 60_000, 5_000);
         try {
             int proposed = worker.runOnce();
@@ -115,40 +101,5 @@ final class GcWorkerTest {
         } finally {
             worker.close();
         }
-    }
-
-    // ===== helpers =====
-
-    private ClusterHarness.KvNode leaderNode() {
-        return harness.leader();
-    }
-
-    /**
-     * Each node has a peer for the same region — StoreImpl's by-region map
-     * would collide. Use a tiny test-only Store that just returns all
-     * peers verbatim; the worker's "is leader" filter picks the right one.
-     */
-    private Store wrapAllAsStore() {
-        var nodes = harness.kvNodes();
-        return new Store() {
-            @Override public java.util.Optional<RegionPeer> peerForRegion(long regionId) {
-                return nodes.stream().map(n -> (RegionPeer) n.peer)
-                        .filter(p -> p.regionId() == regionId).findFirst();
-            }
-            @Override public java.util.Optional<RegionPeer> peerForKey(byte[] key) {
-                return java.util.Optional.empty();
-            }
-            @Override public java.util.Collection<RegionPeer> peers() {
-                return nodes.stream().map(n -> (RegionPeer) n.peer).toList();
-            }
-            @Override public void registerPeer(RegionPeer peer) {}
-            @Override public void destroyPeer(long regionId) {}
-            @Override public long storeId() { return 0L; }
-            @Override public Metapb.Store metadata() {
-                return Metapb.Store.newBuilder().setId(0L).build();
-            }
-            @Override public void shutdown() {}
-            @Override public void runHeartbeatTick() {}
-        };
     }
 }

@@ -182,6 +182,44 @@ public final class RuleCheckerScheduler implements AutoCloseable {
         int scheduled = 0;
         int peerCount = region.getPeersCount();
 
+        int voterCount = 0;
+        for (var p : region.getPeersList()) {
+            if (p.getRole() != Metapb.PeerRole.Learner) voterCount++;
+        }
+
+        // 0. Promote caught-up learners to voters (learner-first scheme, TiKV).
+        //    A learner that no longer appears in the leader's pending_peers has
+        //    finished receiving its snapshot and caught up, so promoting it to
+        //    voter won't stall the quorum. Only one operator per region per
+        //    tick, so return as soon as one promotion is scheduled.
+        if (voterCount < maxPeerCount) {
+            var pendingIds = new HashSet<Long>();
+            for (var pp : state.getPendingPeers(region.getId())) pendingIds.add(pp.getId());
+            for (var peer : region.getPeersList()) {
+                if (peer.getRole() != Metapb.PeerRole.Learner) continue;
+                if (pendingIds.contains(peer.getId())) continue;   // still catching up
+                var promoted = peer.toBuilder().setRole(Metapb.PeerRole.Voter).build();
+                var resp = Pdpb.RegionHeartbeatResponse.newBuilder()
+                        .setRegionId(region.getId()).setChangePeer(promoted)
+                        .addChangePeerV2(Pdpb.ChangePeer.newBuilder()
+                                .setPeer(promoted).setChangeType(Pdpb.ConfChangeType.AddNode))
+                        .build();
+                var op = new SimpleOperator(System.nanoTime(), region.getId(),
+                        Operator.Kind.RULE_FIX,
+                        "rule-checker: promote learner " + peer.getId() + " on store " + peer.getStoreId(),
+                        resp, Set.of(peer.getStoreId()),
+                        List.of(new OperatorSteps.PromoteLearnerStep(promoted)),
+                        Operator.PRIORITY_RULE_FIX);
+                if (controller.addOperator(op)) {
+                    operatorsScheduled.incrementAndGet();
+                    scheduled++;
+                    log.info("rule-checker: promoting learner {} to voter for region={} (store {})",
+                            peer.getId(), region.getId(), peer.getStoreId());
+                }
+                return scheduled;   // one conf-change per region per tick
+            }
+        }
+
         if (peerCount < maxPeerCount) {
             var existingStores = new HashSet<Long>(peerCount);
             for (var p : region.getPeersList()) existingStores.add(p.getStoreId());
@@ -201,26 +239,29 @@ public final class RuleCheckerScheduler implements AutoCloseable {
             }
 
             if (bestStore >= 0) {
+                // Add as a LEARNER first: learners don't count toward quorum, so
+                // a brand-new peer with Match=0 can't stall commits. The promote
+                // pass above lifts it to voter once it has caught up.
                 long newPeerId = state.allocId(1);
                 var newPeer = Metapb.Peer.newBuilder()
                         .setId(newPeerId).setStoreId(bestStore)
-                        .setRole(Metapb.PeerRole.Voter).build();
+                        .setRole(Metapb.PeerRole.Learner).build();
                 var resp = Pdpb.RegionHeartbeatResponse.newBuilder()
                         .setRegionId(region.getId()).setChangePeer(newPeer)
                         .addChangePeerV2(Pdpb.ChangePeer.newBuilder()
-                                .setPeer(newPeer).setChangeType(Pdpb.ConfChangeType.AddNode))
+                                .setPeer(newPeer).setChangeType(Pdpb.ConfChangeType.AddLearnerNode))
                         .build();
                 var op = new SimpleOperator(System.nanoTime(), region.getId(),
                         Operator.Kind.RULE_FIX,
-                        "rule-checker: add peer on store " + bestStore,
+                        "rule-checker: add learner on store " + bestStore,
                         resp, Set.of(bestStore),
-                        List.of(new OperatorSteps.AddPeerStep(newPeer)),
+                        List.of(new OperatorSteps.AddLearnerStep(newPeer)),
                         Operator.PRIORITY_RULE_FIX);
                 if (controller.addOperator(op)) {
                     operatorsScheduled.incrementAndGet();
                     scheduled++;
                     regionCountByStore.merge(bestStore, 1, Integer::sum);
-                    log.info("rule-checker: under-replicated region={} ({}/{}) — adding on store {}",
+                    log.info("rule-checker: under-replicated region={} ({}/{}) — adding learner on store {}",
                             region.getId(), peerCount, maxPeerCount, bestStore);
                 }
             }

@@ -33,14 +33,11 @@ import java.util.concurrent.TimeUnit;
 /**
  * PD node entrypoint.
  *
- * <p>Supports two modes:
- * <ul>
- *   <li><b>Single-node</b> (no peers configured): state is in-memory only.
- *       Adequate for dev/test. This is the default when no peers are set.</li>
- *   <li><b>Multi-node HA</b> (peers configured): state mutations are
- *       replicated through an internal raft group. TSO and schedulers run
- *       only on the PD leader. Followers redirect or reject mutating RPCs.</li>
- * </ul>
+ * <p>State mutations are always replicated through an internal raft group.
+ * A single-node deployment (no peers configured) runs as a one-member raft
+ * group that self-elects; multi-node deployments form a normal HA group.
+ * TSO and schedulers run only on the PD leader; followers redirect or reject
+ * mutating RPCs.
  */
 public final class PdServer {
     private static final Logger log = LoggerFactory.getLogger(PdServer.class);
@@ -53,6 +50,7 @@ public final class PdServer {
     static final long MERGE_CHECKER_INTERVAL_MS = 10_000L;
     static final long RULE_CHECKER_INTERVAL_MS = 10_000L;
     static final long OPERATOR_TIMEOUT_MS = 10 * 60_000L;
+    static final long SINGLE_NODE_LEADER_WAIT_MS = 15_000L;
 
     private final PdConfig config;
     private Server grpcServer;
@@ -118,10 +116,9 @@ public final class PdServer {
             bootstrapMembers();
         }
 
-        // Multi-PD raft: if peers are configured, start the raft group.
-        if (!config.peers().isEmpty()) {
-            startRaftGroup();
-        }
+        // Always run through raft: a single-node deployment forms a
+        // one-member raft group that self-elects.
+        startRaftGroup();
 
         var metricsRegistry = XKvMetrics.init("pd");
         var grpcBuilder = GrpcChannelFactory.serverBuilder(
@@ -159,17 +156,45 @@ public final class PdServer {
                 config.scheduler().maxOperatorsPerStore(), OPERATOR_TIMEOUT_MS);
         service.setOperatorController(operatorController);
 
-        if (config.peers().isEmpty()) {
-            startSchedulers();
-        } else {
-            raftNode.setLeaderObserver(isLeader -> {
-                if (isLeader) {
-                    tso.reloadAfterLeaderChange();
-                    startSchedulers();
-                } else {
-                    stopSchedulers();
-                }
-            });
+        raftNode.setLeaderObserver(isLeader -> {
+            if (isLeader) {
+                tso.reloadAfterLeaderChange();
+                startSchedulers();
+            } else {
+                stopSchedulers();
+            }
+        });
+
+        // Single-node deployment: block until this node self-elects so the
+        // "ready after start()" contract holds for callers that issue RPCs
+        // immediately. Multi-node deployments return without blocking; the
+        // leader emerges once peers are up.
+        if (isSingleNodeGroup()) {
+            awaitSelfLeadership();
+            startSchedulers();   // idempotent — observer may already have run
+        }
+    }
+
+    /** True when this node is the only voter (no peers, or peers == {self}). */
+    private boolean isSingleNodeGroup() {
+        return config.peers().stream()
+                .noneMatch(p -> p.id() != config.nodeId());
+    }
+
+    private void awaitSelfLeadership() throws IOException {
+        long deadline = System.currentTimeMillis() + SINGLE_NODE_LEADER_WAIT_MS;
+        while (raftNode != null && !raftNode.isLeader()) {
+            if (System.currentTimeMillis() > deadline) {
+                throw new IOException("PD node " + config.nodeId()
+                        + " failed to acquire single-node leadership within "
+                        + SINGLE_NODE_LEADER_WAIT_MS + "ms");
+            }
+            try {
+                Thread.sleep(20);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("interrupted while awaiting PD leadership", e);
+            }
         }
     }
 

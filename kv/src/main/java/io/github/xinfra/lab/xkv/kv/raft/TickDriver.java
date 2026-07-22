@@ -13,7 +13,7 @@ import java.util.concurrent.TimeUnit;
  * Single shared tick timer for all regions.
  *
  * <p>Replaces the per-region {@code ScheduledExecutorService} in
- * {@link RegionPeerImpl}. One timer thread fires periodically and enqueues
+ * the legacy per-region-thread peer. One timer thread fires periodically and enqueues
  * a TICK event to each registered {@link RegionMailbox}, then wakes it on
  * the shared {@link RaftPoller}.
  *

@@ -268,9 +268,17 @@ public final class MvccTxn {
         }
 
         var lockOpt = reader.readLock(key);
-        if (lockOpt.isEmpty()) {
-            // No lock → either already committed (find write at startTs) or
-            // already rolled back (write at startTs is ROLLBACK).
+        if (lockOpt.isEmpty() || lockOpt.get().startTs() != startTs) {
+            // Our lock is gone — either it was never present, or a DIFFERENT
+            // txn now holds the key because ours was TTL-expired/resolved and
+            // the key was re-locked in the meantime. Before assuming a stale
+            // view, determine THIS txn's real fate from the write CF at our
+            // startTs: a resolver that rolled us back leaves a ROLLBACK stamp,
+            // and a concurrent path may already have promoted our lock into a
+            // Write record. Checking the foreign lock first (as before) wrongly
+            // reported CommitLockMismatch for a txn we had actually rolled back,
+            // which the apply layer then swallowed as a silent success — a
+            // lost update under contention.
             var w = reader.findWriteByStartTs(key, startTs);
             if (w.isPresent()) {
                 if (w.get().type() == Write.Type.ROLLBACK) {
@@ -279,14 +287,27 @@ public final class MvccTxn {
                 // Already committed; idempotent.
                 return CommitOutcome.alreadyCommitted();
             }
+            // Overlapping-rollback collapse: our ROLLBACK stamp may have been
+            // folded into another txn's write record sitting at (key, startTs).
+            byte[] raw = readerEngine().get(StorageEngine.Cf.WRITE,
+                    MvccKey.encode(key, startTs), reader.snapshotReadOpts());
+            if (raw != null) {
+                Write wr = Write.decode(raw);
+                if (wr.hasOverlappedRollback() && wr.startTs() != startTs) {
+                    return CommitOutcome.alreadyRolledBack();
+                }
+            }
+            // No trace of our txn. If another txn now holds the lock, ours was
+            // resolved without a recoverable stamp — report the mismatch so the
+            // apply layer aborts (never a silent success). Otherwise the txn
+            // was never seen at all.
+            if (lockOpt.isPresent()) {
+                return CommitOutcome.lockMismatch(lockOpt.get());
+            }
             return CommitOutcome.txnNotFound();
         }
 
         var lock = lockOpt.get();
-        if (lock.startTs() != startTs) {
-            // Some other txn's lock — caller's view is stale.
-            return CommitOutcome.lockMismatch(lock);
-        }
         if (commitTs < lock.minCommitTs()) {
             return CommitOutcome.invalidCommitTs(
                     "commitTs (" + commitTs + ") < lock.minCommitTs (" + lock.minCommitTs() + ")");

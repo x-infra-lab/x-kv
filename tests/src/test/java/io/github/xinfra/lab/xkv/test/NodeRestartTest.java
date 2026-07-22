@@ -2,15 +2,12 @@ package io.github.xinfra.lab.xkv.test;
 
 import io.github.xinfra.lab.xkv.client.XKvClient;
 import io.github.xinfra.lab.xkv.client.config.ClientConfig;
-import org.awaitility.Awaitility;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
-import java.time.Duration;
-import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -30,21 +27,21 @@ import static org.assertj.core.api.Assertions.assertThat;
 final class NodeRestartTest {
 
     @TempDir Path baseDir;
-    private ClusterHarness harness;
+    private TestCluster cluster;
     private XKvClient client;
 
     @BeforeEach
     void start() throws Exception {
-        harness = new ClusterHarness(baseDir, 3).start();
+        cluster = new TestCluster(baseDir).startReplicated(1, 3);
         client = XKvClient.create(ClientConfig.builder()
-                .pdEndpoints(List.of("127.0.0.1:" + harness.pdPort()))
+                .pdEndpoints(cluster.pdEndpoints())
                 .build());
     }
 
     @AfterEach
     void teardown() {
         if (client != null) client.close();
-        if (harness != null) harness.close();
+        if (cluster != null) cluster.close();
     }
 
     @Test
@@ -66,24 +63,17 @@ final class NodeRestartTest {
         }
 
         // Phase 2: kill the leader.
-        var oldLeader = harness.leader();
-        long oldLeaderId = oldLeader.peerId;
-        oldLeader.shutdown();
-        harness.kvNodes().remove(oldLeader);
+        long regionId = TestCluster.BOOTSTRAP_REGION_ID;
+        var oldLeader = cluster.leaderStoreFor(regionId);
+        long oldLeaderId = oldLeader.storeId;
+        cluster.killStore(oldLeaderId);
 
         // Phase 3: wait for new leader election.
-        Awaitility.await()
-                .atMost(Duration.ofSeconds(20))
-                .pollInterval(Duration.ofMillis(200))
-                .until(() -> harness.kvNodes().stream()
-                        .anyMatch(n -> n.peer.isLeader()));
-
-        // Refresh PD's leader info so client routing works.
-        harness.publishLeaderToPd();
+        cluster.waitForNewLeaderOtherThan(regionId, oldLeaderId);
 
         // Invalidate client caches for the dead node.
         var impl = (io.github.xinfra.lab.xkv.client.XKvClientImpl) client;
-        impl.regionCache().invalidate(harness.bootstrapRegionId());
+        impl.regionCache().invalidate(regionId);
         impl.storeCache().closeStore(oldLeaderId);
 
         // Phase 4: verify all data is still readable.
@@ -120,20 +110,15 @@ final class NodeRestartTest {
         }
 
         // Kill leader.
-        var oldLeader = harness.leader();
-        long oldLeaderId = oldLeader.peerId;
-        oldLeader.shutdown();
-        harness.kvNodes().remove(oldLeader);
+        long regionId = TestCluster.BOOTSTRAP_REGION_ID;
+        var oldLeader = cluster.leaderStoreFor(regionId);
+        long oldLeaderId = oldLeader.storeId;
+        cluster.killStore(oldLeaderId);
 
-        Awaitility.await()
-                .atMost(Duration.ofSeconds(20))
-                .pollInterval(Duration.ofMillis(200))
-                .until(() -> harness.kvNodes().stream()
-                        .anyMatch(n -> n.peer.isLeader()));
-        harness.publishLeaderToPd();
+        cluster.waitForNewLeaderOtherThan(regionId, oldLeaderId);
 
         var impl = (io.github.xinfra.lab.xkv.client.XKvClientImpl) client;
-        impl.regionCache().invalidate(harness.bootstrapRegionId());
+        impl.regionCache().invalidate(regionId);
         impl.storeCache().closeStore(oldLeaderId);
 
         // Scan after leader change — all 30 keys must be present.

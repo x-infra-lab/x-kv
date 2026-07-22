@@ -68,6 +68,10 @@ message SnapshotMeta {
     repeated string cf_names = 7;
     uint64 total_size = 8;
     uint64 generated_at_ms = 9;
+    // Full region descriptor (range + epoch + peers). Carried so a peer that
+    // was created uninitialized from a bare raft message can learn its region
+    // metadata directly from the snapshot, TiKV-style, without querying PD.
+    metapb.Region region = 10;
 }
 
 // ===========================================================================

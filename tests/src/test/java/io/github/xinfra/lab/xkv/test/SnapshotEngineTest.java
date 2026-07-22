@@ -5,6 +5,7 @@ import io.github.xinfra.lab.xkv.kv.engine.RocksStorageEngine;
 import io.github.xinfra.lab.xkv.kv.engine.SnapshotEngineImpl;
 import io.github.xinfra.lab.xkv.kv.engine.StorageEngine;
 import io.github.xinfra.lab.xkv.proto.KvServerpb;
+import io.github.xinfra.lab.xkv.proto.Metapb;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -67,7 +68,8 @@ final class SnapshotEngineTest {
         // Build snapshot on src; pipe to dst.
         var chunks = new ArrayList<KvServerpb.SnapshotChunk>();
         srcSnap.buildAndStream(/* regionId= */ 1, /* term= */ 5, /* index= */ 100,
-                new byte[]{0}, /* endKey= */ null, chunks::add);
+                new byte[]{0}, /* endKey= */ null,
+                Metapb.Region.newBuilder().setId(1).build(), chunks::add);
         dstSnap.receiveAndInstall(1, chunks);
 
         // Every CF on dst now matches src exactly within range.
@@ -92,7 +94,8 @@ final class SnapshotEngineTest {
             srcEngine.write(b, true);
         }
         var chunks = new ArrayList<KvServerpb.SnapshotChunk>();
-        srcSnap.buildAndStream(1, 1, 1, new byte[]{0}, null, chunks::add);
+        srcSnap.buildAndStream(1, 1, 1, new byte[]{0}, null,
+                Metapb.Region.newBuilder().setId(1).build(), chunks::add);
 
         // Tamper one chunk's data without updating its CRC.
         var tampered = new ArrayList<KvServerpb.SnapshotChunk>(chunks.size());

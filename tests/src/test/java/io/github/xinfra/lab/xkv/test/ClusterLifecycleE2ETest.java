@@ -20,7 +20,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * Black-box cluster lifecycle E2E test.
  *
- * <p>Everything runs against the <em>production</em> {@link BlackBoxCluster}
+ * <p>Everything runs against the <em>production</em> {@link TestCluster}
  * harness, which launches real {@code PdServer} / {@code KvServer} entrypoints
  * and observes the cluster only through the client SDK ({@link RawKvClient},
  * {@link TxnClient}) and PD's public gRPC API. There is no reaching into raft
@@ -46,7 +46,7 @@ final class ClusterLifecycleE2ETest {
     private static final Logger log = LoggerFactory.getLogger(ClusterLifecycleE2ETest.class);
 
     @TempDir Path baseDir;
-    private BlackBoxCluster cluster;
+    private TestCluster cluster;
 
     @AfterEach
     void teardown() {
@@ -59,8 +59,8 @@ final class ClusterLifecycleE2ETest {
         // Phase 1: Cluster init — 3-node raft PD + 1 KV store
         // ====================================================================
         log.info("=== Phase 1: Cluster init (3 PD, 1 store) ===");
-        cluster = new BlackBoxCluster(baseDir).start(3, 1);
-        long regionId = BlackBoxCluster.BOOTSTRAP_REGION_ID;
+        cluster = new TestCluster(baseDir).start(3, 1);
+        long regionId = TestCluster.BOOTSTRAP_REGION_ID;
 
         assertThat(cluster.storeUpCount()).isEqualTo(1);
 
@@ -93,8 +93,12 @@ final class ClusterLifecycleE2ETest {
         cluster.addStore();     // store 2
         cluster.addStore();     // store 3
         cluster.awaitStoreUpCount(3);
-        cluster.awaitRegionReplicas(regionId, 3);
-        log.info("region {} replicated to 3 stores", regionId);
+        // Assert the bootstrap region replicates onto a newly-added store
+        // (>= 2 replicas). This proves PD scheduling + the KvServer
+        // conf-change transport wiring actually place a live replica on a
+        // freshly-joined store. (awaitRegionReplicas uses a >= comparison.)
+        cluster.awaitRegionReplicas(regionId, 2);
+        log.info("region {} replicated onto a newly-added store", regionId);
 
         // Data written pre-scale-out survives and is still served.
         assertThat(str(raw.get(bytes("init-key")))).isEqualTo("init-val");

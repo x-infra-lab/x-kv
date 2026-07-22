@@ -34,13 +34,13 @@ final class AutoSplitE2ETest {
     private static final Logger log = LoggerFactory.getLogger(AutoSplitE2ETest.class);
 
     @TempDir Path baseDir;
-    private ClusterHarness harness;
+    private TestCluster cluster;
     private XKvClient client;
 
     @AfterEach
     void teardown() {
         if (client != null) client.close();
-        if (harness != null) harness.close();
+        if (cluster != null) cluster.close();
     }
 
     @Test
@@ -48,7 +48,7 @@ final class AutoSplitE2ETest {
         // Use a very low split threshold so we trigger it with small data.
         long splitThresholdBytes = 1024;
 
-        harness = new ClusterHarness(baseDir, 3).start();
+        cluster = new TestCluster(baseDir).startReplicated(1, 3);
 
         // Override PD's split checker threshold via direct access.
         // The default PdServer creates SplitCheckerScheduler with the
@@ -62,9 +62,8 @@ final class AutoSplitE2ETest {
         // may report 0 until data is flushed, so we also manually trigger
         // the split checker by updating regionStats.
 
-        String pdAddr = "127.0.0.1:" + harness.pdPort();
         client = XKvClient.create(ClientConfig.builder()
-                .pdEndpoints(List.of(pdAddr))
+                .pdEndpoints(cluster.pdEndpoints())
                 .build());
 
         // Write 200 key-value pairs (~100 bytes each).
@@ -82,11 +81,11 @@ final class AutoSplitE2ETest {
         // Since RocksDB's getApproximateSizes may be zero for small data
         // sets (memtable data isn't counted by default), inject the stat
         // directly to guarantee the split checker fires.
-        long regionId = harness.bootstrapRegionId();
-        harness.pdServer().state().updateRegionStats(regionId,
+        long regionId = TestCluster.BOOTSTRAP_REGION_ID;
+        cluster.pdLeader().server.state().updateRegionStats(regionId,
                 splitThresholdBytes + 1, 200);
 
-        var region = harness.pdServer().state().getRegion(regionId).orElseThrow();
+        var region = cluster.pdLeader().server.state().getRegion(regionId).orElseThrow();
         long currentVersion = region.getRegionEpoch().getVersion();
         var storeIds = new java.util.HashSet<Long>();
         for (var p : region.getPeersList()) storeIds.add(p.getStoreId());
@@ -98,34 +97,32 @@ final class AutoSplitE2ETest {
                 "test: approximate split", resp, storeIds,
                 List.of(new OperatorSteps.SplitRegionStep(currentVersion + 1)),
                 Operator.PRIORITY_ADMIN);
-        harness.pdServer().operatorController().addOperator(splitOp);
+        cluster.pdLeader().server.operatorController().addOperator(splitOp);
 
         // Wait for the split to happen: region count should increase.
         await().atMost(30, TimeUnit.SECONDS)
                 .pollInterval(500, TimeUnit.MILLISECONDS)
                 .until(() -> {
-                    int regionCount = 0;
-                    for (var n : harness.kvNodes()) {
+                    for (var n : cluster.stores()) {
                         // Count distinct regions hosted by this node (parent + children).
-                        regionCount = 1 + n.childPeers.size();
-                        if (regionCount > 1) return true;
+                        if (n.store().peers().size() > 1) return true;
                     }
                     return false;
                 });
 
         // Verify: at least one node has a child peer.
-        int maxRegions = harness.kvNodes().stream()
-                .mapToInt(n -> 1 + n.childPeers.size())
+        int maxRegions = cluster.stores().stream()
+                .mapToInt(n -> n.store().peers().size())
                 .max().orElse(0);
         log.info("auto-split complete: max regions per node = {}", maxRegions);
         assertThat(maxRegions).isGreaterThan(1);
 
         // Verify data integrity via the leader's storage engine directly.
         // (Client SDK routing may not yet know about the child region.)
-        var leader = harness.leader();
+        var leaderNode = cluster.leaderStoreFor(TestCluster.BOOTSTRAP_REGION_ID);
         for (int i = 0; i < 200; i++) {
             byte[] key = String.format("auto-split-key-%04d", i).getBytes();
-            byte[] val = leader.engine.get(
+            byte[] val = leaderNode.server.engine().get(
                     io.github.xinfra.lab.xkv.kv.engine.StorageEngine.Cf.DEFAULT, key);
             assertThat(val)
                     .as("key auto-split-key-%04d should exist after split", i)

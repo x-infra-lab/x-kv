@@ -165,6 +165,26 @@ public final class TsoBatcherImpl implements TsoBatcher {
                     log.warn("TSO response with no pending batch — dropping");
                     return;
                 }
+                // A non-leader PD replies with an error header (e.g. "not PD
+                // leader") and a zero timestamp instead of closing the stream.
+                // Completing the futures here would hand out ts=(0<<18)|1 = 1,
+                // and reads at that start_ts would observe an empty database.
+                // Treat it as a transient failover: re-discover the leader and
+                // re-enqueue every batch still riding this stream so the
+                // dispatcher retries them against the new leader.
+                if (resp.getHeader().hasError()) {
+                    log.warn("TSO rejected by PD ({}); re-discovering leader and retrying",
+                            resp.getHeader().getError().getMessage());
+                    newS.broken = true;
+                    var toRetry = new ArrayList<Pending>(pr.batch);
+                    for (PendingResp other = newS.pending.pollFirst(); other != null;
+                            other = newS.pending.pollFirst()) {
+                        toRetry.addAll(other.batch);
+                    }
+                    pdClient.switchLeader();
+                    requeue(toRetry);
+                    return;
+                }
                 long physical = resp.getTimestamp().getPhysical();
                 long lastLogical = resp.getTimestamp().getLogical();
                 int count = resp.getCount();
@@ -203,6 +223,24 @@ public final class TsoBatcherImpl implements TsoBatcher {
             var pr = s.pending.pollFirst();
             if (pr == null) break;
             for (var p : pr.batch) p.future.completeExceptionally(t);
+        }
+    }
+
+    /**
+     * Push batches back to the front of the queue (preserving their relative
+     * order) so the dispatcher re-sends them on a freshly-established stream.
+     * Used when the current leader rejects a request mid-failover.
+     */
+    private void requeue(List<Pending> items) {
+        if (items.isEmpty()) return;
+        lock.lock();
+        try {
+            for (int i = items.size() - 1; i >= 0; i--) {
+                queue.addFirst(items.get(i));
+            }
+            workArrived.signal();
+        } finally {
+            lock.unlock();
         }
     }
 

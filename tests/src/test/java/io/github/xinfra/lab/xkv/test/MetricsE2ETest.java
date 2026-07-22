@@ -43,14 +43,14 @@ final class MetricsE2ETest {
         if (server != null) server.shutdownNow().awaitTermination(2, TimeUnit.SECONDS);
         if (metricsHttp != null) metricsHttp.close();
         if (registry != null) registry.close();
-        ClusterHarness.releaseAllPorts();
+        TestCluster.releaseAllPorts();
     }
 
     @Test
     void metricsInterceptorAndHttpEndpoint() throws Exception {
         registry = new PrometheusMeterRegistry(PrometheusConfig.DEFAULT);
-        int grpcPort = ClusterHarness.freePort();
-        ClusterHarness.releasePort(grpcPort);
+        int grpcPort = TestCluster.freePort();
+        TestCluster.releasePort(grpcPort);
 
         server = NettyServerBuilder.forPort(grpcPort)
                 .addService(new TikvServiceImpl())

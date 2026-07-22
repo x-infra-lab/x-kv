@@ -62,14 +62,14 @@ final class PdRoutedBankTransferTest {
     private static final int MAX_RETRIES = 30;
 
     @TempDir Path baseDir;
-    private ClusterHarness harness;
+    private TestCluster harness;
     private TxnClient client;
 
     @BeforeEach
     void start() throws Exception {
-        harness = new ClusterHarness(baseDir, 3).start();
+        harness = new TestCluster(baseDir).startReplicated(1, 3);
         client = TxnClient.create(ClientConfig.builder()
-                .pdEndpoints(List.of("127.0.0.1:" + harness.pdPort()))
+                .pdEndpoints(harness.pdEndpoints())
                 .build());
 
         // Seed accounts with initial balance.

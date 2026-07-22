@@ -18,7 +18,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * End-to-end smoke test for the Java client SDK against a live
- * {@link ClusterHarness} (3 KV nodes + 1 PD).
+ * {@link TestCluster} (3 KV nodes + 1 PD).
  *
  * <p>Validates the full stack: client → PD region discovery →
  * StoreChannelCache → KV gRPC → raft apply → response. This test
@@ -27,14 +27,14 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 final class ClientSdkE2ETest {
 
     @TempDir Path baseDir;
-    private ClusterHarness harness;
+    private TestCluster harness;
     private ClientConfig cfg;
 
     @BeforeEach
     void start() throws Exception {
-        harness = new ClusterHarness(baseDir, 3).start();
+        harness = new TestCluster(baseDir).startReplicated(1, 3);
         cfg = ClientConfig.builder()
-                .pdEndpoints(List.of("127.0.0.1:" + harness.pdPort()))
+                .pdEndpoints(harness.pdEndpoints())
                 .backoff(new ClientConfig.BackoffConfig(
                         2, 500,       // regionMiss
                         50, 1000,     // txnLock

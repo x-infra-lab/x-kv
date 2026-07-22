@@ -38,21 +38,21 @@ import static org.assertj.core.api.Assertions.assertThat;
 final class DistributedDeadlockTest {
 
     @TempDir Path baseDir;
-    private ClusterHarness harness;
+    private TestCluster cluster;
 
     @BeforeEach
     void start() throws Exception {
-        harness = new ClusterHarness(baseDir, 3).start();
+        cluster = new TestCluster(baseDir).startReplicated(1, 3);
     }
 
     @AfterEach
     void stop() throws Exception {
-        if (harness != null) harness.close();
+        if (cluster != null) cluster.close();
     }
 
     @Test
     void twoTxnCycleSurfacesAsKeyErrorDeadlock() {
-        var tikv = harness.leader().blockingStub();
+        var tikv = cluster.clientStub(cluster.leaderStoreFor(TestCluster.BOOTSTRAP_REGION_ID).storeId);
         ByteString k1 = ByteString.copyFromUtf8("dl-k1");
         ByteString k2 = ByteString.copyFromUtf8("dl-k2");
 
@@ -108,7 +108,7 @@ final class DistributedDeadlockTest {
 
     @Test
     void noCycleNoDeadlockSurface() {
-        var tikv = harness.leader().blockingStub();
+        var tikv = cluster.clientStub(cluster.leaderStoreFor(TestCluster.BOOTSTRAP_REGION_ID).storeId);
         ByteString k1 = ByteString.copyFromUtf8("nodl-k1");
         ByteString k2 = ByteString.copyFromUtf8("nodl-k2");
         long aStart = 300L, bStart = 400L;
@@ -135,12 +135,12 @@ final class DistributedDeadlockTest {
         assertThat(bLock.getErrors(0).hasDeadlock()).isFalse();
 
         // PD-side: only one edge ever inserted.
-        assertThat(harness.pdServer().deadlockDetector().edgeCount()).isEqualTo(1);
+        assertThat(cluster.pdLeader().server.deadlockDetector().edgeCount()).isEqualTo(1);
     }
 
     @Test
     void commitClearsHolderEdges() throws Exception {
-        var tikv = harness.leader().blockingStub();
+        var tikv = cluster.clientStub(cluster.leaderStoreFor(TestCluster.BOOTSTRAP_REGION_ID).storeId);
         ByteString k = ByteString.copyFromUtf8("clr-k");
         long aStart = 500L, bStart = 600L;
 
@@ -158,7 +158,7 @@ final class DistributedDeadlockTest {
                         .setOp(Kvrpcpb.Op.PessimisticLock).setKey(k))
                 .build());
         assertThat(bWait.getErrors(0).hasLocked()).isTrue();
-        assertThat(harness.pdServer().deadlockDetector().edgeCount()).isEqualTo(1);
+        assertThat(cluster.pdLeader().server.deadlockDetector().edgeCount()).isEqualTo(1);
 
         // A rolls back — the pessimistic lock disappears AND the wait-for
         // edge for A-as-holder must clear so B isn't left "waiting" forever
@@ -169,7 +169,7 @@ final class DistributedDeadlockTest {
 
         // Cleanup is fire-and-forget but synchronous on the response thread —
         // by the time kvBatchRollback returns the RPC has executed.
-        assertThat(harness.pdServer().deadlockDetector().edgeCount())
+        assertThat(cluster.pdLeader().server.deadlockDetector().edgeCount())
                 .as("rollback should have dropped B→A edge")
                 .isZero();
     }

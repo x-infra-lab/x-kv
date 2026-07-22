@@ -85,6 +85,18 @@ public interface PdStateMachine {
 
     default java.util.Map<Long, RegionStats> allRegionStats() { return java.util.Map.of(); }
 
+    // ---- Pending peers (volatile, not replicated) ----
+
+    /**
+     * Record the peers a region leader reports as still catching up (learners
+     * receiving a snapshot / lagging voters). Used by the rule checker to know
+     * when a learner has caught up and can be promoted to voter. Volatile —
+     * does NOT go through raft.
+     */
+    default void updatePendingPeers(long regionId, java.util.List<Metapb.Peer> pendingPeers) {}
+
+    default java.util.List<Metapb.Peer> getPendingPeers(long regionId) { return java.util.List.of(); }
+
     // ---- Members (PD cluster membership) ----
 
     record MemberInfo(long id, String name, String raftAddress, String clientAddress) {}

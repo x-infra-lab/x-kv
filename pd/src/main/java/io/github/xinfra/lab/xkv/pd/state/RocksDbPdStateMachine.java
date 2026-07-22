@@ -84,6 +84,7 @@ public final class RocksDbPdStateMachine implements PdStateMachine {
     private final HashMap<Long, MemberInfo> membersMap = new HashMap<>();
     private final HashMap<Long, Metapb.Peer> leaders = new HashMap<>();
     private final ConcurrentHashMap<Long, RegionStats> regionStats = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Long, java.util.List<Metapb.Peer>> pendingPeers = new ConcurrentHashMap<>();
     private final io.github.xinfra.lab.xkv.pd.state.placement.PlacementRuleManager placementRules =
             new io.github.xinfra.lab.xkv.pd.state.placement.PlacementRuleManager();
     private final io.github.xinfra.lab.xkv.pd.state.keyspace.KeyspaceManager keyspaces =
@@ -445,6 +446,20 @@ public final class RocksDbPdStateMachine implements PdStateMachine {
     @Override
     public java.util.Map<Long, RegionStats> allRegionStats() {
         return java.util.Collections.unmodifiableMap(regionStats);
+    }
+
+    @Override
+    public void updatePendingPeers(long regionId, java.util.List<Metapb.Peer> peers) {
+        if (peers == null || peers.isEmpty()) {
+            pendingPeers.remove(regionId);
+        } else {
+            pendingPeers.put(regionId, java.util.List.copyOf(peers));
+        }
+    }
+
+    @Override
+    public java.util.List<Metapb.Peer> getPendingPeers(long regionId) {
+        return pendingPeers.getOrDefault(regionId, java.util.List.of());
     }
 
     @Override

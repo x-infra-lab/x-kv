@@ -23,7 +23,7 @@ import java.util.concurrent.TimeUnit;
  * <p>Each KV store hosts ONE {@code GrpcRaftTransport} per local region peer
  * (the x-raft-lib {@code Node} owns one transport per peer; messages go
  * out via {@link #send} and inbound deliveries arrive via the
- * {@link Transport.MessageReceiver} the {@link io.github.xinfra.lab.xkv.kv.raft.RegionPeerImpl}
+ * {@link Transport.MessageReceiver} the {@link io.github.xinfra.lab.xkv.kv.raft.RegionPeer}
  * registers).
  *
  * <p>Outbound: a per-target-peer-id channel + outbound {@link StreamObserver}
@@ -55,7 +55,6 @@ public final class GrpcRaftTransport implements Transport {
     private volatile MessageReceiver receiver;
     private volatile boolean closed = false;
     private final Counter sendErrorCounter = XKvMetrics.errorCounter("raft_transport", "send");
-    private final java.util.concurrent.ExecutorService snapshotSender;
 
     public GrpcRaftTransport(long regionId, long selfPeerId, long selfStoreId) {
         this(regionId, selfPeerId, selfStoreId, null);
@@ -66,11 +65,6 @@ public final class GrpcRaftTransport implements Transport {
         this.selfPeerId = selfPeerId;
         this.selfStoreId = selfStoreId;
         this.tls = tls;
-        this.snapshotSender = java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
-            var t = new Thread(r, "snap-send-" + regionId);
-            t.setDaemon(true);
-            return t;
-        });
     }
 
     public long regionId() { return regionId; }
@@ -129,7 +123,6 @@ public final class GrpcRaftTransport implements Transport {
     @Override
     public void close() {
         closed = true;
-        snapshotSender.shutdownNow();
         for (var link : outbound.values()) link.close();
         outbound.clear();
         addresses.clear();
@@ -157,10 +150,11 @@ public final class GrpcRaftTransport implements Transport {
 
         void send(Eraftpb.Message msg) {
             if (closing) return;
-            if (msg.getMsgType() == Eraftpb.MessageType.MsgSnapshot) {
-                snapshotSender.submit(() -> sendViaSnapshotStream(msg));
-                return;
-            }
+            // Snapshots travel inline over the normal raft stream (the message
+            // carries the chunk-envelope in msg.snapshot.data). This keeps the
+            // follower's RawNode in the loop: it steps MsgSnapshot, surfaces
+            // ready.snapshot(), and installs it through the apply path — the
+            // side-channel that bypassed raft could never advance the follower.
             ensureStream();
             var s = outStream;
             if (s == null) return;
@@ -178,61 +172,6 @@ public final class GrpcRaftTransport implements Transport {
             } catch (Throwable t) {
                 log.warn("region={} send to peer={} failed: {}", regionId, targetPeerId, t.getMessage());
                 resetStream();
-            }
-        }
-
-        private void sendViaSnapshotStream(Eraftpb.Message msg) {
-            var snap = msg.getSnapshot();
-            byte[] data = snap.getData().toByteArray();
-            java.util.List<KvServerpb.SnapshotChunk> chunks;
-            try {
-                chunks = decodeChunkEnvelope(data);
-            } catch (Throwable t) {
-                log.warn("region={} snapshot decode failed: {}", regionId, t.getMessage());
-                return;
-            }
-
-            var meta = KvServerpb.SnapshotMeta.newBuilder()
-                    .setRegionId(regionId)
-                    .setRaftTerm(snap.getMetadata().getTerm())
-                    .setRaftIndex(snap.getMetadata().getIndex())
-                    .build();
-
-            ensureChannel();
-            var ch = channel;
-            if (ch == null) return;
-
-            var latch = new java.util.concurrent.CountDownLatch(1);
-            var success = new java.util.concurrent.atomic.AtomicBoolean(false);
-            var stub = KvRaftGrpc.newStub(ch);
-            var observer = stub.sendSnapshot(new StreamObserver<KvServerpb.Done>() {
-                @Override public void onNext(KvServerpb.Done v) { success.set(true); }
-                @Override public void onError(Throwable t) {
-                    log.warn("region={} snapshot send to peer={} failed: {}",
-                            regionId, targetPeerId, t.getMessage());
-                    latch.countDown();
-                }
-                @Override public void onCompleted() { latch.countDown(); }
-            });
-
-            try {
-                // First chunk carries the meta.
-                if (!chunks.isEmpty()) {
-                    observer.onNext(chunks.get(0).toBuilder().setMeta(meta).build());
-                    for (int i = 1; i < chunks.size(); i++) {
-                        observer.onNext(chunks.get(i));
-                    }
-                }
-                observer.onCompleted();
-                latch.await(30, TimeUnit.SECONDS);
-                log.info("region={} snapshot sent to peer={} index={} chunks={} ok={}",
-                        regionId, targetPeerId, snap.getMetadata().getIndex(),
-                        chunks.size(), success.get());
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                log.warn("region={} snapshot send interrupted", regionId);
-            } catch (Throwable t) {
-                log.warn("region={} snapshot send error: {}", regionId, t.getMessage());
             }
         }
 
@@ -302,21 +241,6 @@ public final class GrpcRaftTransport implements Transport {
                 lock.unlock();
             }
         }
-    }
-
-    private static java.util.List<KvServerpb.SnapshotChunk>
-            decodeChunkEnvelope(byte[] data) throws com.google.protobuf.InvalidProtocolBufferException {
-        if (data == null || data.length < 4) return java.util.List.of();
-        var bb = java.nio.ByteBuffer.wrap(data);
-        int count = bb.getInt();
-        var out = new java.util.ArrayList<KvServerpb.SnapshotChunk>(count);
-        for (int i = 0; i < count; i++) {
-            int len = bb.getInt();
-            byte[] chunk = new byte[len];
-            bb.get(chunk);
-            out.add(KvServerpb.SnapshotChunk.parseFrom(chunk));
-        }
-        return out;
     }
 
 }

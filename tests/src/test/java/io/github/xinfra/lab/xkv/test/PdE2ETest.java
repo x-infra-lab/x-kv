@@ -51,8 +51,8 @@ final class PdE2ETest {
 
     @BeforeEach
     void start() throws Exception {
-        pdPort = ClusterHarness.freePort();
-        int raftPort = ClusterHarness.freePort();
+        pdPort = TestCluster.freePort();
+        int raftPort = TestCluster.freePort();
         var cfg = PdConfig.builder()
                 .nodeId(1)
                 .clusterId(42)
@@ -60,8 +60,8 @@ final class PdE2ETest {
                 .raftAddress("127.0.0.1:" + raftPort)
                 .dataDir(dataDir)
                 .build();
-        ClusterHarness.releasePort(pdPort);
-        ClusterHarness.releasePort(raftPort);
+        TestCluster.releasePort(pdPort);
+        TestCluster.releasePort(raftPort);
         pd = new PdServer(cfg);
         pd.start();
 
@@ -74,7 +74,7 @@ final class PdE2ETest {
     void teardown() {
         if (channel != null) channel.shutdownNow();
         if (pd != null) pd.stop();
-        ClusterHarness.releaseAllPorts();
+        TestCluster.releaseAllPorts();
     }
 
     // =====================================================================
@@ -350,7 +350,7 @@ final class PdE2ETest {
     }
 
     private static int freePort() throws Exception {
-        return ClusterHarness.freePort();
+        return TestCluster.freePort();
     }
 
     /** Suppress unused. */

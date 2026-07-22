@@ -72,10 +72,10 @@
         <maven.compiler.target>17</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 
-        <!-- Pinned to x-raft-lib 0.1.0-RC1 so the Eraftpb runtime classes
+        <!-- Pinned to x-raft-lib 0.1.0-RC2 so the Eraftpb runtime classes
              pulled in transitively from raft-proto match the protobuf-java
              API on the rest of the classpath. -->
-        <x-raft.version>0.1.0-RC1</x-raft.version>
+        <x-raft.version>0.1.0-RC2</x-raft.version>
         <protobuf.version>4.35.0</protobuf.version>
         <protoc.version>4.35.0</protoc.version>
         <grpc.version>1.81.0</grpc.version>

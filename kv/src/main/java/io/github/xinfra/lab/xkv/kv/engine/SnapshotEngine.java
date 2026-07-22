@@ -44,6 +44,7 @@ public interface SnapshotEngine {
                         long index,
                         byte[] startKey,
                         byte[] endKey,
+                        io.github.xinfra.lab.xkv.proto.Metapb.Region region,
                         Consumer<KvServerpb.SnapshotChunk> chunkSink);
 
     /**

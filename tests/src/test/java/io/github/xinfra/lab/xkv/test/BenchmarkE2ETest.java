@@ -13,7 +13,6 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.List;
 import java.util.Random;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.CountDownLatch;
@@ -26,24 +25,33 @@ import static org.assertj.core.api.Assertions.assertThat;
  * Performance benchmark tests that output standardized latency reports.
  * Not JMH — lightweight enough to run in CI, detailed enough to track
  * regressions.
+ *
+ * <p>These are latency/throughput <em>reporting</em> tests, not hard SLA
+ * gates. CI runs them under JaCoCo instrumentation on 2-core runners, where
+ * a full 2PC transaction workload (2 raft rounds + 2 TSO round-trips per
+ * txn, replicated 3 ways) is several times slower than an uninstrumented
+ * dev box. The real invariants are {@code errors == 0} and
+ * {@code hist.count() == total} (every operation completed); the completion
+ * latch and {@link Timeout} ceilings are sized generously so an
+ * instrumented/loaded environment doesn't flap the pass/fail signal while
+ * the histogram still records the true per-op distribution.
  */
-@Timeout(value = 120, unit = TimeUnit.SECONDS)
+@Timeout(value = 300, unit = TimeUnit.SECONDS)
 final class BenchmarkE2ETest {
 
     @TempDir Path baseDir;
-    private ClusterHarness harness;
+    private TestCluster harness;
     private XKvClient rawClient;
     private TxnClient txnClient;
 
     @BeforeEach
     void start() throws Exception {
-        harness = new ClusterHarness(baseDir, 3).start();
-        String pdAddr = "127.0.0.1:" + harness.pdPort();
+        harness = new TestCluster(baseDir).startReplicated(1, 3);
         rawClient = XKvClient.create(ClientConfig.builder()
-                .pdEndpoints(List.of(pdAddr))
+                .pdEndpoints(harness.pdEndpoints())
                 .build());
         txnClient = TxnClient.create(ClientConfig.builder()
-                .pdEndpoints(List.of(pdAddr))
+                .pdEndpoints(harness.pdEndpoints())
                 .build());
     }
 
@@ -169,7 +177,7 @@ final class BenchmarkE2ETest {
                 }
             }, "bench-txn-" + w).start();
         }
-        assertThat(done.await(90, TimeUnit.SECONDS)).isTrue();
+        assertThat(done.await(240, TimeUnit.SECONDS)).isTrue();
         double elapsed = (System.nanoTime() - startTime) / 1e9;
         assertThat(errors.get()).isZero();
         System.out.println(hist.summary("txnCommit", elapsed));
@@ -232,7 +240,7 @@ final class BenchmarkE2ETest {
                 }
             }, "bench-conflict-" + w).start();
         }
-        assertThat(done.await(90, TimeUnit.SECONDS)).isTrue();
+        assertThat(done.await(240, TimeUnit.SECONDS)).isTrue();
         double elapsed = (System.nanoTime() - startTime) / 1e9;
         assertThat(errors.get()).isZero();
         System.out.println(hist.summary("txnConflictRetry", elapsed));

@@ -1,6 +1,7 @@
 package io.github.xinfra.lab.xkv.kv.server;
 
 import io.github.xinfra.lab.raft.Peer;
+import io.github.xinfra.lab.raft.proto.Eraftpb;
 import io.github.xinfra.lab.xkv.kv.cdc.CdcEventBus;
 import io.github.xinfra.lab.xkv.kv.coprocessor.TableScanCoprocessor;
 import io.github.xinfra.lab.xkv.kv.config.KvConfig;
@@ -16,7 +17,6 @@ import io.github.xinfra.lab.xkv.kv.raft.CompositeApplyHandler;
 import io.github.xinfra.lab.xkv.kv.raft.AdminApplyHandler;
 import io.github.xinfra.lab.xkv.kv.raft.RaftPoller;
 import io.github.xinfra.lab.xkv.kv.raft.RegionPeer;
-import io.github.xinfra.lab.xkv.kv.raft.RegionPeerImpl;
 import io.github.xinfra.lab.xkv.kv.raft.TickDriver;
 import io.github.xinfra.lab.xkv.kv.store.GcWorker;
 import io.github.xinfra.lab.xkv.kv.store.LogCompactionWorker;
@@ -108,6 +108,12 @@ public final class KvServer {
     private CdcEventBus cdcEventBus;
     private ChangeDataServiceImpl cdcService;
     private io.github.xinfra.lab.xkv.kv.raft.ApplyWorker applyWorker;
+    /**
+     * Single-thread pool that re-establishes a region's {@code max_ts} from PD
+     * when this store acquires that region's leadership. Kept off the raft
+     * poller thread so a slow PD round-trip never stalls raft processing.
+     */
+    private java.util.concurrent.ExecutorService maxTsBumpExecutor;
     private final io.github.xinfra.lab.xkv.kv.mvcc.InMemoryLockTable inMemoryLockTable =
             new io.github.xinfra.lab.xkv.kv.mvcc.InMemoryLockTable();
     private final io.github.xinfra.lab.xkv.kv.cdc.RegionResolvedTsTracker resolvedTsTracker =
@@ -168,10 +174,12 @@ public final class KvServer {
         }
         raftServer = raftBuilder.build().start();
 
-        // On-demand spawn handler for regions this store doesn't yet host.
-        dispatcher.setMissingHandler((regionId, firstMsg) -> {
-            var t = new Thread(() -> spawnOnDemand(regionId),
-                    "spawn-on-demand-" + regionId);
+        // Uninitialized-peer handler: a raft message arrived for a region this
+        // store doesn't host yet. Create the peer directly from the message
+        // (TiKV-style) rather than querying PD's eventually-consistent view.
+        dispatcher.setMissingHandler((regionId, firstMsg, fromStoreId) -> {
+            var t = new Thread(() -> createUninitializedPeer(regionId, firstMsg, fromStoreId),
+                    "uninit-peer-" + regionId);
             t.setDaemon(true);
             t.start();
         });
@@ -181,6 +189,23 @@ public final class KvServer {
         tickDriver = new TickDriver(config.raft().heartbeatTickMs());
         applyWorker = new io.github.xinfra.lab.xkv.kv.raft.ApplyWorker(
                 config.worker().applyPoolThreads());
+        // Single-thread pool that runs the PD TSO round-trip when a region
+        // acquires leadership (see wireLeaderMaxTsBump). Kept off the raft
+        // poller thread so a slow PD never stalls raft progress.
+        maxTsBumpExecutor = java.util.concurrent.Executors.newSingleThreadExecutor(runnable -> {
+            var th = new Thread(runnable, "max-ts-bump");
+            th.setDaemon(true);
+            return th;
+        });
+
+        // Store-level ConcurrencyManager: a single store-wide max_ts authority
+        // shared by every region peer's apply path AND the read path
+        // (TransactionService). Seeded to 0 and raised as each region's
+        // persisted max_ts is loaded below. Keeping reads and writes on ONE CM
+        // is what makes the Snapshot-Isolation min_commit_ts floor correct — a
+        // per-region CM disconnected from the read CM would let a derived
+        // commit_ts land at/under an already-served read_ts (lost update).
+        storeCm = new ConcurrencyManager(new MaxTsTracker(0));
 
         // 6) Recover ALL persisted regions from RAFT CF (primary recovery path).
         recoverPersistedRegions(pdStub, snapshotEngine);
@@ -191,19 +216,14 @@ public final class KvServer {
             var region = bootstrapRegion.get();
             Map<Long, String> peerAddrs = resolvePeerAddresses(pdStub, region);
             var raftEngine = new PerRegionRaftEngine(engine, region.getId());
-            var cm = new ConcurrencyManager(new MaxTsTracker(raftEngine.persistedMaxTs()));
-            var regionPeer = createRegionPeer(region, peerAddrs, snapshotEngine, raftEngine, cm);
+            storeCm.maxTs().observe(raftEngine.persistedMaxTs());
+            var regionPeer = createRegionPeer(region, peerAddrs, snapshotEngine, raftEngine, storeCm);
             store.registerPeer(regionPeer);
             peers.add(regionPeer);
         }
 
-        // 7) Build store-level ConcurrencyManager from max across all regions.
-        long globalMaxTs = 0;
-        for (var peer : peers) {
-            var re = new PerRegionRaftEngine(engine, peer.regionId());
-            globalMaxTs = Math.max(globalMaxTs, re.persistedMaxTs());
-        }
-        storeCm = new ConcurrencyManager(new MaxTsTracker(globalMaxTs));
+        // 7) storeCm was built (step 5b) and seeded with every recovered
+        //    region's persisted max_ts as the peers were created above.
 
         // 8) Build RPC services backed by the store's peer locator.
         RawKvService.PeerLocator locator = key ->
@@ -475,23 +495,7 @@ public final class KvServer {
                 .findFirst().orElseThrow();
 
         var peerHolder = new AtomicReference<BatchRegionPeer>();
-        var splitObserver = (AdminApplyHandler.SplitObserver)
-                (updatedParent, children) -> {
-                    var p = peerHolder.get();
-                    if (p != null) p.updateRegion(updatedParent);
-                    for (var child : children) {
-                        var childSelfOpt = child.getPeersList().stream()
-                                .filter(pe -> pe.getStoreId() == config.storeId())
-                                .findFirst();
-                        if (childSelfOpt.isEmpty()) continue;
-                        try {
-                            spawnChildPeer(child, childSelfOpt.get(), peerAddrs, snapshotEngine);
-                        } catch (Exception e) {
-                            log.error("Failed to spawn child peer for region={}",
-                                    child.getId(), e);
-                        }
-                    }
-                };
+        var splitObserver = newSplitObserver(peerHolder, snapshotEngine);
         var mergeObserver = (AdminApplyHandler.MergeObserver)
                 (mergedTarget, sourceRegion) -> {
                     var p = peerHolder.get();
@@ -500,7 +504,7 @@ public final class KvServer {
                     peers.removeIf(rp -> rp.regionId() == sourceRegion.getId());
                 };
 
-        var settings = new RegionPeerImpl.Settings(
+        var settings = new RegionPeer.Settings(
                 config.raft().electionTickMs() > 0
                         ? (int) (config.raft().electionTickMs() / config.raft().heartbeatTickMs()) : 10,
                 1,
@@ -515,6 +519,7 @@ public final class KvServer {
                         .withAdmin(raftEngine, engine, splitObserver, mergeObserver),
                 settings, cm, snapshotEngine, raftPoller, tickDriver, applyWorker);
         peerHolder.set(peer);
+        wireLeaderMaxTsBump(peer);
         // Wire the raft transport for dynamically-added peers: when a
         // conf-change (AddPeer) applies, resolve the new peer's raft address
         // from PD so the leader can actually reach the new replica. Without
@@ -524,6 +529,52 @@ public final class KvServer {
                 onChangePeer(transport, type, changedPeer));
         dispatcher.register(region.getId(), transport);
         return peer;
+    }
+
+    /**
+     * On acquiring region leadership, re-establish this store's max_ts from
+     * PD's TSO. max_ts lives only in the leader's in-memory
+     * ConcurrencyManager and is never replicated through raft, so a new
+     * leader is blind to the read timestamps the previous leader already
+     * served. Without this bump a derived commit_ts (async-commit / 1PC
+     * min_commit_ts) can land at or below an already-served read_ts, breaking
+     * Snapshot Isolation and surfacing as a lost update under read-modify-write
+     * contention. Fetching one TSO — which is >= every timestamp PD has ever
+     * handed out — and observing it into the store CM closes that gap. The PD
+     * round-trip runs on {@link #maxTsBumpExecutor}, off the raft poller thread.
+     */
+    private void wireLeaderMaxTsBump(BatchRegionPeer peer) {
+        if (pdManager == null) return;
+        peer.setLeaderAcquiredObserver(() -> {
+            var ex = maxTsBumpExecutor;
+            if (ex == null) return;
+            ex.submit(() -> {
+                // Retry until PD hands out a timestamp. max_ts stays un-synced
+                // (async-commit / 1PC gated off — the safe, explicit-commit
+                // path) until a bump actually succeeds; we must NOT mark synced
+                // on failure, or a stale max_ts would reopen the SI hole. This
+                // mirrors TiKV retrying the max_ts update until it lands.
+                for (int attempt = 0; attempt < 3; attempt++) {
+                    try {
+                        long ts = pdManager.fetchTimestamp();
+                        if (ts > 0 && storeCm != null) {
+                            storeCm.maxTs().observe(ts);
+                            peer.markMaxTsSynced();
+                            log.info("region={} leader acquired: max_ts bumped to {} from PD",
+                                    peer.regionId(), ts);
+                            return;
+                        }
+                    } catch (Throwable t) {
+                        log.warn("region={} leader max_ts bump attempt {} failed: {}",
+                                peer.regionId(), attempt, t.getMessage());
+                    }
+                    try { Thread.sleep(200); }
+                    catch (InterruptedException ie) { Thread.currentThread().interrupt(); return; }
+                }
+                log.warn("region={} leader max_ts bump exhausted retries; "
+                        + "async-commit stays gated until next leadership change", peer.regionId());
+            });
+        });
     }
 
     private long findSelfPeerId(Metapb.Region region) {
@@ -579,23 +630,61 @@ public final class KvServer {
     }
 
     /**
+     * Build the split observer for a region peer. When an ADMIN_SPLIT applies,
+     * EVERY peer of the parent region (leader and followers alike) fires this:
+     * it refreshes the parent's shrunken descriptor and, for each child region
+     * that has a peer on THIS store, spawns a live child {@link RegionPeer}.
+     *
+     * <p>Wiring the real observer on every peer — not just the bootstrap peer —
+     * is what lets the child raft group reach quorum. A follower created via
+     * the snapshot/uninitialized path used to get a no-op observer, so it would
+     * apply the split but never materialize its child peer; the child region
+     * was left with a single live replica that could neither elect a leader
+     * nor heartbeat PD, and clients got "no region for key".
+     */
+    private AdminApplyHandler.SplitObserver newSplitObserver(
+            AtomicReference<BatchRegionPeer> peerHolder,
+            SnapshotEngineImpl snapshotEngine) {
+        return (updatedParent, children) -> {
+            var p = peerHolder.get();
+            if (p != null) p.updateRegion(updatedParent);
+            for (var child : children) {
+                var childSelfOpt = child.getPeersList().stream()
+                        .filter(pe -> pe.getStoreId() == config.storeId())
+                        .findFirst();
+                if (childSelfOpt.isEmpty()) continue;
+                try {
+                    spawnChildPeer(child, childSelfOpt.get(), snapshotEngine);
+                } catch (Exception e) {
+                    log.error("Failed to spawn child peer for region={}", child.getId(), e);
+                }
+            }
+        };
+    }
+
+    /**
      * Spawn a freshly-split child region as a live RegionPeer.
      * Uses the store-level ConcurrencyManager for consistent max_ts tracking.
      */
     private void spawnChildPeer(Metapb.Region childRegion,
                                  Metapb.Peer childSelf,
-                                 Map<Long, String> peerAddrs,
                                  SnapshotEngineImpl snapshotEngine) {
         long childPeerId = childSelf.getId();
         long childRegionId = childRegion.getId();
         var childRaftEngine = new PerRegionRaftEngine(engine, childRegionId);
 
         var childTransport = new GrpcRaftTransport(childRegionId, childPeerId, config.storeId(), config.raftTls());
+        // Resolve each sibling's raft address fresh from PD. The parent's
+        // captured peerAddrs map is keyed to the parent's peer set at the time
+        // that peer was created and omits peers added later, so it can't be
+        // trusted to reach the child's siblings — which would strand the child
+        // raft group without quorum.
         for (var cpe : childRegion.getPeersList()) {
             if (cpe.getId() == childPeerId) continue;
-            var addr = peerAddrs.get(cpe.getStoreId());
-            if (addr == null) addr = peerAddrs.get(cpe.getId());
-            if (addr != null) childTransport.addPeer(cpe.getId(), addr, cpe.getStoreId());
+            String addr = resolveStoreRaftAddr(cpe.getStoreId());
+            if (addr != null && !addr.isEmpty()) {
+                childTransport.addPeer(cpe.getId(), addr, cpe.getStoreId());
+            }
         }
 
         var childPeers = new ArrayList<Peer>();
@@ -616,15 +705,17 @@ public final class KvServer {
 
         var childHandler = CompositeApplyHandler.defaultFor(engine, childCm, childRegionId, cdcEventBus,
                         inMemoryLockTable, resolvedTsTracker)
-                .withAdmin(childRaftEngine, engine, (p, ch) -> {}, childMergeObserver);
+                .withAdmin(childRaftEngine, engine,
+                        newSplitObserver(childPeerHolder, snapshotEngine), childMergeObserver);
 
         var childPeer = new BatchRegionPeer(
                 engine, childRaftEngine, childRegion, childSelf, childPeers,
                 childTransport, childHandler,
-                new RegionPeerImpl.Settings(10, 1, config.raft().heartbeatTickMs(),
+                new RegionPeer.Settings(10, 1, config.raft().heartbeatTickMs(),
                         config.raft().leaseBasedRead()),
                 childCm, snapshotEngine, raftPoller, tickDriver, applyWorker);
         childPeerHolder.set(childPeer);
+        wireLeaderMaxTsBump(childPeer);
         childPeer.setChangePeerObserver((type, changedPeer, updatedRegion) ->
                 onChangePeer(childTransport, type, changedPeer));
         dispatcher.register(childRegionId, childTransport);
@@ -640,38 +731,138 @@ public final class KvServer {
     }
 
     /**
-     * On-demand region spawn: a raft message arrived for a region this store
-     * doesn't yet host. Query PD, find this store's peer slot, and create it.
+     * TiKV-style uninitialized peer creation. A raft message arrived for a
+     * region this store does not host yet. Instead of querying PD (whose view
+     * is eventually consistent, which used to leave the leader with a ghost
+     * voter during the heartbeat-lag window), we create an <em>uninitialized</em>
+     * peer directly from the message: a placeholder region (id + self only,
+     * empty range, epoch 0), NOT bootstrapped, wired back to the sender
+     * (leader) so raft can pull the log / snapshot. The leader's snapshot
+     * carries the real region descriptor (range/epoch/peers), which completes
+     * initialization via the {@link BatchRegionPeer#setInitObserver init observer}.
+     *
+     * <p>Until initialized, the peer is not registered to the store's key-range
+     * routing and does not heartbeat — it only participates in raft message
+     * exchange and snapshot receipt.
      */
-    private void spawnOnDemand(long regionId) {
+    private void createUninitializedPeer(long regionId, Eraftpb.Message firstMsg, long fromStoreId) {
         try {
-            var resp = pdManager.blockingStub().getRegionByID(Pdpb.GetRegionByIDRequest.newBuilder()
-                    .setRegionId(regionId).build());
-            if (!resp.hasRegion()) {
-                log.warn("on-demand spawn: PD has no region={}", regionId);
-                return;
-            }
-            var regionDesc = resp.getRegion();
-            var selfPeer = regionDesc.getPeersList().stream()
-                    .filter(p -> p.getStoreId() == config.storeId())
-                    .findFirst().orElse(null);
-            if (selfPeer == null) {
-                log.warn("on-demand spawn: region={} has no peer on store={}",
-                        regionId, config.storeId());
-                return;
-            }
             if (store.peerForRegion(regionId).isPresent()) return;
 
-            var peerAddrs = resolvePeerAddresses(pdManager.blockingStub(), regionDesc);
+            long selfPeerId = firstMsg.getTo();
+            long fromPeerId = firstMsg.getFrom();
+
+            var self = Metapb.Peer.newBuilder()
+                    .setId(selfPeerId)
+                    .setStoreId(config.storeId())
+                    .build();
+            // Placeholder: only self, empty range, epoch 0. The initializing
+            // snapshot fills in the real range/epoch/peers.
+            var placeholder = Metapb.Region.newBuilder()
+                    .setId(regionId)
+                    .addPeers(self)
+                    .build();
+
+            var raftEngine = new PerRegionRaftEngine(engine, regionId);
+            var cm = storeCm != null ? storeCm
+                    : new ConcurrencyManager(new MaxTsTracker(raftEngine.persistedMaxTs()));
             var snapshotEngine = new SnapshotEngineImpl(engine, config.dataDir().resolve("snap"));
-            spawnChildPeer(regionDesc, selfPeer, peerAddrs, snapshotEngine);
-            log.info("on-demand spawn: region={} peer={} on store={} created",
-                    regionId, selfPeer.getId(), config.storeId());
-        } catch (Throwable err) {
-            log.warn("on-demand spawn for region={} failed: {}", regionId, err.getMessage());
+
+            var transport = new GrpcRaftTransport(regionId, selfPeerId, config.storeId(), config.raftTls());
+            // Wire the outbound link back to the leader so the uninitialized peer
+            // can reply (vote / append-response) and drive its own catch-up.
+            // Store-address resolution is routing (allowed to consult PD's
+            // getStore), not region metadata.
+            if (fromPeerId != 0 && fromStoreId != 0) {
+                String leaderAddr = resolveStoreRaftAddr(fromStoreId);
+                if (leaderAddr != null && !leaderAddr.isEmpty()) {
+                    transport.addPeer(fromPeerId, leaderAddr, fromStoreId);
+                }
+            }
+
+            var raftPeers = new ArrayList<Peer>();
+            raftPeers.add(new Peer(selfPeerId));
+
+            // A peer created from a raft message (snapshot/uninitialized path)
+            // must still spawn its child peers when a split applies, otherwise
+            // the child region never reaches quorum on this store. Wire the
+            // same real split observer used by the bootstrap/recovery path.
+            var peerHolder = new AtomicReference<BatchRegionPeer>();
+            var mergeObserver = (AdminApplyHandler.MergeObserver)
+                    (mergedTarget, sourceRegion) -> {
+                        var p = peerHolder.get();
+                        if (p != null) p.updateRegion(mergedTarget);
+                        store.destroyPeer(sourceRegion.getId());
+                        peers.removeIf(rp -> rp.regionId() == sourceRegion.getId());
+                    };
+            var handler = CompositeApplyHandler.defaultFor(engine, cm, regionId, cdcEventBus,
+                            inMemoryLockTable, resolvedTsTracker)
+                    .withAdmin(raftEngine, engine,
+                            newSplitObserver(peerHolder, snapshotEngine), mergeObserver);
+
+            var settings = new RegionPeer.Settings(
+                    config.raft().electionTickMs() > 0
+                            ? (int) (config.raft().electionTickMs() / config.raft().heartbeatTickMs()) : 10,
+                    1,
+                    config.raft().heartbeatTickMs(),
+                    config.raft().leaseBasedRead());
+
+            var peer = new BatchRegionPeer(
+                    engine, raftEngine, placeholder, self, raftPeers,
+                    transport, handler, settings, cm, snapshotEngine,
+                    raftPoller, tickDriver, applyWorker, /* uninitialized= */ true);
+            peerHolder.set(peer);
+            wireLeaderMaxTsBump(peer);
+            peer.setChangePeerObserver((type, changedPeer, updatedRegion) ->
+                    onChangePeer(transport, type, changedPeer));
+            peer.setInitObserver(region ->
+                    completeUninitializedInit(peer, transport, region));
+
+            // Route raft messages to the peer and track it for shutdown, but do
+            // NOT register key-range routing or start the heartbeater yet — that
+            // happens on init completion, once the region descriptor is valid.
+            dispatcher.register(regionId, transport);
+            peers.add(peer);
+            log.info("created uninitialized peer region={} self={} leader-peer={} leader-store={}",
+                    regionId, selfPeerId, fromPeerId, fromStoreId);
+        } catch (Throwable t) {
+            log.warn("createUninitializedPeer region={} failed: {}", regionId, t.getMessage());
         } finally {
             dispatcher.onSpawnDone(regionId);
         }
+    }
+
+    /**
+     * Complete initialization of a peer that just learned its real region
+     * descriptor from an installed snapshot. Runs off the poller thread because
+     * it performs blocking PD lookups (store address resolution).
+     */
+    private void completeUninitializedInit(BatchRegionPeer peer,
+                                           GrpcRaftTransport transport,
+                                           Metapb.Region region) {
+        var t = new Thread(() -> {
+            try {
+                for (var p : region.getPeersList()) {
+                    if (p.getStoreId() == config.storeId()) continue;
+                    String addr = resolveStoreRaftAddr(p.getStoreId());
+                    if (addr != null && !addr.isEmpty()) {
+                        transport.addPeer(p.getId(), addr, p.getStoreId());
+                    }
+                }
+                store.registerPeer(peer);
+                if (pdManager != null) startHeartbeater(peer);
+                if (copService != null) copService.invalidateCache();
+                log.info("uninitialized peer region={} initialized (range=[{}, {}) peers={})",
+                        region.getId(),
+                        region.getStartKey().toStringUtf8(),
+                        region.getEndKey().toStringUtf8(),
+                        region.getPeersCount());
+            } catch (Throwable e) {
+                log.warn("complete init for region={} failed: {}", region.getId(), e.getMessage());
+            }
+        }, "peer-init-" + region.getId());
+        t.setDaemon(true);
+        t.start();
     }
 
     // =====================================================================
@@ -712,10 +903,9 @@ public final class KvServer {
 
                 var peerAddrs = resolvePeerAddresses(pdStub, region);
                 var childRaftEngine = new PerRegionRaftEngine(engine, regionId);
-                var childCm = new ConcurrencyManager(
-                        new MaxTsTracker(childRaftEngine.persistedMaxTs()));
+                storeCm.maxTs().observe(childRaftEngine.persistedMaxTs());
                 var peer = createRegionPeer(region, peerAddrs, snapshotEngine,
-                        childRaftEngine, childCm);
+                        childRaftEngine, storeCm);
                 store.registerPeer(peer);
                 peers.add(peer);
                 recovered++;
@@ -736,10 +926,12 @@ public final class KvServer {
     // =====================================================================
 
     private void startHeartbeater(RegionPeer peer) {
-        var pdAsyncStub = pdManager.asyncStub();
         var splitDriver = new SplitDriver(pdManager.blockingStub(), PROPOSE_TIMEOUT_MS);
-        var hb = new RegionHeartbeater(pdAsyncStub, peer,
-                HEARTBEAT_INTERVAL_MS, splitDriver::split);
+        // Pass the PdEndpointManager (not a fixed stub) so the heartbeat stream
+        // always binds to the current PD raft leader and fails over when the
+        // leader moves.
+        var hb = new RegionHeartbeater(pdManager, peer,
+                HEARTBEAT_INTERVAL_MS, splitDriver::split, engine);
         hb.start();
         heartbeaters.add(hb);
     }
@@ -867,6 +1059,7 @@ public final class KvServer {
         }
 
         // 3b) Shut down BatchSystem: apply pool → poller → tick driver.
+        if (maxTsBumpExecutor != null) maxTsBumpExecutor.shutdownNow();
         if (applyWorker != null) applyWorker.shutdown();
         if (tickDriver != null) tickDriver.shutdown();
         if (raftPoller != null) raftPoller.shutdown();

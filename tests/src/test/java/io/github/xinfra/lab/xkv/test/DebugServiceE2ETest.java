@@ -6,7 +6,8 @@ import io.github.xinfra.lab.xkv.kv.engine.PerRegionRaftEngine;
 import io.github.xinfra.lab.xkv.kv.engine.RocksStorageEngine;
 import io.github.xinfra.lab.xkv.kv.engine.StorageEngine;
 import io.github.xinfra.lab.xkv.kv.raft.CompositeApplyHandler;
-import io.github.xinfra.lab.xkv.kv.raft.RegionPeerImpl;
+import io.github.xinfra.lab.xkv.kv.raft.BatchRegionPeer;
+import io.github.xinfra.lab.xkv.kv.raft.RegionPeer;
 import io.github.xinfra.lab.xkv.kv.server.DebugServiceImpl;
 import io.github.xinfra.lab.xkv.kv.store.StoreImpl;
 import io.github.xinfra.lab.xkv.kv.transport.GrpcRaftTransport;
@@ -37,7 +38,7 @@ final class DebugServiceE2ETest {
     @TempDir Path dataDir;
 
     private RocksStorageEngine engine;
-    private RegionPeerImpl peer;
+    private BatchRegionPeer peer;
     private StoreImpl store;
     private Server server;
     private ManagedChannel channel;
@@ -59,13 +60,13 @@ final class DebugServiceE2ETest {
         transport = new GrpcRaftTransport(1, 1, 1);
         var cm = new io.github.xinfra.lab.xkv.kv.mvcc.ConcurrencyManager(
                 new io.github.xinfra.lab.xkv.kv.mvcc.MaxTsTracker(0));
-        peer = new RegionPeerImpl(
+        peer = BatchRegionPeer.standalone(
                 engine, raftEngine, region, self,
                 List.of(new Peer(1)),
                 transport,
                 CompositeApplyHandler.defaultFor(engine, cm)
                         .withAdmin(raftEngine, engine, (p, ch) -> {}, (t, s) -> {}),
-                new RegionPeerImpl.Settings(10, 1, 30),
+                new RegionPeer.Settings(10, 1, 30),
                 cm);
 
         var storeMeta = Metapb.Store.newBuilder()
@@ -79,8 +80,8 @@ final class DebugServiceE2ETest {
         Awaitility.await().atMost(Duration.ofSeconds(10))
                 .until(peer::isLeader);
 
-        int port = ClusterHarness.freePort();
-        ClusterHarness.releasePort(port);
+        int port = TestCluster.freePort();
+        TestCluster.releasePort(port);
         server = NettyServerBuilder.forPort(port)
                 .addService(new DebugServiceImpl(null, store, engine, storeMeta, dataDir))
                 .build()
@@ -97,7 +98,7 @@ final class DebugServiceE2ETest {
         if (peer != null) try { peer.shutdown(); } catch (Throwable e) { e.printStackTrace(); }
         if (transport != null) try { transport.close(); } catch (Throwable e) { e.printStackTrace(); }
         if (engine != null) try { engine.close(); } catch (Throwable e) { e.printStackTrace(); }
-        ClusterHarness.releaseAllPorts();
+        TestCluster.releaseAllPorts();
     }
 
     @Test

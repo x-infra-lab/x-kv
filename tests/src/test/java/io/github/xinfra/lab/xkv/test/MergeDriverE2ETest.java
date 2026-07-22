@@ -36,31 +36,28 @@ import static org.assertj.core.api.Assertions.assertThat;
 final class MergeDriverE2ETest {
 
     @TempDir Path baseDir;
-    private ClusterHarness harness;
-    private ManagedChannel pdChannel;
+    private TestCluster cluster;
     private PDGrpc.PDBlockingStub pd;
 
     @BeforeEach
     void start() throws Exception {
-        harness = new ClusterHarness(baseDir, 3).start();
-        pdChannel = NettyChannelBuilder.forAddress("127.0.0.1", harness.pdPort())
-                .usePlaintext().build();
-        pd = PDGrpc.newBlockingStub(pdChannel);
+        cluster = new TestCluster(baseDir).startReplicated(1, 3);
+        pd = cluster.pdStub();
     }
 
     @AfterEach
     void stop() throws Exception {
-        if (pdChannel != null) pdChannel.shutdownNow().awaitTermination(2, TimeUnit.SECONDS);
-        if (harness != null) harness.close();
+        if (cluster != null) cluster.close();
     }
 
     @Test
     void splitThenMergeRestoresOriginalRange() throws Exception {
-        var leader = harness.leader();
+        var leaderNode = cluster.leaderStoreFor(TestCluster.BOOTSTRAP_REGION_ID);
+        var parentPeer = cluster.realPeer(leaderNode.storeId, TestCluster.BOOTSTRAP_REGION_ID);
 
         // 1) Split at "m".
         var split = new SplitDriver(pd, /* proposeTimeoutMs= */ 5_000);
-        var afterSplit = split.split(leader.peer, List.of("m".getBytes()));
+        var afterSplit = split.split(parentPeer, List.of("m".getBytes()));
         assertThat(afterSplit).hasSize(2);
         var parentAfterSplit = afterSplit.get(0);
         var child = afterSplit.get(1);
@@ -68,10 +65,8 @@ final class MergeDriverE2ETest {
         // Wait for the child peer to materialize on this store.
         Awaitility.await().atMost(Duration.ofSeconds(5))
                 .pollInterval(Duration.ofMillis(20))
-                .until(() -> leader.childPeers.stream()
-                        .anyMatch(c -> c.regionId() == child.getId()));
-        var childPeer = leader.childPeers.stream()
-                .filter(c -> c.regionId() == child.getId()).findFirst().orElseThrow();
+                .until(() -> leaderNode.store().peerForRegion(child.getId()).isPresent());
+        var childPeer = leaderNode.store().peerForRegion(child.getId()).orElseThrow();
 
         // 2) Wait for the child raft group to elect its own leader (the
         //    merge driver requires the target peer to be a leader; in our
@@ -82,17 +77,15 @@ final class MergeDriverE2ETest {
         // use the right one as the merge source.
         Awaitility.await().atMost(Duration.ofSeconds(30))
                 .pollInterval(Duration.ofMillis(100))
-                .until(() -> harness.kvNodes().stream()
-                        .flatMap(n -> n.childPeers.stream())
-                        .anyMatch(c -> c.regionId() == child.getId() && c.isLeader()));
-        var childLeader = harness.kvNodes().stream()
-                .flatMap(n -> n.childPeers.stream())
-                .filter(c -> c.regionId() == child.getId() && c.isLeader())
+                .until(() -> cluster.regionPeers(child.getId()).stream()
+                        .anyMatch(c -> c.isLeader()));
+        var childLeader = cluster.regionPeers(child.getId()).stream()
+                .filter(c -> c.isLeader())
                 .findFirst().orElseThrow();
 
         // 3) Merge child INTO parent. Parent is the merge target.
         var merge = new MergeDriver(/* proposeTimeoutMs= */ 5_000);
-        var merged = merge.merge(/* source= */ childLeader, /* target= */ leader.peer);
+        var merged = merge.merge(/* source= */ childLeader, /* target= */ parentPeer);
 
         // Merged target's range covers parent's original [-, -).
         assertThat(merged.getStartKey().isEmpty()).isTrue();
@@ -102,18 +95,17 @@ final class MergeDriverE2ETest {
         // commit-merge entry replicates to all stores' parent raft groups).
         Awaitility.await().atMost(Duration.ofSeconds(10))
                 .pollInterval(Duration.ofMillis(50))
-                .until(() -> harness.kvNodes().stream()
-                        .noneMatch(n -> n.store.peerForRegion(child.getId()).isPresent()));
+                .until(() -> cluster.regionPeers(child.getId()).isEmpty());
 
         // Parent (the merged target) now routes the whole keyspace.
-        assertThat(leader.store.peerForKey("alpha".getBytes()).orElseThrow().regionId())
-                .isEqualTo(leader.peer.regionId());
-        assertThat(leader.store.peerForKey("zulu".getBytes()).orElseThrow().regionId())
-                .isEqualTo(leader.peer.regionId());
+        assertThat(leaderNode.store().peerForKey("alpha".getBytes()).orElseThrow().regionId())
+                .isEqualTo(parentPeer.regionId());
+        assertThat(leaderNode.store().peerForKey("zulu".getBytes()).orElseThrow().regionId())
+                .isEqualTo(parentPeer.regionId());
         // Child region descriptor gone from EVERY store.
-        for (var n : harness.kvNodes()) {
-            assertThat(n.store.peerForRegion(child.getId()))
-                    .as("store %d still has child peer", n.peerId).isEmpty();
+        for (var n : cluster.stores()) {
+            assertThat(n.store().peerForRegion(child.getId()))
+                    .as("store %d still has child peer", n.storeId).isEmpty();
         }
     }
 }

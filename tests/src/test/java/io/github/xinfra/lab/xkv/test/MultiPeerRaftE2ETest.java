@@ -6,7 +6,8 @@ import io.github.xinfra.lab.xkv.kv.config.KvConfig;
 import io.github.xinfra.lab.xkv.kv.engine.PerRegionRaftEngine;
 import io.github.xinfra.lab.xkv.kv.engine.RocksStorageEngine;
 import io.github.xinfra.lab.xkv.kv.raft.CompositeApplyHandler;
-import io.github.xinfra.lab.xkv.kv.raft.RegionPeerImpl;
+import io.github.xinfra.lab.xkv.kv.raft.BatchRegionPeer;
+import io.github.xinfra.lab.xkv.kv.raft.RegionPeer;
 import io.github.xinfra.lab.xkv.kv.server.KvRaftServiceImpl;
 import io.github.xinfra.lab.xkv.kv.server.RawKvService;
 import io.github.xinfra.lab.xkv.kv.server.TikvServiceImpl;
@@ -56,7 +57,7 @@ final class MultiPeerRaftE2ETest {
     void teardown() {
         for (Node n : nodes) n.shutdown();
         nodes.clear();
-        ClusterHarness.releaseAllPorts();
+        TestCluster.releaseAllPorts();
     }
 
     @Test
@@ -160,8 +161,8 @@ final class MultiPeerRaftE2ETest {
         int[] clientPorts = new int[n];
         int[] raftPorts = new int[n];
         for (int i = 0; i < n; i++) {
-            clientPorts[i] = ClusterHarness.freePort();
-            raftPorts[i] = ClusterHarness.freePort();
+            clientPorts[i] = TestCluster.freePort();
+            raftPorts[i] = TestCluster.freePort();
         }
 
         // 2) describe the region + peer set.
@@ -207,7 +208,7 @@ final class MultiPeerRaftE2ETest {
             if (e.getKey() != peerId) transport.addPeer(e.getKey(), e.getValue());
         }
 
-        ClusterHarness.releasePort(raftPort);
+        TestCluster.releasePort(raftPort);
         var raftServer = NettyServerBuilder.forPort(raftPort)
                 .addService(new KvRaftServiceImpl(dispatcher))
                 .build()
@@ -220,19 +221,19 @@ final class MultiPeerRaftE2ETest {
         var self = region.getPeersList().stream().filter(p -> p.getId() == peerId).findFirst().orElseThrow();
         var cm = new io.github.xinfra.lab.xkv.kv.mvcc.ConcurrencyManager(
                 new io.github.xinfra.lab.xkv.kv.mvcc.MaxTsTracker(raftEngine.persistedMaxTs()));
-        var peer = new RegionPeerImpl(
+        var peer = BatchRegionPeer.standalone(
                 engine, raftEngine, region, self,
                 peers,
                 transport,
                 CompositeApplyHandler.defaultFor(engine, cm),
-                new RegionPeerImpl.Settings(10, 1, 30),
+                new RegionPeer.Settings(10, 1, 30),
                 cm);
         dispatcher.register(region.getId(), transport);
 
         var rawKv = new RawKvService(engine, key -> peer, 10_000);
         var txn = new TransactionService(engine, key -> peer, 10_000, cm);
 
-        ClusterHarness.releasePort(clientPort);
+        TestCluster.releasePort(clientPort);
         var clientServer = NettyServerBuilder.forPort(clientPort)
                 .addService(new TikvServiceImpl(rawKv, txn))
                 .build()
@@ -251,14 +252,14 @@ final class MultiPeerRaftE2ETest {
     }
 
     private static int freePort() throws Exception {
-        return ClusterHarness.freePort();
+        return TestCluster.freePort();
     }
 
     /** Per-store bundle. */
     private static final class Node {
         final long storeId;
         final RocksStorageEngine engine;
-        final RegionPeerImpl peer;
+        final BatchRegionPeer peer;
         final Server raftServer;
         final Server clientServer;
         final ManagedChannel channel;
@@ -266,7 +267,7 @@ final class MultiPeerRaftE2ETest {
         final GrpcRaftTransport transport;
         final RaftMessageDispatcher dispatcher;
 
-        Node(long storeId, RocksStorageEngine engine, RegionPeerImpl peer,
+        Node(long storeId, RocksStorageEngine engine, BatchRegionPeer peer,
              Server raftServer, Server clientServer,
              ManagedChannel channel, TikvGrpc.TikvBlockingStub stub,
              GrpcRaftTransport transport, RaftMessageDispatcher dispatcher) {

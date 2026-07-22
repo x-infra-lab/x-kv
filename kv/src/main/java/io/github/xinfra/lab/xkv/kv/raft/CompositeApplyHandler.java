@@ -8,7 +8,7 @@ import java.util.Map;
 /**
  * Routes apply calls by {@link ProposalCodec.Kind} to a per-kind handler.
  *
- * <p>Built so the same {@link RegionPeerImpl} can serve raw KV + MVCC +
+ * <p>Built so the same {@link RegionPeer} can serve raw KV + MVCC +
  * admin entries without a giant switch in the caller. The peer supplies
  * one composite handler at startup; this dispatcher fans out to the
  * handler registered for each entry's kind.

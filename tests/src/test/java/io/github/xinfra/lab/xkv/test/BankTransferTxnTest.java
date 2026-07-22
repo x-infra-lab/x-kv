@@ -7,7 +7,8 @@ import io.github.xinfra.lab.xkv.kv.engine.PerRegionRaftEngine;
 import io.github.xinfra.lab.xkv.kv.engine.RocksStorageEngine;
 import io.github.xinfra.lab.xkv.kv.raft.CompositeApplyHandler;
 import io.github.xinfra.lab.xkv.kv.raft.LoopbackTransport;
-import io.github.xinfra.lab.xkv.kv.raft.RegionPeerImpl;
+import io.github.xinfra.lab.xkv.kv.raft.BatchRegionPeer;
+import io.github.xinfra.lab.xkv.kv.raft.RegionPeer;
 import io.github.xinfra.lab.xkv.kv.server.RawKvService;
 import io.github.xinfra.lab.xkv.kv.server.TikvServiceImpl;
 import io.github.xinfra.lab.xkv.kv.server.TransactionService;
@@ -77,7 +78,7 @@ final class BankTransferTxnTest {
 
     @TempDir Path dataDir;
     private RocksStorageEngine engine;
-    private RegionPeerImpl peer;
+    private BatchRegionPeer peer;
     private Server grpcServer;
     private ManagedChannel channel;
     private TikvGrpc.TikvBlockingStub tikv;
@@ -113,12 +114,12 @@ final class BankTransferTxnTest {
         // serialized for SI correctness.
         var cm = new io.github.xinfra.lab.xkv.kv.mvcc.ConcurrencyManager(
                 new io.github.xinfra.lab.xkv.kv.mvcc.MaxTsTracker(raftEngine.persistedMaxTs()));
-        peer = new RegionPeerImpl(
+        peer = BatchRegionPeer.standalone(
                 engine, raftEngine, region, region.getPeers(0),
                 List.of(new Peer(1)),
                 new LoopbackTransport(),
                 CompositeApplyHandler.defaultFor(engine, cm),
-                new RegionPeerImpl.Settings(10, 1, 30),
+                new RegionPeer.Settings(10, 1, 30),
                 cm);
         Awaitility.await().atMost(Duration.ofSeconds(10)).until(peer::isLeader);
 

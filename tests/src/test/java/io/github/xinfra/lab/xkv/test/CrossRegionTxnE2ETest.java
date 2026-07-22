@@ -31,82 +31,64 @@ import static org.assertj.core.api.Assertions.assertThat;
 final class CrossRegionTxnE2ETest {
 
     @TempDir Path baseDir;
-    private ClusterHarness harness;
+    private TestCluster cluster;
     private XKvClient rawClient;
     private TxnClient txnClient;
-    private ManagedChannel pdChannel;
 
     @BeforeEach
     void start() throws Exception {
-        harness = new ClusterHarness(baseDir, 3).start();
-        String pdAddr = "127.0.0.1:" + harness.pdPort();
+        cluster = new TestCluster(baseDir).startReplicated(1, 3);
 
         rawClient = XKvClient.create(ClientConfig.builder()
-                .pdEndpoints(List.of(pdAddr))
+                .pdEndpoints(cluster.pdEndpoints())
                 .build());
         txnClient = TxnClient.create(ClientConfig.builder()
-                .pdEndpoints(List.of(pdAddr))
+                .pdEndpoints(cluster.pdEndpoints())
                 .build());
 
-        pdChannel = NettyChannelBuilder.forAddress("127.0.0.1", harness.pdPort())
-                .usePlaintext().build();
-
         // Split at "m" to create two regions.
-        var pdStub = PDGrpc.newBlockingStub(pdChannel);
-        var leader = harness.leader();
-        var driver = new SplitDriver(pdStub, 10_000);
-        var resulting = driver.split(leader.peer, List.of("m".getBytes()));
+        var leaderNode = cluster.leaderStoreFor(TestCluster.BOOTSTRAP_REGION_ID);
+        var parentPeer = cluster.realPeer(leaderNode.storeId, TestCluster.BOOTSTRAP_REGION_ID);
+        var driver = new SplitDriver(cluster.pdStub(), 10_000);
+        var resulting = driver.split(parentPeer, List.of("m".getBytes()));
         assertThat(resulting).hasSize(2);
 
         var child = resulting.get(1);
 
         // Wait for the child peer to be live on all stores.
-        Awaitility.await().atMost(Duration.ofSeconds(10))
-                .pollInterval(Duration.ofMillis(100))
-                .until(() -> harness.kvNodes().stream()
-                        .allMatch(n -> n.store.peerForRegion(child.getId()).isPresent()));
+        cluster.awaitResidentPeers(child.getId(), cluster.stores().size());
 
         // Wait for leader election on the child region.
-        Awaitility.await().atMost(Duration.ofSeconds(10))
-                .pollInterval(Duration.ofMillis(100))
-                .until(() -> harness.kvNodes().stream()
-                        .flatMap(n -> n.childPeers.stream())
-                        .filter(p -> p.regionId() == child.getId())
-                        .anyMatch(p -> p.isLeader()));
+        cluster.waitForRegionLeader(child.getId());
 
-        // Register both regions with PD so the client can discover them.
-        // The split shrank the parent's range and created a child; PD only
-        // learns about these via heartbeats which may not have fired yet.
-        var updatedParent = resulting.get(0);
-        harness.pdServer().state().updateRegion(updatedParent);
-        harness.pdServer().state().updateRegion(child);
-
-        // Publish leaders for both regions.
-        harness.publishLeaderToPd();
-        for (var n : harness.kvNodes()) {
-            for (var cp : n.childPeers) {
-                if (cp.isLeader()) {
-                    harness.pdServer().state().updateLeader(cp.regionId(), cp.self());
-                }
-            }
-        }
+        // The real heartbeaters publish the split (parent's shrunk range +
+        // the new child region and its leader) to PD. Wait until PD's
+        // metadata reflects both regions before the client tries to route.
+        Awaitility.await().atMost(Duration.ofSeconds(15))
+                .pollInterval(Duration.ofMillis(200))
+                .until(() -> {
+                    var pd = cluster.pdLeader().server.state();
+                    var parentInfo = pd.getRegion(TestCluster.BOOTSTRAP_REGION_ID);
+                    var childInfo = pd.getRegion(child.getId());
+                    return parentInfo.isPresent()
+                            && "m".equals(parentInfo.get().getEndKey().toStringUtf8())
+                            && childInfo.isPresent()
+                            && pd.getLeader(TestCluster.BOOTSTRAP_REGION_ID).isPresent()
+                            && pd.getLeader(child.getId()).isPresent();
+                });
 
         // Invalidate client caches so they re-discover the split regions.
         var rawImpl = (io.github.xinfra.lab.xkv.client.XKvClientImpl) rawClient;
-        rawImpl.regionCache().invalidate(harness.bootstrapRegionId());
+        rawImpl.regionCache().invalidate(TestCluster.BOOTSTRAP_REGION_ID);
         var txnImpl = (io.github.xinfra.lab.xkv.client.TxnClientImpl) txnClient;
-        txnImpl.regionCache().invalidate(harness.bootstrapRegionId());
+        txnImpl.regionCache().invalidate(TestCluster.BOOTSTRAP_REGION_ID);
     }
 
     @AfterEach
     void teardown() {
         if (rawClient != null) rawClient.close();
         if (txnClient != null) txnClient.close();
-        if (pdChannel != null) {
-            try { pdChannel.shutdownNow().awaitTermination(2, TimeUnit.SECONDS); }
-            catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-        }
-        if (harness != null) harness.close();
+        if (cluster != null) cluster.close();
     }
 
     @Test

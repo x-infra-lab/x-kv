@@ -31,21 +31,21 @@ import static org.assertj.core.api.Assertions.assertThat;
 final class SnapshotCatchupTest {
 
     @TempDir Path baseDir;
-    private ClusterHarness harness;
+    private TestCluster cluster;
     private TxnClient client;
 
     @BeforeEach
     void start() throws Exception {
-        harness = new ClusterHarness(baseDir, 3).start();
+        cluster = new TestCluster(baseDir).startReplicated(1, 3);
         client = TxnClient.create(ClientConfig.builder()
-                .pdEndpoints(List.of("127.0.0.1:" + harness.pdPort()))
+                .pdEndpoints(cluster.pdEndpoints())
                 .build());
     }
 
     @AfterEach
     void stop() throws Exception {
         if (client != null) client.close();
-        if (harness != null) harness.close();
+        if (cluster != null) cluster.close();
     }
 
     @Test
@@ -59,9 +59,10 @@ final class SnapshotCatchupTest {
             }
         }
 
-        var leader = harness.leader();
-        var store = wrapAllAsStore();
-        long firstBefore = leader.peer.firstIndex();
+        var leaderNode = cluster.leaderStoreFor(TestCluster.BOOTSTRAP_REGION_ID);
+        var leaderPeer = cluster.realPeer(leaderNode.storeId, TestCluster.BOOTSTRAP_REGION_ID);
+        var store = leaderNode.store();
+        long firstBefore = leaderPeer.firstIndex();
 
         // Run compaction worker — it should stage a snapshot AND advance
         // first_index.
@@ -78,44 +79,21 @@ final class SnapshotCatchupTest {
         }
         Awaitility.await().atMost(Duration.ofSeconds(5))
                 .pollInterval(Duration.ofMillis(50))
-                .until(() -> leader.peer.firstIndex() > firstBefore);
+                .until(() -> leaderPeer.firstIndex() > firstBefore);
 
         // The leader's storage now has a pending snapshot (otherwise raft
         // library couldn't recover a follower whose nextIndex < first_index).
         // We can't directly read pendingSnapshot from outside, but we CAN
         // verify the staged snapshot's coherent point-in-time by querying
         // through raftStorage.snapshot() — should return a Snapshot, not throw.
-        var snap = leader.peer.raftStorage().snapshot();
+        var snap = ((io.github.xinfra.lab.xkv.kv.raft.BatchRegionPeer) leaderPeer)
+                .raftStorage().snapshot();
         assertThat(snap).isNotNull();
         assertThat(snap.getMetadata().getIndex())
                 .as("snapshot stages at or above leader applied_index post-compact")
-                .isGreaterThanOrEqualTo(leader.peer.firstIndex() - 1);
+                .isGreaterThanOrEqualTo(leaderPeer.firstIndex() - 1);
         assertThat(snap.getData().size())
                 .as("snapshot carries user-data CFs")
                 .isPositive();
-    }
-
-    private Store wrapAllAsStore() {
-        var nodes = harness.kvNodes();
-        return new Store() {
-            @Override public java.util.Optional<RegionPeer> peerForRegion(long regionId) {
-                return nodes.stream().map(n -> (RegionPeer) n.peer)
-                        .filter(p -> p.regionId() == regionId).findFirst();
-            }
-            @Override public java.util.Optional<RegionPeer> peerForKey(byte[] key) {
-                return java.util.Optional.empty();
-            }
-            @Override public java.util.Collection<RegionPeer> peers() {
-                return nodes.stream().map(n -> (RegionPeer) n.peer).toList();
-            }
-            @Override public void registerPeer(RegionPeer peer) {}
-            @Override public void destroyPeer(long regionId) {}
-            @Override public long storeId() { return 0L; }
-            @Override public Metapb.Store metadata() {
-                return Metapb.Store.newBuilder().setId(0L).build();
-            }
-            @Override public void shutdown() {}
-            @Override public void runHeartbeatTick() {}
-        };
     }
 }

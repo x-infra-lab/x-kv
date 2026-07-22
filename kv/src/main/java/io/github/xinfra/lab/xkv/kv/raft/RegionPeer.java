@@ -40,6 +40,16 @@ public interface RegionPeer {
     /** True if this peer believes it is the current leader. */
     boolean isLeader();
 
+    /**
+     * Whether this leader's {@code max_ts} has been re-synced from PD since it
+     * acquired leadership. Used to gate async-commit / 1PC prewrites so a
+     * newly-elected leader never derives a {@code commit_ts} below a
+     * {@code read_ts} a previous leader already served (TiKV's
+     * {@code is_max_ts_synced}). Defaults to {@code true} for peer
+     * implementations that do not track it (no gating).
+     */
+    default boolean isMaxTsSynced() { return true; }
+
     /** True if {@link RaftEngine} has been destroyed (region merged away). */
     boolean isDestroyed();
 
@@ -121,7 +131,42 @@ public interface RegionPeer {
     /** Stop the peer; flush in-flight applies; close engines. */
     void shutdown();
 
+    /**
+     * Return the set of peer ids that the leader considers lagging (still
+     * receiving a snapshot or whose match index hasn't caught up with the
+     * leader's last index). Used to populate {@code pending_peers} in the
+     * region heartbeat so PD knows when a learner is safe to promote.
+     * Only meaningful on the leader; followers return empty.
+     */
+    default java.util.Set<Long> laggingPeerIds() { return java.util.Set.of(); }
+
     // ---- Companion types ----
+
+    /**
+     * Per-region runtime tunables. Defaults align with KvConfig.RaftConfig.
+     *
+     * <p>Lives on the interface (not any single implementation) because both
+     * {@link BatchRegionPeer} and its test/bench standalone factory build a
+     * peer from these settings.
+     */
+    record Settings(int electionTick, int heartbeatTick, long heartbeatTickMs, boolean leaseBasedRead) {
+        public Settings(int electionTick, int heartbeatTick, long heartbeatTickMs) {
+            this(electionTick, heartbeatTick, heartbeatTickMs, true);
+        }
+        public static Settings defaults() { return new Settings(10, 1, 100, true); }
+    }
+
+    /**
+     * Notified after a conf-change has been applied locally. Use to spawn a
+     * new peer (for AddNode targeting this store) or destroy an existing one
+     * (for RemoveNode of this peer).
+     */
+    @FunctionalInterface
+    interface ChangePeerObserver {
+        void onChangePeer(io.github.xinfra.lab.raft.proto.Eraftpb.ConfChangeType type,
+                          Metapb.Peer peer,
+                          Metapb.Region updatedRegion);
+    }
 
     /** Opaque Raft entry payload + dedup envelope. */
     record Proposal(byte[] payload, long clientId, long requestId) {}

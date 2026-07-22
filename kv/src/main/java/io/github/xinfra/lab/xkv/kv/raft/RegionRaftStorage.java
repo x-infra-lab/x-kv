@@ -6,6 +6,7 @@ import io.github.xinfra.lab.raft.proto.Eraftpb;
 import io.github.xinfra.lab.xkv.kv.engine.PerRegionRaftEngine;
 import io.github.xinfra.lab.xkv.kv.engine.RaftCfKeys;
 import io.github.xinfra.lab.xkv.kv.engine.StorageEngine;
+import io.github.xinfra.lab.xkv.proto.Metapb;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -23,18 +24,18 @@ import java.util.List;
  * shipped with x-raft-lib could not satisfy Inv-1 because it owns its own
  * RocksDB.
  *
- * <h3>What lands here vs in {@code RegionPeerImpl}</h3>
+ * <h3>What lands here vs in {@code RegionPeer}</h3>
  *
  * <ul>
  *   <li>{@link #append}, {@link #setHardState}, {@link #applySnapshot}:
  *       called by x-raft-lib at "ready" time. We open a fresh batch, write
  *       it with sync = true, return. Apply-loop business mutations come in
- *       a <em>different</em> path (RegionPeerImpl) and use their own batch.
+ *       a <em>different</em> path (the peer's apply loop) and use their own batch.
  *       Both paths obey Inv-1 individually; the apply loop additionally
  *       co-bundles its business writes with appliedIndex into one batch.</li>
  *   <li>The fully-fused single-batch path lives on
  *       {@link #appendFused(List, Eraftpb.HardState, StorageEngine.WriteBatch)}
- *       used by RegionPeerImpl when it wants entries + hard state + applied
+ *       used by the peer's apply loop when it wants entries + hard state + applied
  *       + business in one fsync. That path bypasses the regular Storage
  *       SPI to avoid double-fsync.</li>
  * </ul>
@@ -175,8 +176,28 @@ public final class RegionRaftStorage implements Storage {
             pendingSnapshot = null;
             return s;
         }
-        // Without a built snapshot ready: tell raft to retry later. The
-        // store-side snapshot generator schedules creation asynchronously.
+        // No snapshot staged yet. Build one on-demand so raft can catch up a
+        // lagging peer (or a freshly-added one whose log we've compacted past)
+        // by shipping it a snapshot. This is called on the poller thread from
+        // Raft.maybeSendSnapshot, so building inline is safe; without this a
+        // peer that needs a snapshot would be stuck forever, because nothing
+        // else re-stages one after the first is consumed. On failure we ask
+        // raft to retry on a later ready.
+        long applied = raft.appliedIndex();
+        if (applied > 0) {
+            try {
+                var snap = createSnapshot(applied, cachedConfState, null);
+                pendingSnapshot = null;   // consume the one createSnapshot staged
+                if (snap != null && snap.hasMetadata()
+                        && snap.getMetadata().getIndex() > 0) {
+                    return snap;
+                }
+            } catch (Throwable t) {
+                log.warn("region={} on-demand snapshot generation failed: {}",
+                        regionId(), t.getMessage());
+            }
+        }
+        // Still nothing to send: tell raft to retry later.
         throw RaftException.ErrSnapshotTemporarilyUnavailable;
     }
 
@@ -242,6 +263,10 @@ public final class RegionRaftStorage implements Storage {
         raft.saveSnapshotMeta(new io.github.xinfra.lab.xkv.kv.engine.RaftEngine.SnapshotMeta(
                 snapTerm, snapIndex, null, null), batch);
         raft.saveAppliedIndex(snapIndex, batch);
+        // The log range was just wiped above; realign the in-memory log bounds
+        // to the snapshot so term(snapIndex) resolves to the snapshot term and
+        // the follower accepts the leader's subsequent appends.
+        raft.resetLogToSnapshot(snapIndex);
 
         var cs = snap.getMetadata().getConfState();
         batch.put(StorageEngine.Cf.RAFT, RaftCfKeys.confStateKey(regionId()), cs.toByteArray());
@@ -257,21 +282,33 @@ public final class RegionRaftStorage implements Storage {
      * Install KV user data from a previously persisted pending snapshot.
      * Called in the apply phase (after messages are sent) or on restart
      * recovery.
+     *
+     * @return the {@link Metapb.Region} descriptor carried by the snapshot,
+     *         or {@code null} if the snapshot had none / there was nothing to
+     *         install. Callers created uninitialized (from a bare raft
+     *         message) use this to learn their range/epoch/peers.
      */
-    public void installPendingSnapshot() {
-        if (!raft.hasPendingSnapshot()) return;
+    public Metapb.Region installPendingSnapshot() {
+        if (!raft.hasPendingSnapshot()) return null;
         byte[] dataBytes = raft.loadPendingSnapshot();
         if (dataBytes == null || dataBytes.length == 0) {
             try (var b = storage.newWriteBatch()) {
                 raft.clearPendingSnapshot(b);
                 storage.write(b, false);
             }
-            return;
+            return null;
         }
 
+        Metapb.Region region = null;
         if (snapshotEngine != null) {
             try {
                 var chunks = decodeChunkEnvelope(dataBytes);
+                for (var chunk : chunks) {
+                    if (chunk.hasMeta() && chunk.getMeta().hasRegion()) {
+                        region = chunk.getMeta().getRegion();
+                        break;
+                    }
+                }
                 snapshotEngine.receiveAndInstall(regionId(), chunks);
             } catch (Throwable t) {
                 log.warn("region={} installPendingSnapshot failed: {}", regionId(), t.getMessage());
@@ -280,9 +317,16 @@ public final class RegionRaftStorage implements Storage {
         }
 
         try (var b = storage.newWriteBatch()) {
+            // Persist the region descriptor learned from the snapshot so the
+            // in-memory descriptor and restart recovery both agree with what
+            // the leader shipped (range/epoch/peers).
+            if (region != null) {
+                raft.saveRegion(region, b);
+            }
             raft.clearPendingSnapshot(b);
             storage.write(b, true);
         }
+        return region;
     }
 
     @Override
@@ -329,9 +373,17 @@ public final class RegionRaftStorage implements Storage {
         // only raft meta and lose all business data.
         byte[] snapshotData = data == null ? new byte[0] : data;
         if (snapshotEngine != null) {
+            // Carry this peer's current region descriptor in the snapshot so a
+            // receiver that was created uninitialized (from a bare raft message)
+            // can learn its range/epoch/peers directly from the snapshot.
+            Metapb.Region regionDesc = raft.region();
+            byte[] startKey = regionDesc != null && !regionDesc.getStartKey().isEmpty()
+                    ? regionDesc.getStartKey().toByteArray() : new byte[]{0};
+            byte[] endKey = regionDesc != null && !regionDesc.getEndKey().isEmpty()
+                    ? regionDesc.getEndKey().toByteArray() : null;
             var chunks = new java.util.ArrayList<io.github.xinfra.lab.xkv.proto.KvServerpb.SnapshotChunk>();
             snapshotEngine.buildAndStream(regionId(), term, appliedIndex,
-                    /* startKey= */ new byte[]{0}, /* endKey= */ null, chunks::add);
+                    startKey, endKey, regionDesc, chunks::add);
             // Serialize the chunk list with a tiny [4B count][N x [4B len][bytes]] envelope.
             int total = 4;
             var perChunkBytes = new byte[chunks.size()][];
@@ -380,7 +432,7 @@ public final class RegionRaftStorage implements Storage {
 
     @Override public void close() { /* engine ownership is the Store's */ }
 
-    // ===== Fused single-batch path used by RegionPeerImpl =====
+    // ===== Fused single-batch path used by the peer's apply loop =====
 
     /**
      * Stages entries and hard state into the caller's batch. After the

@@ -23,12 +23,12 @@ final class RaftMessageDispatcherTest {
     void missingHandlerFiresOncePerUnknownRegion() {
         var dispatcher = new RaftMessageDispatcher();
         var calls = new AtomicInteger();
-        dispatcher.setMissingHandler((regionId, msg) -> calls.incrementAndGet());
+        dispatcher.setMissingHandler((regionId, msg, fromStoreId) -> calls.incrementAndGet());
 
         // Three messages for the same unknown region — handler fires ONCE.
         for (int i = 0; i < 3; i++) {
             dispatcher.deliver(99, Eraftpb.Message.newBuilder()
-                    .setMsgType(Eraftpb.MessageType.MsgAppend).build());
+                    .setMsgType(Eraftpb.MessageType.MsgAppend).build(), 1L);
         }
         assertThat(calls.get()).isEqualTo(1);
 
@@ -36,7 +36,7 @@ final class RaftMessageDispatcherTest {
         // a registered transport, a NEW message fires the handler again.
         dispatcher.onSpawnDone(99);
         dispatcher.deliver(99, Eraftpb.Message.newBuilder()
-                .setMsgType(Eraftpb.MessageType.MsgAppend).build());
+                .setMsgType(Eraftpb.MessageType.MsgAppend).build(), 1L);
         assertThat(calls.get()).isEqualTo(2);
     }
 
@@ -47,12 +47,12 @@ final class RaftMessageDispatcherTest {
         var latch = new CountDownLatch(1);
         var delivered = new ConcurrentLinkedQueue<Eraftpb.Message>();
 
-        dispatcher.setMissingHandler((regionId, msg) -> {
+        dispatcher.setMissingHandler((regionId, msg, fromStoreId) -> {
             calls.incrementAndGet();
             latch.countDown();
         });
         dispatcher.deliver(42, Eraftpb.Message.newBuilder()
-                .setMsgType(Eraftpb.MessageType.MsgAppend).build());
+                .setMsgType(Eraftpb.MessageType.MsgAppend).build(), 1L);
         assertThat(latch.await(1, TimeUnit.SECONDS)).isTrue();
         assertThat(calls.get()).isEqualTo(1);
 
@@ -66,7 +66,7 @@ final class RaftMessageDispatcherTest {
 
         // Subsequent message routes to the transport; handler doesn't fire.
         var msg = Eraftpb.Message.newBuilder().setMsgType(Eraftpb.MessageType.MsgHeartbeat).build();
-        dispatcher.deliver(42, msg);
+        dispatcher.deliver(42, msg, 1L);
         assertThat(delivered.poll()).isNotNull();
         assertThat(calls.get()).as("register clears spawn-in-flight").isEqualTo(1);
     }

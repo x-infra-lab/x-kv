@@ -251,6 +251,23 @@ public final class PerRegionRaftEngine implements RaftEngine {
         this.lastSnapshotMeta = meta;
     }
 
+    /**
+     * Reset the in-memory log bounds after a snapshot install wiped the log
+     * and replaced it with a snapshot at {@code snapIndex}. The on-disk log
+     * is now empty, so firstIndex = snapIndex + 1 and lastIndex = snapIndex.
+     *
+     * <p>Without this the bounds stay stale (e.g. firstIndex=1, lastIndex=0 on
+     * a freshly-created peer), which makes {@link RegionRaftStorage#term} treat
+     * {@code snapIndex} as beyond the end of the log and report it unavailable.
+     * The just-initialized follower would then reject the leader's next append
+     * (prevLogIndex = snapIndex) and stall in StateProbe forever, never
+     * catching up past the snapshot.
+     */
+    public void resetLogToSnapshot(long snapIndex) {
+        this.firstIndex = snapIndex + 1;
+        this.lastIndex = snapIndex;
+    }
+
     // ---- pending snapshot ----
 
     public boolean hasPendingSnapshot() { return hasPendingSnapshot; }

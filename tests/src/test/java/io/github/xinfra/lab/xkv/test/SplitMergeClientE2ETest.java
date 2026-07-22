@@ -42,13 +42,13 @@ final class SplitMergeClientE2ETest {
     private static final Logger log = LoggerFactory.getLogger(SplitMergeClientE2ETest.class);
 
     @TempDir Path baseDir;
-    private ClusterHarness harness;
+    private TestCluster cluster;
     private XKvClient client;
 
     @AfterEach
     void teardown() {
         if (client != null) try { client.close(); } catch (Exception e) { e.printStackTrace(); }
-        if (harness != null) harness.close();
+        if (cluster != null) cluster.close();
     }
 
     /**
@@ -59,11 +59,10 @@ final class SplitMergeClientE2ETest {
      */
     @Test
     void splitAutoDiscoveredByClient() throws Exception {
-        harness = new ClusterHarness(baseDir, 3).start();
+        cluster = new TestCluster(baseDir).startReplicated(1, 3);
 
-        String pdAddr = "127.0.0.1:" + harness.pdPort();
         client = XKvClient.create(ClientConfig.builder()
-                .pdEndpoints(List.of(pdAddr))
+                .pdEndpoints(cluster.pdEndpoints())
                 .build());
 
         byte[] value = new byte[100];
@@ -80,14 +79,14 @@ final class SplitMergeClientE2ETest {
         // an APPROXIMATE split via PD's operator controller. The operator is
         // delivered through the real heartbeat response stream to the KV
         // leader, which computes the midpoint and drives the split end-to-end.
-        long regionId = harness.bootstrapRegionId();
+        long regionId = TestCluster.BOOTSTRAP_REGION_ID;
         scheduleApproximateSplit(regionId);
 
         // Wait for the split to materialize on at least one store.
         Awaitility.await().atMost(Duration.ofSeconds(30))
                 .pollInterval(Duration.ofMillis(200))
-                .until(() -> harness.kvNodes().stream()
-                        .anyMatch(n -> !n.childPeers.isEmpty()));
+                .until(() -> cluster.stores().stream()
+                        .anyMatch(n -> n.store().peers().size() > 1));
         log.info("split complete — child peer(s) created");
 
         // Read all keys via the client SDK. No manual PD registration or
@@ -117,11 +116,10 @@ final class SplitMergeClientE2ETest {
      */
     @Test
     void mergeAfterSplitClientRoutesSelfHealing() throws Exception {
-        harness = new ClusterHarness(baseDir, 3).start();
+        cluster = new TestCluster(baseDir).startReplicated(1, 3);
 
-        String pdAddr = "127.0.0.1:" + harness.pdPort();
         client = XKvClient.create(ClientConfig.builder()
-                .pdEndpoints(List.of(pdAddr))
+                .pdEndpoints(cluster.pdEndpoints())
                 .build());
 
         byte[] value = new byte[100];
@@ -134,13 +132,13 @@ final class SplitMergeClientE2ETest {
 
         // Schedule split via PD operator controller — delivered through the
         // real heartbeat response stream.
-        long regionId = harness.bootstrapRegionId();
+        long regionId = TestCluster.BOOTSTRAP_REGION_ID;
         scheduleApproximateSplit(regionId);
 
         Awaitility.await().atMost(Duration.ofSeconds(30))
                 .pollInterval(Duration.ofMillis(200))
-                .until(() -> harness.kvNodes().stream()
-                        .anyMatch(n -> !n.childPeers.isEmpty()));
+                .until(() -> cluster.stores().stream()
+                        .anyMatch(n -> n.store().peers().size() > 1));
         log.info("split complete");
 
         // Verify reads work across both regions before merge.
@@ -152,29 +150,30 @@ final class SplitMergeClientE2ETest {
         }
 
         // Find the child region's leader for the merge.
-        var leader = harness.leader();
-        var childRegionId = leader.childPeers.get(0).regionId();
+        var leaderNode = cluster.leaderStoreFor(TestCluster.BOOTSTRAP_REGION_ID);
+        var parentPeer = cluster.realPeer(leaderNode.storeId, TestCluster.BOOTSTRAP_REGION_ID);
+        var childRegionId = leaderNode.store().peers().stream()
+                .map(p -> p.regionId())
+                .filter(id -> id != TestCluster.BOOTSTRAP_REGION_ID)
+                .findFirst().orElseThrow();
 
         Awaitility.await().atMost(Duration.ofSeconds(30))
                 .pollInterval(Duration.ofMillis(100))
-                .until(() -> harness.kvNodes().stream()
-                        .flatMap(n -> n.childPeers.stream())
-                        .anyMatch(c -> c.regionId() == childRegionId && c.isLeader()));
-        var childLeader = harness.kvNodes().stream()
-                .flatMap(n -> n.childPeers.stream())
-                .filter(c -> c.regionId() == childRegionId && c.isLeader())
+                .until(() -> cluster.regionPeers(childRegionId).stream()
+                        .anyMatch(c -> c.isLeader()));
+        var childLeader = cluster.regionPeers(childRegionId).stream()
+                .filter(c -> c.isLeader())
                 .findFirst().orElseThrow();
 
         // Merge child INTO parent.
         var merge = new MergeDriver(5_000);
-        merge.merge(childLeader, leader.peer);
+        merge.merge(childLeader, parentPeer);
         log.info("merge complete");
 
         // Wait for the child peer to be destroyed on all stores.
         Awaitility.await().atMost(Duration.ofSeconds(10))
                 .pollInterval(Duration.ofMillis(50))
-                .until(() -> harness.kvNodes().stream()
-                        .noneMatch(n -> n.store.peerForRegion(childRegionId).isPresent()));
+                .until(() -> cluster.regionPeers(childRegionId).isEmpty());
 
         // Wait for PD to reflect the merged region — the parent's heartbeat
         // must publish its expanded range to PD before the client can route
@@ -183,7 +182,7 @@ final class SplitMergeClientE2ETest {
         Awaitility.await().atMost(Duration.ofSeconds(15))
                 .pollInterval(Duration.ofMillis(200))
                 .until(() -> {
-                    var pd = harness.pdServer().state();
+                    var pd = cluster.pdLeader().server.state();
                     var parentInfo = pd.getRegion(regionId);
                     if (parentInfo.isEmpty() || !parentInfo.get().getEndKey().isEmpty()) {
                         return false;
@@ -213,11 +212,10 @@ final class SplitMergeClientE2ETest {
      */
     @Test
     void concurrentReadersDuringSplit() throws Exception {
-        harness = new ClusterHarness(baseDir, 3).start();
+        cluster = new TestCluster(baseDir).startReplicated(1, 3);
 
-        String pdAddr = "127.0.0.1:" + harness.pdPort();
         client = XKvClient.create(ClientConfig.builder()
-                .pdEndpoints(List.of(pdAddr))
+                .pdEndpoints(cluster.pdEndpoints())
                 .build());
 
         byte[] value = new byte[100];
@@ -262,13 +260,13 @@ final class SplitMergeClientE2ETest {
         started.await(5, TimeUnit.SECONDS);
 
         // Schedule split while readers are running.
-        long regionId = harness.bootstrapRegionId();
+        long regionId = TestCluster.BOOTSTRAP_REGION_ID;
         scheduleApproximateSplit(regionId);
 
         Awaitility.await().atMost(Duration.ofSeconds(30))
                 .pollInterval(Duration.ofMillis(200))
-                .until(() -> harness.kvNodes().stream()
-                        .anyMatch(n -> !n.childPeers.isEmpty()));
+                .until(() -> cluster.stores().stream()
+                        .anyMatch(n -> n.store().peers().size() > 1));
         log.info("split completed while readers active");
 
         // Let readers run for 5 more seconds after split.
@@ -282,7 +280,7 @@ final class SplitMergeClientE2ETest {
     }
 
     private void scheduleApproximateSplit(long regionId) {
-        var region = harness.pdServer().state().getRegion(regionId).orElseThrow();
+        var region = cluster.pdLeader().server.state().getRegion(regionId).orElseThrow();
         long currentVersion = region.getRegionEpoch().getVersion();
         var storeIds = new java.util.HashSet<Long>();
         for (var p : region.getPeersList()) storeIds.add(p.getStoreId());
@@ -294,6 +292,6 @@ final class SplitMergeClientE2ETest {
                 "test: approximate split", resp, storeIds,
                 List.of(new OperatorSteps.SplitRegionStep(currentVersion + 1)),
                 Operator.PRIORITY_ADMIN);
-        harness.pdServer().operatorController().addOperator(splitOp);
+        cluster.pdLeader().server.operatorController().addOperator(splitOp);
     }
 }

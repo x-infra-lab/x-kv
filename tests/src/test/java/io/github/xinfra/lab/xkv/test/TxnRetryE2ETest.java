@@ -24,22 +24,21 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 final class TxnRetryE2ETest {
 
     @TempDir Path baseDir;
-    private ClusterHarness harness;
+    private TestCluster cluster;
     private TxnClient txnClient;
 
     @BeforeEach
     void start() throws Exception {
-        harness = new ClusterHarness(baseDir, 3).start();
-        String pdAddr = "127.0.0.1:" + harness.pdPort();
+        cluster = new TestCluster(baseDir).startReplicated(1, 3);
         txnClient = TxnClient.create(ClientConfig.builder()
-                .pdEndpoints(List.of(pdAddr))
+                .pdEndpoints(cluster.pdEndpoints())
                 .build());
     }
 
     @AfterEach
     void teardown() {
         if (txnClient != null) txnClient.close();
-        if (harness != null) harness.close();
+        if (cluster != null) cluster.close();
     }
 
     @Test

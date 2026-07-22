@@ -15,7 +15,6 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
-import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -53,19 +52,18 @@ final class SoakTest {
     private static final long CHAOS_MAX_JITTER_MS = 3_000;
 
     @TempDir Path baseDir;
-    private ClusterHarness harness;
+    private TestCluster cluster;
     private XKvClient rawClient;
     private TxnClient txnClient;
 
     @BeforeEach
     void start() throws Exception {
-        harness = new ClusterHarness(baseDir, KV_NODES).start();
-        String pdAddr = "127.0.0.1:" + harness.pdPort();
+        cluster = new TestCluster(baseDir).startReplicated(1, KV_NODES);
         rawClient = XKvClient.create(ClientConfig.builder()
-                .pdEndpoints(List.of(pdAddr))
+                .pdEndpoints(cluster.pdEndpoints())
                 .build());
         txnClient = TxnClient.create(ClientConfig.builder()
-                .pdEndpoints(List.of(pdAddr))
+                .pdEndpoints(cluster.pdEndpoints())
                 .build());
     }
 
@@ -73,7 +71,7 @@ final class SoakTest {
     void teardown() {
         if (rawClient != null) rawClient.close();
         if (txnClient != null) txnClient.close();
-        if (harness != null) harness.close();
+        if (cluster != null) cluster.close();
     }
 
     @Test
@@ -253,20 +251,19 @@ final class SoakTest {
             } catch (InterruptedException e) { return; }
             if (stop.get()) return;
 
-            var followers = harness.kvNodes().stream()
-                    .filter(n -> !n.peer.isLeader()).toList();
+            List<TestCluster.StoreNode> followers =
+                    cluster.followerStoresFor(TestCluster.BOOTSTRAP_REGION_ID);
             if (followers.isEmpty()) continue;
             var victim = followers.get(rnd.nextInt(followers.size()));
+            long victimId = victim.storeId;
 
             try {
-                log.info("SOAK CHAOS: killing follower peer={}", victim.peerId);
-                Map<Long, String> peerAddrs = victim.peerAddrs;
-                victim.shutdown();
-                harness.kvNodes().remove(victim);
+                log.info("SOAK CHAOS: killing follower store={}", victimId);
+                cluster.killStore(victimId);
                 kills.incrementAndGet();
                 Thread.sleep(2000 + rnd.nextInt(2000));
-                log.info("SOAK CHAOS: restarting peer={}", victim.peerId);
-                harness.restartNode(victim.peerId, peerAddrs);
+                log.info("SOAK CHAOS: restarting store={}", victimId);
+                cluster.restartStore(victimId);
             } catch (Exception e) {
                 log.warn("SOAK CHAOS error: {}", e.getMessage());
             }

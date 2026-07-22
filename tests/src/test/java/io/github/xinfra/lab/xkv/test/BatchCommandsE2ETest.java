@@ -7,7 +7,8 @@ import io.github.xinfra.lab.xkv.kv.engine.PerRegionRaftEngine;
 import io.github.xinfra.lab.xkv.kv.engine.RocksStorageEngine;
 import io.github.xinfra.lab.xkv.kv.raft.LoopbackTransport;
 import io.github.xinfra.lab.xkv.kv.raft.RawKvApplyHandler;
-import io.github.xinfra.lab.xkv.kv.raft.RegionPeerImpl;
+import io.github.xinfra.lab.xkv.kv.raft.BatchRegionPeer;
+import io.github.xinfra.lab.xkv.kv.raft.RegionPeer;
 import io.github.xinfra.lab.xkv.kv.server.RawKvService;
 import io.github.xinfra.lab.xkv.kv.server.TikvServiceImpl;
 import io.github.xinfra.lab.xkv.proto.Kvrpcpb;
@@ -43,7 +44,7 @@ final class BatchCommandsE2ETest {
     @TempDir Path dataDir;
 
     private RocksStorageEngine engine;
-    private RegionPeerImpl peer;
+    private BatchRegionPeer peer;
     private Server grpcServer;
     private ManagedChannel channel;
     private String channelName;
@@ -58,10 +59,10 @@ final class BatchCommandsE2ETest {
         var self = region.getPeers(0);
         var raftEngine = new PerRegionRaftEngine(engine, 1);
         var transport = new LoopbackTransport();
-        peer = new RegionPeerImpl(
+        peer = BatchRegionPeer.standalone(
                 engine, raftEngine, region, self, List.of(new Peer(1)),
                 transport, new RawKvApplyHandler(engine),
-                new RegionPeerImpl.Settings(10, 1, 100),
+                new RegionPeer.Settings(10, 1, 100),
                 null, null);
         Awaitility.await().atMost(Duration.ofSeconds(10)).until(peer::isLeader);
 

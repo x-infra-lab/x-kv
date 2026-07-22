@@ -51,7 +51,7 @@ final class PdClusterScalingE2ETest {
             try { s.stop(); } catch (Exception e) { e.printStackTrace(); }
         }
         servers.clear();
-        ClusterHarness.releaseAllPorts();
+        TestCluster.releaseAllPorts();
     }
 
     @Test
@@ -59,8 +59,8 @@ final class PdClusterScalingE2ETest {
         int[] clientPorts = new int[3];
         int[] raftPorts = new int[3];
         for (int i = 0; i < 3; i++) {
-            clientPorts[i] = ClusterHarness.freePort();
-            raftPorts[i] = ClusterHarness.freePort();
+            clientPorts[i] = TestCluster.freePort();
+            raftPorts[i] = TestCluster.freePort();
         }
 
         // ====== Phase 1: Start 2-node PD cluster ======
@@ -79,8 +79,8 @@ final class PdClusterScalingE2ETest {
                     .dataDir(tempDir.resolve("pd-" + (i + 1)))
                     .peers(initialPeers)
                     .build();
-            ClusterHarness.releasePort(clientPorts[i]);
-            ClusterHarness.releasePort(raftPorts[i]);
+            TestCluster.releasePort(clientPorts[i]);
+            TestCluster.releasePort(raftPorts[i]);
             var srv = new PdServer(cfg);
             srv.start();
             servers.add(srv);
@@ -112,8 +112,8 @@ final class PdClusterScalingE2ETest {
 
         // ====== Phase 2: Add 3rd node via addMember + joinMode ======
 
-        ClusterHarness.releasePort(clientPorts[2]);
-        ClusterHarness.releasePort(raftPorts[2]);
+        TestCluster.releasePort(clientPorts[2]);
+        TestCluster.releasePort(raftPorts[2]);
 
         var addMemberResp = leaderStub.addMember(Pdpb.AddMemberRequest.newBuilder()
                 .setMember(Pdpb.Member.newBuilder()

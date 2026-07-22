@@ -36,19 +36,19 @@ import static org.assertj.core.api.Assertions.assertThat;
 final class PdAwareRoutingE2ETest {
 
     @TempDir Path baseDir;
-    private ClusterHarness harness;
+    private TestCluster cluster;
     private PdClient pdClient;
 
     @BeforeEach
     void start() throws Exception {
-        harness = new ClusterHarness(baseDir, 3).start();
-        pdClient = new PdClient(List.of("127.0.0.1:" + harness.pdPort()));
+        cluster = new TestCluster(baseDir).startReplicated(1, 3);
+        pdClient = new PdClient(cluster.pdEndpoints());
     }
 
     @AfterEach
     void teardown() {
         if (pdClient != null) pdClient.close();
-        if (harness != null) harness.close();
+        if (cluster != null) cluster.close();
     }
 
     @Test
@@ -56,13 +56,13 @@ final class PdAwareRoutingE2ETest {
         var cache = new RegionCacheImpl(pdClient, ClientConfig.RegionCacheConfig.defaults());
         // Cache miss → loads from PD.
         var info = cache.locateKey("anything".getBytes()).orElseThrow();
-        assertThat(info.region().getId()).isEqualTo(harness.bootstrapRegionId());
+        assertThat(info.region().getId()).isEqualTo(TestCluster.BOOTSTRAP_REGION_ID);
         assertThat(info.region().getPeersCount()).isEqualTo(3);
 
         // Hit the cache the second time.
         assertThat(cache.size()).isEqualTo(1);
         var hit = cache.locateKey("else".getBytes()).orElseThrow();
-        assertThat(hit.region().getId()).isEqualTo(harness.bootstrapRegionId());
+        assertThat(hit.region().getId()).isEqualTo(TestCluster.BOOTSTRAP_REGION_ID);
     }
 
     @Test
@@ -92,10 +92,10 @@ final class PdAwareRoutingE2ETest {
             // Pick the leader peer's storeId (Phase 4 simplification: peer 0
             // is the elected leader in this small cluster — but here we ask
             // every store node and find the actual leader at runtime).
-            var leader = harness.leader();
+            var leader = cluster.leaderStoreFor(TestCluster.BOOTSTRAP_REGION_ID);
 
             // Issue write via the leader's stub.
-            var stub = leader.blockingStub();
+            var stub = cluster.clientStub(leader.storeId);
             stub.rawPut(Kvrpcpb.RawPutRequest.newBuilder()
                     .setKey(ByteString.copyFromUtf8("k"))
                     .setValue(ByteString.copyFromUtf8("v"))

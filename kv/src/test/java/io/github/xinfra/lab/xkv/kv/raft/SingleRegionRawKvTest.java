@@ -20,7 +20,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * Phase 1 verification: a single-peer Raft group serves raw KV puts/deletes
- * end-to-end through the {@link RegionPeerImpl} apply loop.
+ * end-to-end through the {@link BatchRegionPeer} apply loop.
  *
  * <p>Validates the v2 atomicity contract empirically: after every {@code
  * propose}, the data CF and the applied-index in the RAFT CF are visible
@@ -30,7 +30,7 @@ final class SingleRegionRawKvTest {
 
     @TempDir Path dataDir;
     private RocksStorageEngine engine;
-    private RegionPeerImpl peer;
+    private BatchRegionPeer peer;
 
     @BeforeEach
     void open() throws Exception {
@@ -131,7 +131,7 @@ final class SingleRegionRawKvTest {
 
     // ---- helpers ----
 
-    private static RegionPeerImpl startPeer(RocksStorageEngine engine, long peerId, long regionId) {
+    private static BatchRegionPeer startPeer(RocksStorageEngine engine, long peerId, long regionId) {
         var raft = new PerRegionRaftEngine(engine, regionId);
         var region = Metapb.Region.newBuilder()
                 .setId(regionId)
@@ -142,16 +142,16 @@ final class SingleRegionRawKvTest {
                 .build();
         var self = region.getPeers(0);
 
-        return new RegionPeerImpl(
+        return BatchRegionPeer.standalone(
                 engine, raft, region, self,
                 List.of(new Peer(peerId)),
                 new LoopbackTransport(),
                 new RawKvApplyHandler(),
-                new RegionPeerImpl.Settings(/* electionTick= */ 10, /* heartbeatTick= */ 1, /* heartbeatTickMs= */ 30));
+                new RegionPeer.Settings(/* electionTick= */ 10, /* heartbeatTick= */ 1, /* heartbeatTickMs= */ 30));
     }
 
-    private static void propose(RegionPeerImpl peer, ProposalCodec.Kind kind, byte[] payload) throws Exception {
-        // Encode with proposeSeq=0; RegionPeerImpl rewrites those bytes with
+    private static void propose(BatchRegionPeer peer, ProposalCodec.Kind kind, byte[] payload) throws Exception {
+        // Encode with proposeSeq=0; the peer rewrites those bytes with
         // the actual seq before calling node.propose.
         var envelope = ProposalCodec.encode(kind, 0, payload);
         var future = peer.propose(new RegionPeer.Proposal(envelope, 0, 0));

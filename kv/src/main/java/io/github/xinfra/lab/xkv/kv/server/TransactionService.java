@@ -364,6 +364,21 @@ public final class TransactionService {
     public Kvrpcpb.PrewriteResponse kvPrewrite(Kvrpcpb.PrewriteRequest req) {
         if (req.getMutationsCount() == 0) return Kvrpcpb.PrewriteResponse.newBuilder().build();
         byte[] sample = req.getMutations(0).getKey().toByteArray();
+        // Strict SI across leadership change: async-commit / 1PC derive their
+        // commit_ts from min_commit_ts (= max_ts+1). Right after this peer
+        // became leader, max_ts has not yet been re-synced from PD (see
+        // KvServer#wireLeaderMaxTsBump), so a derived commit_ts could land under
+        // a read_ts the previous leader already served. Until the sync lands,
+        // strip async-commit/1PC and force the client onto the explicit-Commit
+        // path (TSO-allocated commit_ts) — exactly TiKV's is_max_ts_synced gate.
+        // Decided on the leader BEFORE proposing so every replica applies the
+        // identical (stripped) request; deciding at apply time would diverge.
+        if (req.getUseAsyncCommit() || req.getTryOnePc()) {
+            var peer = locator.peerForKey(sample);
+            if (peer != null && peer.isLeader() && !peer.isMaxTsSynced()) {
+                req = req.toBuilder().setUseAsyncCommit(false).setTryOnePc(false).build();
+            }
+        }
         return propose(ProposalCodec.Kind.MVCC_PREWRITE, req.toByteArray(), sample, req.getContext(),
                 bytes -> {
                     try { return Kvrpcpb.PrewriteResponse.parseFrom(bytes); }

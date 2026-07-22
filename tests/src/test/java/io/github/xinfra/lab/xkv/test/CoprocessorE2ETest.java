@@ -13,7 +13,8 @@ import io.github.xinfra.lab.xkv.kv.mvcc.ConcurrencyManager;
 import io.github.xinfra.lab.xkv.kv.mvcc.MaxTsTracker;
 import io.github.xinfra.lab.xkv.kv.raft.CompositeApplyHandler;
 import io.github.xinfra.lab.xkv.kv.raft.LoopbackTransport;
-import io.github.xinfra.lab.xkv.kv.raft.RegionPeerImpl;
+import io.github.xinfra.lab.xkv.kv.raft.BatchRegionPeer;
+import io.github.xinfra.lab.xkv.kv.raft.RegionPeer;
 import io.github.xinfra.lab.xkv.kv.server.CoprocessorService;
 import io.github.xinfra.lab.xkv.kv.server.RawKvService;
 import io.github.xinfra.lab.xkv.kv.server.TikvServiceImpl;
@@ -54,7 +55,7 @@ final class CoprocessorE2ETest {
 
     @TempDir Path dataDir;
     private RocksStorageEngine engine;
-    private RegionPeerImpl peer;
+    private BatchRegionPeer peer;
     private Server grpcServer;
     private ManagedChannel channel;
     private TikvGrpc.TikvBlockingStub tikv;
@@ -69,12 +70,12 @@ final class CoprocessorE2ETest {
                 .addPeers(Metapb.Peer.newBuilder().setId(1).setStoreId(1).setRole(Metapb.PeerRole.Voter))
                 .build();
         var cm = new ConcurrencyManager(new MaxTsTracker(raftEngine.persistedMaxTs()));
-        peer = new RegionPeerImpl(
+        peer = BatchRegionPeer.standalone(
                 engine, raftEngine, region, region.getPeers(0),
                 List.of(new Peer(1)),
                 new LoopbackTransport(),
                 CompositeApplyHandler.defaultFor(engine, cm).withAdmin(raftEngine),
-                new RegionPeerImpl.Settings(10, 1, 30),
+                new RegionPeer.Settings(10, 1, 30),
                 cm);
         Awaitility.await().atMost(Duration.ofSeconds(10)).until(peer::isLeader);
 

@@ -6,7 +6,6 @@ import io.github.xinfra.lab.xkv.client.txn.Transaction;
 import io.github.xinfra.lab.xkv.kv.raft.RegionPeer;
 import io.github.xinfra.lab.xkv.kv.store.LogCompactionWorker;
 import io.github.xinfra.lab.xkv.kv.store.Store;
-import io.github.xinfra.lab.xkv.proto.Metapb;
 import org.awaitility.Awaitility;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -15,7 +14,6 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
 import java.time.Duration;
-import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -30,26 +28,26 @@ import static org.assertj.core.api.Assertions.assertThat;
 final class LogCompactionWorkerTest {
 
     @TempDir Path baseDir;
-    private ClusterHarness harness;
+    private TestCluster cluster;
     private TxnClient client;
 
     @BeforeEach
     void start() throws Exception {
-        harness = new ClusterHarness(baseDir, 3).start();
+        cluster = new TestCluster(baseDir).startReplicated(1, 3);
         client = TxnClient.create(ClientConfig.builder()
-                .pdEndpoints(List.of("127.0.0.1:" + harness.pdPort()))
+                .pdEndpoints(cluster.pdEndpoints())
                 .build());
     }
 
     @AfterEach
     void stop() throws Exception {
         if (client != null) client.close();
-        if (harness != null) harness.close();
+        if (cluster != null) cluster.close();
     }
 
     @Test
     void compactionAdvancesFirstIndexOnceAppliedGapExceedsThreshold() {
-        var store = wrapAllAsStore();
+        var store = leaderStore();
 
         // Push the raft log past the gap threshold. Each commit = 2 raft
         // entries (prewrite + commit), so ~50 commits ⇒ ~100 applied
@@ -94,7 +92,7 @@ final class LogCompactionWorkerTest {
     @Test
     void compactionNoOpWhenGapBelowThreshold() {
         // No workload pushed through — gap is tiny.
-        var store = wrapAllAsStore();
+        var store = leaderStore();
         var worker = new LogCompactionWorker(store, 60_000, 10_000, 100, 5_000);
         try {
             int issued = worker.runOnce();
@@ -107,31 +105,12 @@ final class LogCompactionWorkerTest {
 
     // ===== helpers =====
 
-    private RegionPeer leaderPeer() {
-        return harness.leader().peer;
+    private Store leaderStore() {
+        return cluster.leaderStoreFor(TestCluster.BOOTSTRAP_REGION_ID).store();
     }
 
-    private Store wrapAllAsStore() {
-        var nodes = harness.kvNodes();
-        return new Store() {
-            @Override public java.util.Optional<RegionPeer> peerForRegion(long regionId) {
-                return nodes.stream().map(n -> (RegionPeer) n.peer)
-                        .filter(p -> p.regionId() == regionId).findFirst();
-            }
-            @Override public java.util.Optional<RegionPeer> peerForKey(byte[] key) {
-                return java.util.Optional.empty();
-            }
-            @Override public java.util.Collection<RegionPeer> peers() {
-                return nodes.stream().map(n -> (RegionPeer) n.peer).toList();
-            }
-            @Override public void registerPeer(RegionPeer peer) {}
-            @Override public void destroyPeer(long regionId) {}
-            @Override public long storeId() { return 0L; }
-            @Override public Metapb.Store metadata() {
-                return Metapb.Store.newBuilder().setId(0L).build();
-            }
-            @Override public void shutdown() {}
-            @Override public void runHeartbeatTick() {}
-        };
+    private RegionPeer leaderPeer() {
+        var s = cluster.leaderStoreFor(TestCluster.BOOTSTRAP_REGION_ID);
+        return cluster.realPeer(s.storeId, TestCluster.BOOTSTRAP_REGION_ID);
     }
 }

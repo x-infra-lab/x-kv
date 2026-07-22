@@ -21,31 +21,24 @@ import static org.assertj.core.api.Assertions.assertThat;
 final class PdOperatorDispatchTest {
 
     @TempDir Path baseDir;
-    private ClusterHarness harness;
+    private TestCluster cluster;
 
     @BeforeEach
     void start() throws Exception {
-        harness = new ClusterHarness(baseDir, 3).start();
+        cluster = new TestCluster(baseDir).startReplicated(1, 3);
     }
 
     @AfterEach
     void stop() throws Exception {
-        if (harness != null) harness.close();
+        if (cluster != null) cluster.close();
     }
 
     @Test
     void pdChangePeerOperatorAddsLearnerToRegion() throws Exception {
-        var leader = harness.leader();
-        var pdChannel = io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder
-                .forAddress("127.0.0.1", harness.pdPort()).usePlaintext().build();
-        long newPeerId;
-        try {
-            var pd = io.github.xinfra.lab.xkv.proto.PDGrpc.newBlockingStub(pdChannel);
-            newPeerId = pd.allocID(Pdpb.AllocIDRequest
-                    .newBuilder().setCount(1).build()).getId();
-        } finally {
-            pdChannel.shutdownNow().awaitTermination(2, java.util.concurrent.TimeUnit.SECONDS);
-        }
+        var leaderNode = cluster.leaderStoreFor(TestCluster.BOOTSTRAP_REGION_ID);
+        var leaderPeer = cluster.realPeer(leaderNode.storeId, TestCluster.BOOTSTRAP_REGION_ID);
+        long newPeerId = cluster.pdStub().allocID(Pdpb.AllocIDRequest
+                .newBuilder().setCount(1).build()).getId();
         var newPeer = Metapb.Peer.newBuilder()
                 .setId(newPeerId).setStoreId(99).setRole(Metapb.PeerRole.Learner)
                 .build();
@@ -59,19 +52,20 @@ final class PdOperatorDispatchTest {
                 "test: add learner", resp, Set.of(99L),
                 List.of(new OperatorSteps.AddLearnerStep(newPeer)),
                 Operator.PRIORITY_ADMIN);
-        harness.pdServer().operatorController().addOperator(op);
+        cluster.pdLeader().server.operatorController().addOperator(op);
 
         Awaitility.await().atMost(Duration.ofSeconds(15))
                 .pollInterval(Duration.ofMillis(100))
-                .until(() -> leader.peer.region().getPeersList().stream()
+                .until(() -> leaderPeer.region().getPeersList().stream()
                         .anyMatch(p -> p.getId() == newPeer.getId()
                                 && p.getRole() == Metapb.PeerRole.Learner));
     }
 
     @Test
     void pdSplitOperatorReachesLeaderAndTriggersSplit() throws Exception {
-        var leader = harness.leader();
-        var region = harness.pdServer().state().getRegion(1).orElseThrow();
+        var leaderNode = cluster.leaderStoreFor(TestCluster.BOOTSTRAP_REGION_ID);
+        var leaderPeer = cluster.realPeer(leaderNode.storeId, TestCluster.BOOTSTRAP_REGION_ID);
+        var region = cluster.pdLeader().server.state().getRegion(1).orElseThrow();
         long currentVersion = region.getRegionEpoch().getVersion();
 
         var sr = Pdpb.SplitRegion.newBuilder()
@@ -88,24 +82,21 @@ final class PdOperatorDispatchTest {
                 "test: split at m", resp, storeIds,
                 List.of(new OperatorSteps.SplitRegionStep(currentVersion + 1)),
                 Operator.PRIORITY_ADMIN);
-        harness.pdServer().operatorController().addOperator(op);
+        cluster.pdLeader().server.operatorController().addOperator(op);
 
         Awaitility.await().atMost(Duration.ofSeconds(15))
                 .pollInterval(Duration.ofMillis(100))
-                .until(() -> !leader.childPeers.isEmpty());
+                .until(() -> leaderNode.store().peers().size() > 1);
 
-        assertThat(leader.peer.region().getEndKey().toStringUtf8())
+        assertThat(leaderPeer.region().getEndKey().toStringUtf8())
                 .as("parent shrunk after PD-driven split").isEqualTo("m");
     }
 
     @Test
     void pdTransferLeaderOperatorReachesLeader() throws Exception {
-        var currentLeader = harness.leader();
-        var target = harness.kvNodes().stream()
-                .filter(n -> n.peerId != currentLeader.peerId)
-                .findFirst().orElseThrow();
-        var targetPeer = Metapb.Peer.newBuilder()
-                .setId(target.peerId).setStoreId(target.peerId).build();
+        var targetNode = cluster.followerStoresFor(TestCluster.BOOTSTRAP_REGION_ID).get(0);
+        var targetRegionPeer = cluster.realPeer(targetNode.storeId, TestCluster.BOOTSTRAP_REGION_ID);
+        var targetPeer = targetRegionPeer.self();
 
         var resp = Pdpb.RegionHeartbeatResponse.newBuilder()
                 .setRegionId(1)
@@ -115,12 +106,12 @@ final class PdOperatorDispatchTest {
                 "test: transfer leader", resp, Set.of(targetPeer.getStoreId()),
                 List.of(new OperatorSteps.TransferLeaderStep(targetPeer)),
                 Operator.PRIORITY_ADMIN);
-        harness.pdServer().operatorController().addOperator(op);
+        cluster.pdLeader().server.operatorController().addOperator(op);
 
         Awaitility.await().atMost(Duration.ofSeconds(10))
                 .pollInterval(Duration.ofMillis(100))
-                .until(() -> target.peer.isLeader());
+                .until(() -> targetRegionPeer.isLeader());
 
-        assertThat(target.peer.isLeader()).isTrue();
+        assertThat(targetRegionPeer.isLeader()).isTrue();
     }
 }

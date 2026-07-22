@@ -57,7 +57,7 @@ final class TlsE2ETest {
         }
         channels.clear();
         if (server != null) server.shutdownNow().awaitTermination(2, TimeUnit.SECONDS);
-        ClusterHarness.releaseAllPorts();
+        TestCluster.releaseAllPorts();
     }
 
     private ManagedChannel track(ManagedChannel ch) {
@@ -69,8 +69,8 @@ final class TlsE2ETest {
     void tlsServerRejectsPlaintextClient() throws Exception {
         var serverTls = new TlsConfig(serverCert, serverKey, null, false);
 
-        int port = ClusterHarness.freePort();
-        ClusterHarness.releasePort(port);
+        int port = TestCluster.freePort();
+        TestCluster.releasePort(port);
         server = GrpcChannelFactory.serverBuilder(
                         new InetSocketAddress("127.0.0.1", port), serverTls)
                 .addService(new TikvServiceImpl())
@@ -92,8 +92,8 @@ final class TlsE2ETest {
     void tlsClientConnectsSuccessfully() throws Exception {
         var serverTls = new TlsConfig(serverCert, serverKey, null, false);
 
-        int port = ClusterHarness.freePort();
-        ClusterHarness.releasePort(port);
+        int port = TestCluster.freePort();
+        TestCluster.releasePort(port);
         server = GrpcChannelFactory.serverBuilder(
                         new InetSocketAddress("127.0.0.1", port), serverTls)
                 .addService(new TikvServiceImpl())
@@ -117,8 +117,8 @@ final class TlsE2ETest {
     void mtlsRejectsClientWithoutCert() throws Exception {
         var serverTls = TlsConfig.of(serverCert, serverKey, clientCert);
 
-        int port = ClusterHarness.freePort();
-        ClusterHarness.releasePort(port);
+        int port = TestCluster.freePort();
+        TestCluster.releasePort(port);
         server = GrpcChannelFactory.serverBuilder(
                         new InetSocketAddress("127.0.0.1", port), serverTls)
                 .addService(new TikvServiceImpl())
@@ -140,8 +140,8 @@ final class TlsE2ETest {
     void mtlsAcceptsClientWithValidCert() throws Exception {
         var serverTls = TlsConfig.of(serverCert, serverKey, clientCert);
 
-        int port = ClusterHarness.freePort();
-        ClusterHarness.releasePort(port);
+        int port = TestCluster.freePort();
+        TestCluster.releasePort(port);
         server = GrpcChannelFactory.serverBuilder(
                         new InetSocketAddress("127.0.0.1", port), serverTls)
                 .addService(new TikvServiceImpl())

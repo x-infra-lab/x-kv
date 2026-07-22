@@ -21,37 +21,40 @@ import static org.assertj.core.api.Assertions.assertThat;
 final class TransferLeaderTest {
 
     @TempDir Path baseDir;
-    private ClusterHarness harness;
+    private TestCluster cluster;
 
     @BeforeEach
     void start() throws Exception {
-        harness = new ClusterHarness(baseDir, 3).start();
+        cluster = new TestCluster(baseDir).startReplicated(1, 3);
     }
 
     @AfterEach
     void stop() throws Exception {
-        if (harness != null) harness.close();
+        if (cluster != null) cluster.close();
     }
 
     @Test
     void transferLeaderMovesLeadershipToRequestedPeer() {
-        var currentLeader = harness.leader();
-        var target = harness.kvNodes().stream()
-                .filter(n -> n.peerId != currentLeader.peerId)
-                .findFirst().orElseThrow();
+        long regionId = TestCluster.BOOTSTRAP_REGION_ID;
+        var currentLeaderStore = cluster.leaderStoreFor(regionId);
+        var currentLeaderPeer = cluster.realPeer(currentLeaderStore.storeId, regionId);
 
-        currentLeader.peer.transferLeader(target.peerId);
+        var targetStore = cluster.followerStoresFor(regionId).get(0);
+        var targetPeer = cluster.realPeer(targetStore.storeId, regionId);
+        long targetPeerId = targetPeer.self().getId();
+
+        currentLeaderPeer.transferLeader(targetPeerId);
 
         // The target must become leader within a few election timeouts.
         Awaitility.await().atMost(Duration.ofSeconds(5))
                 .pollInterval(Duration.ofMillis(50))
-                .until(() -> target.peer.isLeader());
+                .until(targetPeer::isLeader);
 
         // And the previous leader must have stepped down.
         Awaitility.await().atMost(Duration.ofSeconds(5))
                 .pollInterval(Duration.ofMillis(50))
-                .until(() -> !currentLeader.peer.isLeader());
+                .until(() -> !currentLeaderPeer.isLeader());
 
-        assertThat(target.peer.isLeader()).isTrue();
+        assertThat(targetPeer.isLeader()).isTrue();
     }
 }

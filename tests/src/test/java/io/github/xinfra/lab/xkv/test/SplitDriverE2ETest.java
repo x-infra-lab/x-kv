@@ -31,29 +31,25 @@ import static org.assertj.core.api.Assertions.assertThat;
 final class SplitDriverE2ETest {
 
     @TempDir Path baseDir;
-    private ClusterHarness harness;
-    private ManagedChannel pdChannel;
+    private TestCluster cluster;
     private PDGrpc.PDBlockingStub pd;
 
     @BeforeEach
     void start() throws Exception {
-        harness = new ClusterHarness(baseDir, 3).start();
-        pdChannel = NettyChannelBuilder.forAddress("127.0.0.1", harness.pdPort())
-                .usePlaintext().build();
-        pd = PDGrpc.newBlockingStub(pdChannel);
+        cluster = new TestCluster(baseDir).startReplicated(1, 3);
+        pd = cluster.pdStub();
     }
 
     @AfterEach
     void stop() throws Exception {
-        if (pdChannel != null) pdChannel.shutdownNow().awaitTermination(2, TimeUnit.SECONDS);
-        if (harness != null) harness.close();
-        ClusterHarness.releaseAllPorts();
+        if (cluster != null) cluster.close();
+        TestCluster.releaseAllPorts();
     }
 
     @Test
     void splitRegionRpcDrivesEndToEnd() throws Exception {
-        var leader = harness.leader();
-        var tikv = leader.blockingStub();
+        var leaderNode = cluster.leaderStoreFor(TestCluster.BOOTSTRAP_REGION_ID);
+        var tikv = cluster.clientStub(leaderNode.storeId);
         var resp = tikv.splitRegion(io.github.xinfra.lab.xkv.proto.Kvrpcpb.SplitRegionRequest.newBuilder()
                 .addSplitKeys(com.google.protobuf.ByteString.copyFromUtf8("p"))
                 .build());
@@ -69,41 +65,42 @@ final class SplitDriverE2ETest {
         // Wait for the child peer to appear locally.
         Awaitility.await().atMost(Duration.ofSeconds(5))
                 .pollInterval(Duration.ofMillis(20))
-                .until(() -> leader.childPeers.stream()
-                        .anyMatch(c -> c.regionId() == child.getId()));
+                .until(() -> leaderNode.store().peerForRegion(child.getId()).isPresent());
     }
 
     @Test
     void childPeerSpawnedAfterSplitOwnsChildRange() throws Exception {
-        var leader = harness.leader();
+        var leaderNode = cluster.leaderStoreFor(TestCluster.BOOTSTRAP_REGION_ID);
+        var parentPeer = cluster.realPeer(leaderNode.storeId, TestCluster.BOOTSTRAP_REGION_ID);
         // Pre-split: this store hosts one peer (the parent).
-        int beforeChildren = leader.childPeers.size();
+        int beforeChildren = leaderNode.store().peers().size();
 
         var driver = new SplitDriver(pd, /* proposeTimeoutMs= */ 5_000);
-        var resulting = driver.split(leader.peer, List.of("m".getBytes()));
+        var resulting = driver.split(parentPeer, List.of("m".getBytes()));
 
         // Splitter observer spawned a child peer on this store. Wait for
         // the apply to propagate (observer fires synchronously after persist).
         Awaitility.await().atMost(Duration.ofSeconds(5))
                 .pollInterval(Duration.ofMillis(20))
-                .until(() -> leader.childPeers.size() > beforeChildren);
+                .until(() -> leaderNode.store().peers().size() > beforeChildren);
 
         var child = resulting.get(1);
         // Store now routes "m" onwards to the child; "a" still to parent.
-        var routedForChild = leader.store.peerForKey("noah".getBytes()).orElseThrow();
+        var routedForChild = leaderNode.store().peerForKey("noah".getBytes()).orElseThrow();
         assertThat(routedForChild.regionId()).isEqualTo(child.getId());
-        var routedForParent = leader.store.peerForKey("alpha".getBytes()).orElseThrow();
-        assertThat(routedForParent.regionId()).isEqualTo(leader.peer.regionId());
+        var routedForParent = leaderNode.store().peerForKey("alpha".getBytes()).orElseThrow();
+        assertThat(routedForParent.regionId()).isEqualTo(parentPeer.regionId());
     }
 
     @Test
     void splitDriverShrinksParentAndAllocatesChildIds() throws Exception {
-        var leader = harness.leader();
+        var leaderNode = cluster.leaderStoreFor(TestCluster.BOOTSTRAP_REGION_ID);
+        var parentPeer = cluster.realPeer(leaderNode.storeId, TestCluster.BOOTSTRAP_REGION_ID);
         var driver = new SplitDriver(pd, /* proposeTimeoutMs= */ 5_000);
 
-        long beforeEpochVersion = leader.peer.region().getRegionEpoch().getVersion();
+        long beforeEpochVersion = parentPeer.region().getRegionEpoch().getVersion();
 
-        var resulting = driver.split(leader.peer, List.of("m".getBytes()));
+        var resulting = driver.split(parentPeer, List.of("m".getBytes()));
 
         assertThat(resulting).hasSize(2);
         var newParent = resulting.get(0);

@@ -11,7 +11,7 @@ import io.github.xinfra.lab.xkv.kv.raft.CompositeApplyHandler;
 import io.github.xinfra.lab.xkv.kv.raft.LoopbackTransport;
 import io.github.xinfra.lab.xkv.kv.raft.ProposalCodec;
 import io.github.xinfra.lab.xkv.kv.raft.RegionPeer;
-import io.github.xinfra.lab.xkv.kv.raft.RegionPeerImpl;
+import io.github.xinfra.lab.xkv.kv.raft.BatchRegionPeer;
 import io.github.xinfra.lab.xkv.proto.KvServerpb;
 import io.github.xinfra.lab.xkv.proto.Metapb;
 import org.awaitility.Awaitility;
@@ -43,7 +43,7 @@ final class PrepareMergeQuiescenceTest {
     @TempDir Path dataDir;
     private RocksStorageEngine engine;
     private PerRegionRaftEngine raftEngine;
-    private RegionPeerImpl peer;
+    private BatchRegionPeer peer;
     private ConcurrencyManager cm;
 
     @BeforeEach
@@ -56,12 +56,12 @@ final class PrepareMergeQuiescenceTest {
                 .addPeers(Metapb.Peer.newBuilder().setId(1).setStoreId(1).setRole(Metapb.PeerRole.Voter))
                 .build();
         cm = new ConcurrencyManager(new MaxTsTracker(raftEngine.persistedMaxTs()));
-        peer = new RegionPeerImpl(
+        peer = BatchRegionPeer.standalone(
                 engine, raftEngine, region, region.getPeers(0),
                 List.of(new Peer(1)),
                 new LoopbackTransport(),
                 CompositeApplyHandler.defaultFor(engine, cm).withAdmin(raftEngine, engine, null, null),
-                new RegionPeerImpl.Settings(10, 1, 30),
+                new RegionPeer.Settings(10, 1, 30),
                 cm);
         Awaitility.await().atMost(Duration.ofSeconds(10)).until(peer::isLeader);
     }

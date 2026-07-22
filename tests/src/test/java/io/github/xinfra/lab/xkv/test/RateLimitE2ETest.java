@@ -28,19 +28,19 @@ final class RateLimitE2ETest {
 
     @TempDir Path dataDir;
 
-    private ClusterHarness harness;
+    private TestCluster cluster;
 
     @AfterEach
     void tearDown() {
-        if (harness != null) harness.close();
+        if (cluster != null) cluster.close();
     }
 
     @Test
     void rateLimitRejectsExcessConcurrency() throws Exception {
-        harness = new ClusterHarness(dataDir, 1).start();
-        var leader = harness.leader();
+        cluster = new TestCluster(dataDir).start(1, 1);
+        var leader = cluster.leaderStoreFor(TestCluster.BOOTSTRAP_REGION_ID);
 
-        var stub = leader.blockingStub();
+        var stub = cluster.clientStub(leader.storeId);
         stub.rawPut(Kvrpcpb.RawPutRequest.newBuilder()
                 .setKey(ByteString.copyFromUtf8("k1"))
                 .setValue(ByteString.copyFromUtf8("v1"))

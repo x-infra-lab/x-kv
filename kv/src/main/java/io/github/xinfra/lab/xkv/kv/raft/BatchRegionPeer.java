@@ -19,14 +19,19 @@ import java.util.concurrent.CompletableFuture;
  * {@link RaftPoller}. No per-region threads are created — the mailbox
  * queues events and the poller drives the underlying {@code RawNode}.
  *
- * <p>Implements the same {@code RegionPeer} interface as
- * {@link RegionPeerImpl}, so callers (KvServer, TransactionService, etc.)
- * are unaware of the threading model.
+ * <p>Implements the {@code RegionPeer} interface so callers (KvServer,
+ * TransactionService, etc.) are unaware of the threading model.
  */
 public final class BatchRegionPeer implements RegionPeer {
 
     private final RegionMailbox mailbox;
     private final PerRegionRaftEngine raftEngine;
+
+    // Non-null only for peers built via standalone() — a self-contained peer
+    // (tests / benchmarks) that owns its poller + tick driver instead of
+    // sharing the store-wide BatchSystem. shutdown() closes them.
+    private RaftPoller ownedPoller;
+    private TickDriver ownedTickDriver;
 
     public BatchRegionPeer(StorageEngine storage,
                            PerRegionRaftEngine raftEngine,
@@ -35,15 +40,92 @@ public final class BatchRegionPeer implements RegionPeer {
                            List<Peer> peers,
                            Transport transport,
                            ApplyHandler applyHandler,
-                           RegionPeerImpl.Settings settings,
+                           RegionPeer.Settings settings,
                            ConcurrencyManager cm,
                            io.github.xinfra.lab.xkv.kv.engine.SnapshotEngine snapshotEngine,
                            RaftPoller poller,
                            TickDriver tickDriver,
                            ApplyWorker applyWorker) {
+        this(storage, raftEngine, region, self, peers, transport, applyHandler,
+                settings, cm, snapshotEngine, poller, tickDriver, applyWorker,
+                /* uninitialized= */ false);
+    }
+
+    /**
+     * Build a self-contained peer for tests and benchmarks: it owns a
+     * dedicated single-thread {@link RaftPoller} and {@link TickDriver} (no
+     * shared BatchSystem) and applies committed entries synchronously on the
+     * poller thread (applyWorker = null), mirroring the deterministic apply
+     * timing standalone test code relies on. {@link #shutdown()} tears the
+     * owned poller + tick driver down.
+     */
+    public static BatchRegionPeer standalone(StorageEngine storage,
+                                             PerRegionRaftEngine raftEngine,
+                                             Metapb.Region region,
+                                             Metapb.Peer self,
+                                             List<Peer> peers,
+                                             Transport transport,
+                                             ApplyHandler applyHandler,
+                                             RegionPeer.Settings settings,
+                                             ConcurrencyManager cm,
+                                             io.github.xinfra.lab.xkv.kv.engine.SnapshotEngine snapshotEngine) {
+        var poller = new RaftPoller(1);
+        var tickDriver = new TickDriver(settings.heartbeatTickMs());
+        var peer = new BatchRegionPeer(storage, raftEngine, region, self, peers,
+                transport, applyHandler, settings, cm, snapshotEngine,
+                poller, tickDriver, /* applyWorker= */ null);
+        peer.ownedPoller = poller;
+        peer.ownedTickDriver = tickDriver;
+        return peer;
+    }
+
+    public static BatchRegionPeer standalone(StorageEngine storage,
+                                             PerRegionRaftEngine raftEngine,
+                                             Metapb.Region region,
+                                             Metapb.Peer self,
+                                             List<Peer> peers,
+                                             Transport transport,
+                                             ApplyHandler applyHandler,
+                                             RegionPeer.Settings settings) {
+        return standalone(storage, raftEngine, region, self, peers, transport,
+                applyHandler, settings, null, null);
+    }
+
+    public static BatchRegionPeer standalone(StorageEngine storage,
+                                             PerRegionRaftEngine raftEngine,
+                                             Metapb.Region region,
+                                             Metapb.Peer self,
+                                             List<Peer> peers,
+                                             Transport transport,
+                                             ApplyHandler applyHandler,
+                                             RegionPeer.Settings settings,
+                                             ConcurrencyManager cm) {
+        return standalone(storage, raftEngine, region, self, peers, transport,
+                applyHandler, settings, cm, null);
+    }
+
+    /**
+     * Full constructor. When {@code uninitialized} is true the peer is created
+     * from a bare raft message (TiKV-style): it is not bootstrapped and learns
+     * its real region descriptor from the leader's snapshot before serving.
+     */
+    public BatchRegionPeer(StorageEngine storage,
+                           PerRegionRaftEngine raftEngine,
+                           Metapb.Region region,
+                           Metapb.Peer self,
+                           List<Peer> peers,
+                           Transport transport,
+                           ApplyHandler applyHandler,
+                           RegionPeer.Settings settings,
+                           ConcurrencyManager cm,
+                           io.github.xinfra.lab.xkv.kv.engine.SnapshotEngine snapshotEngine,
+                           RaftPoller poller,
+                           TickDriver tickDriver,
+                           ApplyWorker applyWorker,
+                           boolean uninitialized) {
         this.raftEngine = raftEngine;
         this.mailbox = new RegionMailbox(storage, raftEngine, region, self, peers,
-                transport, applyHandler, settings, cm, snapshotEngine);
+                transport, applyHandler, settings, cm, snapshotEngine, uninitialized);
         this.mailbox.setPoller(poller);
         if (applyWorker != null) this.mailbox.setApplyWorker(applyWorker);
         tickDriver.register(mailbox);
@@ -53,9 +135,26 @@ public final class BatchRegionPeer implements RegionPeer {
 
     public RegionMailbox mailbox() { return mailbox; }
 
-    public void setChangePeerObserver(RegionPeerImpl.ChangePeerObserver obs) {
+    public void setChangePeerObserver(RegionPeer.ChangePeerObserver obs) {
         mailbox.changePeerObserver = obs;
     }
+
+    /** Register a callback fired when an uninitialized peer completes snapshot init. */
+    public void setInitObserver(RegionMailbox.InitObserver obs) {
+        mailbox.initObserver = obs;
+    }
+
+    /**
+     * Register a callback fired when this peer acquires region leadership.
+     * Used to re-establish {@code max_ts} from PD on failover so SI holds
+     * across leadership changes. The callback must be non-blocking.
+     */
+    public void setLeaderAcquiredObserver(Runnable obs) {
+        mailbox.onLeaderAcquired = obs;
+    }
+
+    /** False while this peer still awaits its initializing snapshot. */
+    public boolean isInitialized() { return !mailbox.uninitialized; }
 
     @Override public long regionId() { return mailbox.regionId; }
     @Override public Metapb.Region region() { return mailbox.region; }
@@ -65,6 +164,12 @@ public final class BatchRegionPeer implements RegionPeer {
     public boolean isLeader() {
         return mailbox.isLeader();
     }
+
+    @Override
+    public boolean isMaxTsSynced() { return mailbox.isMaxTsSynced(); }
+
+    /** Called by the leadership PD-TSO bump once it has re-synced max_ts. */
+    public void markMaxTsSynced() { mailbox.markMaxTsSynced(); }
 
     @Override public boolean isDestroyed() { return mailbox.destroyed; }
     @Override public long firstIndex() { return raftEngine.firstIndex(); }
@@ -146,11 +251,18 @@ public final class BatchRegionPeer implements RegionPeer {
     @Override
     public void shutdown() {
         mailbox.shutdown();
+        if (ownedTickDriver != null) ownedTickDriver.shutdown();
+        if (ownedPoller != null) ownedPoller.shutdown();
+    }
+
+    @Override
+    public java.util.Set<Long> laggingPeerIds() {
+        return mailbox.laggingPeers;
     }
 
     public RegionRaftStorage raftStorage() { return mailbox.raftStorage; }
 
-    // Envelope helper — same as RegionPeerImpl.withSeq
+    // Envelope helper — rewrites the propose_seq bytes in the payload header.
     private static byte[] withSeq(byte[] inner, long seq) {
         if (inner == null || inner.length < 6) {
             throw new IllegalArgumentException("malformed proposal payload");

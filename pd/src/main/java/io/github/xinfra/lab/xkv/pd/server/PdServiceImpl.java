@@ -149,13 +149,6 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
             StreamObserver<T> obs,
             java.util.function.Supplier<T> onSuccess) {
         var rn = raftNode;
-        if (rn == null) {
-            // Single-PD mode: apply directly.
-            state.applyCommand(cmd.toByteArray());
-            obs.onNext(onSuccess.get());
-            obs.onCompleted();
-            return true;
-        }
         if (!rn.isLeader()) {
             obs.onError(io.grpc.Status.UNAVAILABLE
                     .withDescription("not PD leader").asRuntimeException());
@@ -182,7 +175,6 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
      */
     private <T> boolean ensureLinearizableRead(StreamObserver<T> obs) {
         var rn = raftNode;
-        if (rn == null) return true;
         if (!rn.isLeader()) {
             obs.onError(Status.UNAVAILABLE
                     .withDescription("not PD leader").asRuntimeException());
@@ -227,7 +219,7 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
             if (!m.raftAddress().isEmpty()) mb.addPeerUrls(m.raftAddress());
             b.addMembers(mb.build());
         }
-        long leaderId = raftNode != null ? raftNode.leaderNodeId() : nodeId;
+        long leaderId = raftNode.leaderNodeId();
         for (var mb : b.getMembersList()) {
             if (mb.getMemberId() == leaderId) {
                 b.setLeader(mb);
@@ -291,7 +283,7 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
     @Override
     public void allocID(AllocIDRequest req, StreamObserver<AllocIDResponse> obs) {
         var rn = raftNode;
-        if (rn != null && !rn.isLeader()) {
+        if (!rn.isLeader()) {
             obs.onError(Status.UNAVAILABLE
                     .withDescription("not PD leader").asRuntimeException());
             return;
@@ -330,7 +322,7 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
             @Override
             public void onNext(TsoRequest req) {
                 var rn = raftNode;
-                if (rn != null && !rn.isLeader()) {
+                if (!rn.isLeader()) {
                     resp.onNext(TsoResponse.newBuilder()
                             .setHeader(errorHeader(
                                     io.github.xinfra.lab.xkv.proto.Pdpb.Error.ErrorType.UNKNOWN,
@@ -402,7 +394,7 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
     @Override
     public void storeHeartbeat(StoreHeartbeatRequest req, StreamObserver<StoreHeartbeatResponse> obs) {
         var rn = raftNode;
-        if (rn != null && !rn.isLeader()) {
+        if (!rn.isLeader()) {
             obs.onError(Status.UNAVAILABLE
                     .withDescription("not PD leader").asRuntimeException());
             return;
@@ -419,11 +411,20 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
         return new io.grpc.stub.StreamObserver<>() {
             @Override
             public void onNext(RegionHeartbeatRequest hb) {
+                // Region heartbeats carry operator dispatch: only the PD raft
+                // leader owns the operatorController with live operators. A
+                // follower's controller is empty, so dispatching there silently
+                // drops conf-changes. Reject non-leader heartbeats so the KV
+                // store re-discovers the real leader and reconnects.
+                var leaderRn = raftNode;
+                if (!leaderRn.isLeader()) {
+                    obs.onError(Status.UNAVAILABLE
+                            .withDescription("not PD leader").asRuntimeException());
+                    return;
+                }
                 if (hb.hasRegion() && shouldUpdateRegion(hb.getRegion())) {
                     var rn = raftNode;
-                    if (rn == null) {
-                        state.updateRegion(hb.getRegion());
-                    } else if (rn.isLeader()) {
+                    if (rn.isLeader()) {
                         var cmd = io.github.xinfra.lab.xkv.proto.PdInternalpb.PdCommand.newBuilder()
                                 .setType(io.github.xinfra.lab.xkv.proto.PdInternalpb.CommandType.CMD_UPDATE_REGION)
                                 .setRegion(hb.getRegion())
@@ -440,6 +441,10 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
                 if (hb.hasRegion()) {
                     state.updateRegionStats(hb.getRegion().getId(),
                             hb.getApproximateSize(), hb.getApproximateKeys());
+                    // Track peers still catching up (learners receiving a
+                    // snapshot / lagging voters) so the rule checker knows when
+                    // a learner can be promoted to voter.
+                    state.updatePendingPeers(hb.getRegion().getId(), hb.getPendingPeersList());
                 }
                 // Leader identity is volatile routing state — NOT replicated.
                 if (hb.hasLeader() && hb.hasRegion()) {
@@ -518,7 +523,7 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
             return;
         }
         var rn = raftNode;
-        if (rn != null && !rn.isLeader()) {
+        if (!rn.isLeader()) {
             obs.onError(Status.UNAVAILABLE
                     .withDescription("not PD leader").asRuntimeException());
             return;
@@ -551,7 +556,7 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
             return;
         }
         var rn = raftNode;
-        if (rn != null && !rn.isLeader()) {
+        if (!rn.isLeader()) {
             obs.onError(Status.UNAVAILABLE
                     .withDescription("not PD leader").asRuntimeException());
             return;
@@ -1045,12 +1050,6 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
     public void addMember(io.github.xinfra.lab.xkv.proto.Pdpb.AddMemberRequest req,
                           StreamObserver<io.github.xinfra.lab.xkv.proto.Pdpb.AddMemberResponse> obs) {
         var rn = raftNode;
-        if (rn == null) {
-            obs.onError(Status.UNAVAILABLE
-                    .withDescription("single-PD mode does not support membership change")
-                    .asRuntimeException());
-            return;
-        }
         if (!rn.isLeader()) {
             obs.onError(Status.UNAVAILABLE
                     .withDescription("not PD leader").asRuntimeException());
@@ -1121,12 +1120,6 @@ public final class PdServiceImpl extends PDGrpc.PDImplBase {
     public void removeMember(io.github.xinfra.lab.xkv.proto.Pdpb.RemoveMemberRequest req,
                              StreamObserver<io.github.xinfra.lab.xkv.proto.Pdpb.RemoveMemberResponse> obs) {
         var rn = raftNode;
-        if (rn == null) {
-            obs.onError(Status.UNAVAILABLE
-                    .withDescription("single-PD mode does not support membership change")
-                    .asRuntimeException());
-            return;
-        }
         if (!rn.isLeader()) {
             obs.onError(Status.UNAVAILABLE
                     .withDescription("not PD leader").asRuntimeException());

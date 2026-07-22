@@ -3,6 +3,7 @@ package io.github.xinfra.lab.xkv.kv.store;
 import io.github.xinfra.lab.xkv.common.metrics.XKvMetrics;
 import io.github.xinfra.lab.xkv.kv.engine.StorageEngine;
 import io.github.xinfra.lab.xkv.kv.raft.RegionPeer;
+import io.github.xinfra.lab.xkv.kv.transport.PdEndpointManager;
 import io.github.xinfra.lab.xkv.proto.Metapb;
 import io.github.xinfra.lab.xkv.proto.PDGrpc;
 import io.github.xinfra.lab.xkv.proto.Pdpb;
@@ -30,6 +31,7 @@ public final class RegionHeartbeater implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(RegionHeartbeater.class);
 
     private final PDGrpc.PDStub asyncStub;
+    private final PdEndpointManager pdManager;
     private final RegionPeer peer;
     private final long intervalMs;
     private final ScheduledExecutorService timer;
@@ -53,6 +55,30 @@ public final class RegionHeartbeater implements AutoCloseable {
                               long intervalMs, SplitTrigger splitTrigger,
                               StorageEngine engine) {
         this.asyncStub = asyncStub;
+        this.pdManager = null;
+        this.peer = peer;
+        this.intervalMs = intervalMs;
+        this.splitTrigger = splitTrigger;
+        this.engine = engine;
+        this.timer = Executors.newSingleThreadScheduledExecutor(r -> {
+            var t = new Thread(r, "region-heartbeat-" + peer.regionId());
+            t.setDaemon(true);
+            return t;
+        });
+    }
+
+    /**
+     * Production constructor: takes the {@link PdEndpointManager} so the
+     * heartbeat stream always binds to the current PD raft leader's stub and,
+     * on stream error (e.g. the PD leader rejected us with UNAVAILABLE because
+     * we connected to a follower), re-discovers the real leader via {@code
+     * switchLeader()} before reconnecting on the next tick.
+     */
+    public RegionHeartbeater(PdEndpointManager pdManager, RegionPeer peer,
+                              long intervalMs, SplitTrigger splitTrigger,
+                              StorageEngine engine) {
+        this.asyncStub = null;
+        this.pdManager = pdManager;
         this.peer = peer;
         this.intervalMs = intervalMs;
         this.splitTrigger = splitTrigger;
@@ -110,16 +136,34 @@ public final class RegionHeartbeater implements AutoCloseable {
         outbound.onNext(Pdpb.RegionHeartbeatRequest.newBuilder()
                 .setRegion(peer.region())
                 .setLeader(peer.self())
+                .addAllPendingPeers(pendingPeers())
                 .setApproximateSize(approxSize)
                 .setApproximateKeys(0)
                 .build());
+    }
+
+    /**
+     * Map the leader's lagging-peer ids to their {@code metapb.Peer}
+     * descriptors for the {@code pending_peers} field. PD uses this to defer
+     * promoting a learner until it has caught up.
+     */
+    private java.util.List<Metapb.Peer> pendingPeers() {
+        var lagging = peer.laggingPeerIds();
+        if (lagging.isEmpty()) return java.util.List.of();
+        var out = new java.util.ArrayList<Metapb.Peer>(lagging.size());
+        for (var p : peer.region().getPeersList()) {
+            if (lagging.contains(p.getId())) out.add(p);
+        }
+        return out;
     }
 
     private void ensureStream() {
         if (outbound != null) return;
         synchronized (this) {
             if (outbound != null || closed) return;
-            outbound = asyncStub.regionHeartbeat(new StreamObserver<>() {
+            var stub = pdManager != null ? pdManager.asyncStub() : asyncStub;
+            if (stub == null) return;
+            outbound = stub.regionHeartbeat(new StreamObserver<>() {
                 @Override public void onNext(Pdpb.RegionHeartbeatResponse v) {
                     dispatchOperator(v);
                 }
@@ -127,6 +171,15 @@ public final class RegionHeartbeater implements AutoCloseable {
                     errorCounter.increment();
                     log.warn("heartbeat stream error region={}: {}", peer.regionId(), t.getMessage());
                     resetStream();
+                    // The PD node we streamed to may have rejected us because
+                    // it is no longer the raft leader. Re-discover the real
+                    // leader so the next tick reconnects to it.
+                    if (pdManager != null) {
+                        try { pdManager.switchLeader(); }
+                        catch (Throwable st) {
+                            log.debug("PD switchLeader after stream error failed: {}", st.getMessage());
+                        }
+                    }
                 }
                 @Override public void onCompleted() { resetStream(); }
             });

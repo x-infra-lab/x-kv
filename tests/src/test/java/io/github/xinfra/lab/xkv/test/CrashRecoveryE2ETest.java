@@ -11,9 +11,6 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
 import java.time.Duration;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -28,21 +25,15 @@ import static org.assertj.core.api.Assertions.assertThat;
 final class CrashRecoveryE2ETest {
 
     @TempDir Path baseDir;
-    private ClusterHarness harness;
+    private TestCluster harness;
     private XKvClient client;
-    private Map<Long, String> raftAddrs;
 
     @BeforeEach
     void start() throws Exception {
-        harness = new ClusterHarness(baseDir, 3).start();
+        harness = new TestCluster(baseDir).startReplicated(1, 3);
         client = XKvClient.create(ClientConfig.builder()
-                .pdEndpoints(List.of("127.0.0.1:" + harness.pdPort()))
+                .pdEndpoints(harness.pdEndpoints())
                 .build());
-
-        raftAddrs = new HashMap<>();
-        for (var n : harness.kvNodes()) {
-            raftAddrs.put(n.peerId, "127.0.0.1:" + n.raftPort);
-        }
     }
 
     @AfterEach
@@ -69,13 +60,9 @@ final class CrashRecoveryE2ETest {
         }
 
         // Kill a follower (not the leader — so the cluster stays available).
-        var leader = harness.leader();
-        var follower = harness.kvNodes().stream()
-                .filter(n -> !n.peer.isLeader())
-                .findFirst().orElseThrow();
-        long killedPeerId = follower.peerId;
-        follower.shutdown();
-        harness.kvNodes().remove(follower);
+        var follower = harness.followerStoresFor(TestCluster.BOOTSTRAP_REGION_ID).get(0);
+        long killedStoreId = follower.storeId;
+        harness.killStore(killedStoreId);
 
         // Write a few more keys while the follower is down.
         for (int i = 100; i < 110; i++) {
@@ -84,7 +71,7 @@ final class CrashRecoveryE2ETest {
         }
 
         // Restart the killed node.
-        var restarted = harness.restartNode(killedPeerId, raftAddrs);
+        var restarted = harness.restartStore(killedStoreId);
 
         // Wait for the restarted node's raft engine to catch up.
         Awaitility.await()
@@ -94,7 +81,7 @@ final class CrashRecoveryE2ETest {
                     // Check that the restarted node has all 110 keys in RocksDB.
                     for (int i = 0; i < 110; i++) {
                         byte[] key = String.format("crash:%04d", i).getBytes();
-                        byte[] val = restarted.engine.get(StorageEngine.Cf.DEFAULT, key);
+                        byte[] val = restarted.server.engine().get(StorageEngine.Cf.DEFAULT, key);
                         if (val == null) return false;
                     }
                     return true;
@@ -119,24 +106,17 @@ final class CrashRecoveryE2ETest {
         }
 
         // Kill the leader.
-        var oldLeader = harness.leader();
-        long killedPeerId = oldLeader.peerId;
-        oldLeader.shutdown();
-        harness.kvNodes().remove(oldLeader);
+        var oldLeader = harness.leaderStoreFor(TestCluster.BOOTSTRAP_REGION_ID);
+        long killedStoreId = oldLeader.storeId;
+        harness.killStore(killedStoreId);
 
-        // Wait for new leader.
-        Awaitility.await()
-                .atMost(Duration.ofSeconds(30))
-                .pollInterval(Duration.ofMillis(200))
-                .until(() -> harness.kvNodes().stream()
-                        .anyMatch(n -> n.peer.isLeader()));
-
-        harness.publishLeaderToPd();
+        // Wait for a new leader on a surviving store.
+        harness.waitForNewLeaderOtherThan(TestCluster.BOOTSTRAP_REGION_ID, killedStoreId);
 
         // Invalidate client caches for the dead node.
         var impl = (io.github.xinfra.lab.xkv.client.XKvClientImpl) client;
-        impl.regionCache().invalidate(harness.bootstrapRegionId());
-        impl.storeCache().closeStore(killedPeerId);
+        impl.regionCache().invalidate(TestCluster.BOOTSTRAP_REGION_ID);
+        impl.storeCache().closeStore(killedStoreId);
 
         // Phase 2: write 50 more keys while old leader is down.
         for (int i = 50; i < 100; i++) {
@@ -145,7 +125,7 @@ final class CrashRecoveryE2ETest {
         }
 
         // Phase 3: restart the killed leader.
-        var restarted = harness.restartNode(killedPeerId, raftAddrs);
+        var restarted = harness.restartStore(killedStoreId);
 
         // Wait for the restarted node to replicate all 100 keys.
         Awaitility.await()
@@ -154,7 +134,7 @@ final class CrashRecoveryE2ETest {
                 .until(() -> {
                     for (int i = 0; i < 100; i++) {
                         byte[] key = String.format("recover:%04d", i).getBytes();
-                        byte[] val = restarted.engine.get(StorageEngine.Cf.DEFAULT, key);
+                        byte[] val = restarted.server.engine().get(StorageEngine.Cf.DEFAULT, key);
                         if (val == null) return false;
                     }
                     return true;
@@ -172,26 +152,19 @@ final class CrashRecoveryE2ETest {
         }
 
         // Kill the leader.
-        var oldLeader = harness.leader();
-        long killedPeerId = oldLeader.peerId;
-        oldLeader.shutdown();
-        harness.kvNodes().remove(oldLeader);
+        var oldLeader = harness.leaderStoreFor(TestCluster.BOOTSTRAP_REGION_ID);
+        long killedStoreId = oldLeader.storeId;
+        harness.killStore(killedStoreId);
 
-        // Wait for new leader.
-        Awaitility.await()
-                .atMost(Duration.ofSeconds(30))
-                .pollInterval(Duration.ofMillis(200))
-                .until(() -> harness.kvNodes().stream()
-                        .anyMatch(n -> n.peer.isLeader()));
-
-        harness.publishLeaderToPd();
+        // Wait for a new leader on a surviving store.
+        harness.waitForNewLeaderOtherThan(TestCluster.BOOTSTRAP_REGION_ID, killedStoreId);
 
         var impl = (io.github.xinfra.lab.xkv.client.XKvClientImpl) client;
-        impl.regionCache().invalidate(harness.bootstrapRegionId());
-        impl.storeCache().closeStore(killedPeerId);
+        impl.regionCache().invalidate(TestCluster.BOOTSTRAP_REGION_ID);
+        impl.storeCache().closeStore(killedStoreId);
 
         // Restart old leader.
-        var restarted = harness.restartNode(killedPeerId, raftAddrs);
+        var restarted = harness.restartStore(killedStoreId);
 
         // Wait for the restarted node to join the cluster.
         Awaitility.await()
@@ -200,13 +173,13 @@ final class CrashRecoveryE2ETest {
                 .until(() -> {
                     // The restarted node should have data and NOT be leader
                     // (the new leader was already elected).
-                    byte[] val = restarted.engine.get(StorageEngine.Cf.DEFAULT,
+                    byte[] val = restarted.server.engine().get(StorageEngine.Cf.DEFAULT,
                             "leader:0000".getBytes());
                     return val != null;
                 });
 
         // Verify cluster is fully functional with 3 nodes.
-        assertThat(harness.kvNodes()).hasSize(3);
+        assertThat(harness.stores()).hasSize(3);
 
         // New writes should succeed.
         for (int i = 30; i < 40; i++) {

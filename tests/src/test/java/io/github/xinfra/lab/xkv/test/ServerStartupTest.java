@@ -31,8 +31,8 @@ final class ServerStartupTest {
 
     @Test
     void pdStartsAndAnswersGetMembers() throws Exception {
-        int port = ClusterHarness.freePort();
-        int raftPort = ClusterHarness.freePort();
+        int port = TestCluster.freePort();
+        int raftPort = TestCluster.freePort();
         var dir = Files.createTempDirectory("x-pd-startup");
 
         var cfg = PdConfig.builder()
@@ -43,8 +43,8 @@ final class ServerStartupTest {
                 .dataDir(dir)
                 .build();
 
-        ClusterHarness.releasePort(port);
-        ClusterHarness.releasePort(raftPort);
+        TestCluster.releasePort(port);
+        TestCluster.releasePort(raftPort);
         var pd = new PdServer(cfg);
         pd.start();
         try {
@@ -62,14 +62,14 @@ final class ServerStartupTest {
             }
         } finally {
             pd.stop();
-            ClusterHarness.releaseAllPorts();
+            TestCluster.releaseAllPorts();
         }
     }
 
     @Test
     void kvServerBootstrapsWithPdAndServesRawKv() throws Exception {
-        int pdPort = ClusterHarness.freePort();
-        int pdRaftPort = ClusterHarness.freePort();
+        int pdPort = TestCluster.freePort();
+        int pdRaftPort = TestCluster.freePort();
         var pdDir = Files.createTempDirectory("x-pd-kvboot");
 
         var pdCfg = PdConfig.builder()
@@ -78,13 +78,13 @@ final class ServerStartupTest {
                 .raftAddress("127.0.0.1:" + pdRaftPort)
                 .dataDir(pdDir)
                 .build();
-        ClusterHarness.releasePort(pdPort);
-        ClusterHarness.releasePort(pdRaftPort);
+        TestCluster.releasePort(pdPort);
+        TestCluster.releasePort(pdRaftPort);
         var pd = new PdServer(pdCfg);
         pd.start();
 
-        int kvClientPort = ClusterHarness.freePort();
-        int kvRaftPort = ClusterHarness.freePort();
+        int kvClientPort = TestCluster.freePort();
+        int kvRaftPort = TestCluster.freePort();
         var kvDir = Files.createTempDirectory("x-kv-kvboot");
 
         var kvCfg = KvConfig.builder()
@@ -94,8 +94,8 @@ final class ServerStartupTest {
                 .raftAddress("127.0.0.1:" + kvRaftPort)
                 .dataDir(kvDir)
                 .build();
-        ClusterHarness.releasePort(kvClientPort);
-        ClusterHarness.releasePort(kvRaftPort);
+        TestCluster.releasePort(kvClientPort);
+        TestCluster.releasePort(kvRaftPort);
         var kv = new KvServer(kvCfg);
         kv.start();
 
@@ -142,7 +142,7 @@ final class ServerStartupTest {
         } finally {
             kv.stop();
             pd.stop();
-            ClusterHarness.releaseAllPorts();
+            TestCluster.releaseAllPorts();
         }
     }
 }

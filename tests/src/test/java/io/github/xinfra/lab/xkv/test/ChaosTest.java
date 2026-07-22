@@ -14,7 +14,6 @@ import org.slf4j.LoggerFactory;
 
 import java.nio.file.Path;
 import java.util.List;
-import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
@@ -45,15 +44,14 @@ final class ChaosTest {
     private static final int TRANSFERS_PER_WORKER = 100;
 
     @TempDir Path baseDir;
-    private ClusterHarness harness;
+    private TestCluster cluster;
     private TxnClient txnClient;
 
     @BeforeEach
     void start() throws Exception {
-        harness = new ClusterHarness(baseDir, 3).start();
-        String pdAddr = "127.0.0.1:" + harness.pdPort();
+        cluster = new TestCluster(baseDir).startReplicated(1, 3);
         txnClient = TxnClient.create(ClientConfig.builder()
-                .pdEndpoints(List.of(pdAddr))
+                .pdEndpoints(cluster.pdEndpoints())
                 .build());
 
         // Seed accounts.
@@ -70,7 +68,7 @@ final class ChaosTest {
     @AfterEach
     void teardown() {
         if (txnClient != null) txnClient.close();
-        if (harness != null) harness.close();
+        if (cluster != null) cluster.close();
     }
 
     @Test
@@ -123,24 +121,22 @@ final class ChaosTest {
                 catch (InterruptedException e) { return; }
                 if (chaosStop.get()) return;
 
-                var nodes = harness.kvNodes();
+                var nodes = cluster.stores();
                 if (nodes.size() < 3) continue;
 
                 // Pick a random node to isolate.
                 var victim = nodes.get(rnd.nextInt(nodes.size()));
-                long victimId = victim.peerId;
+                long victimId = victim.storeId;
 
                 try {
-                    log.info("CHAOS: partitioning peer={}", victimId);
-                    var peerAddrs = victim.peerAddrs;
-                    victim.shutdown();
-                    nodes.remove(victim);
+                    log.info("CHAOS: partitioning store={}", victimId);
+                    cluster.killStore(victimId);
                     partitions.incrementAndGet();
 
                     Thread.sleep(3000 + rnd.nextInt(2000));
 
-                    log.info("CHAOS: healing partition peer={}", victimId);
-                    harness.restartNode(victimId, peerAddrs);
+                    log.info("CHAOS: healing partition store={}", victimId);
+                    cluster.restartStore(victimId);
                 } catch (Exception e) {
                     log.warn("partition chaos error: {}", e.getMessage());
                 }
@@ -202,25 +198,28 @@ final class ChaosTest {
                 catch (InterruptedException e) { return; }
                 if (chaosStop.get()) return;
 
-                var candidates = killLeader
-                        ? harness.kvNodes().stream()
-                                .filter(n -> n.peer.isLeader()).toList()
-                        : harness.kvNodes().stream()
-                                .filter(n -> !n.peer.isLeader()).toList();
+                long regionId = TestCluster.BOOTSTRAP_REGION_ID;
+                List<TestCluster.StoreNode> candidates;
+                try {
+                    candidates = killLeader
+                            ? List.of(cluster.leaderStoreFor(regionId))
+                            : cluster.followerStoresFor(regionId);
+                } catch (RuntimeException noLeaderYet) {
+                    continue;
+                }
                 if (candidates.isEmpty()) continue;
                 var victim = candidates.get(rnd.nextInt(candidates.size()));
+                long victimId = victim.storeId;
 
                 try {
-                    log.info("CHAOS: killing {} peer={}",
-                            killLeader ? "leader" : "follower", victim.peerId);
-                    Map<Long, String> peerAddrs = victim.peerAddrs;
-                    victim.shutdown();
-                    harness.kvNodes().remove(victim);
+                    log.info("CHAOS: killing {} store={}",
+                            killLeader ? "leader" : "follower", victimId);
+                    cluster.killStore(victimId);
                     killCount.incrementAndGet();
                     Thread.sleep(1500 + rnd.nextInt(1000));
 
-                    log.info("CHAOS: restarting peer={}", victim.peerId);
-                    harness.restartNode(victim.peerId, peerAddrs);
+                    log.info("CHAOS: restarting store={}", victimId);
+                    cluster.restartStore(victimId);
                 } catch (Exception e) {
                     log.warn("chaos error: {}", e.getMessage());
                 }

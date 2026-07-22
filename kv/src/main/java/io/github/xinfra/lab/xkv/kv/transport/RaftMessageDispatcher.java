@@ -42,8 +42,14 @@ public final class RaftMessageDispatcher {
          * Called from the gRPC server thread. Implementations should kick
          * off async work and return quickly. The dispatcher tags the region
          * as "spawning" until {@link #onSpawnDone} is called.
+         *
+         * @param fromStoreId store id of the sender (the leader), taken from
+         *        the wire {@code RaftMessage.from_peer}. The handler needs it
+         *        to wire the outbound link back to the leader when creating an
+         *        uninitialized peer (the bare {@code Eraftpb.Message} only
+         *        carries peer ids, not store ids).
          */
-        void onMissing(long regionId, Eraftpb.Message firstMessage);
+        void onMissing(long regionId, Eraftpb.Message firstMessage, long fromStoreId);
     }
 
     public void setMissingHandler(MissingRegionHandler h) { this.missingHandler = h; }
@@ -63,7 +69,7 @@ public final class RaftMessageDispatcher {
     public void onSpawnDone(long regionId) { spawnInFlight.remove(regionId); }
 
     /** Inbound: route a parsed raft message to the right local peer. */
-    public void deliver(long regionId, Eraftpb.Message msg) {
+    public void deliver(long regionId, Eraftpb.Message msg, long fromStoreId) {
         var t = byRegion.get(regionId);
         if (t != null) {
             t.deliver(msg);
@@ -77,7 +83,7 @@ public final class RaftMessageDispatcher {
         if (h != null && spawnInFlight.putIfAbsent(regionId, Boolean.TRUE) == null) {
             log.info("on-demand spawn fired for region={} (triggered by {})",
                     regionId, msg.getMsgType());
-            try { h.onMissing(regionId, msg); }
+            try { h.onMissing(regionId, msg, fromStoreId); }
             catch (Throwable t2) {
                 deliverErrorCounter.increment();
                 log.warn("on-demand spawn handler threw for region={}: {}",

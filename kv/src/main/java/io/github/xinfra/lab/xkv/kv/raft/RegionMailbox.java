@@ -33,7 +33,7 @@ import java.util.concurrent.atomic.AtomicLong;
 /**
  * Per-region lightweight state holder for the BatchSystem.
  *
- * <p>Replaces the per-region threads in {@link RegionPeerImpl}. Instead of
+ * <p>Replaces the per-region threads of the legacy single-thread peer. Instead of
  * a dedicated readyThread blocking on {@code node.ready()}, the mailbox
  * queues inbound events (propose, step, tick, readIndex) and the shared
  * {@link RaftPoller} drives the {@link RawNode} state machine.
@@ -95,10 +95,64 @@ public final class RegionMailbox {
     final AtomicBoolean leader = new AtomicBoolean(false);
     private long prevLeaderId = 0;
 
+    // --- Lagging peers (leader-only view; refreshed on the poller thread,
+    //     read by the heartbeat thread to fill RegionHeartbeatRequest.pending_peers) ---
+    volatile java.util.Set<Long> laggingPeers = java.util.Set.of();
+
     private final Counter snapshotGenErrors = XKvMetrics.errorCounter("region_peer", "snapshot_gen");
 
     // --- Change-peer observer ---
-    volatile RegionPeerImpl.ChangePeerObserver changePeerObserver;
+    volatile RegionPeer.ChangePeerObserver changePeerObserver;
+
+    /**
+     * Fires exactly once when an {@link #uninitialized} peer (one created from
+     * a bare raft message, TiKV-style) learns its real {@code Region}
+     * descriptor from an installed snapshot. KvServer uses it to complete
+     * initialization: wire transport for all peers, register key-range routing,
+     * start the region heartbeater.
+     */
+    @FunctionalInterface
+    public interface InitObserver {
+        void onInitialized(Metapb.Region region);
+    }
+    volatile InitObserver initObserver;
+
+    /**
+     * Fired (once per transition) when this peer acquires region leadership.
+     * Used to bump the in-memory {@code max_ts} to a fresh PD timestamp so a
+     * new leader never issues a prewrite whose {@code min_commit_ts} falls
+     * below a {@code read_ts} that a PREVIOUS leader already served — the
+     * classic cross-leadership Snapshot-Isolation lost-update. {@code max_ts}
+     * lives only in the leader's memory and is not replicated via raft, so it
+     * must be re-established on every leadership change. Must be non-blocking:
+     * the implementation submits the PD round-trip asynchronously.
+     */
+    volatile Runnable onLeaderAcquired;
+
+    /**
+     * Whether this leader's {@code max_ts} has been re-synced from PD since it
+     * acquired leadership (see {@link #onLeaderAcquired}). Gates async-commit /
+     * 1PC prewrites: while {@code false}, a derived {@code commit_ts}
+     * (= {@code min_commit_ts} = {@code max_ts+1}) could land under a
+     * {@code read_ts} the previous leader already served, so such prewrites
+     * must fall back to the explicit-Commit (TSO-allocated {@code commit_ts})
+     * path. Mirrors TiKV's {@code SnapshotExt::is_max_ts_synced}.
+     *
+     * <p>Defaults to {@code true} so deployments without a PD-backed bump
+     * (no {@link #onLeaderAcquired} wired) keep async-commit enabled. It is
+     * flipped to {@code false} only on a leadership transition when a bump is
+     * wired, and back to {@code true} once the bump completes.
+     */
+    volatile boolean maxTsSynced = true;
+
+    /**
+     * True while this peer was created from a bare raft message and has not yet
+     * received the leader's snapshot carrying the real region descriptor. An
+     * uninitialized peer is NOT bootstrapped (empty conf state, waits for the
+     * leader), is NOT persisted as a region descriptor, and is NOT registered
+     * to the store's key-range routing until the snapshot initializes it.
+     */
+    volatile boolean uninitialized;
 
     public RegionMailbox(StorageEngine storage,
                          PerRegionRaftEngine raftEngine,
@@ -107,9 +161,10 @@ public final class RegionMailbox {
                          List<Peer> peers,
                          Transport transport,
                          ApplyHandler applyHandler,
-                         RegionPeerImpl.Settings settings,
+                         RegionPeer.Settings settings,
                          ConcurrencyManager cm,
-                         io.github.xinfra.lab.xkv.kv.engine.SnapshotEngine snapshotEngine) {
+                         io.github.xinfra.lab.xkv.kv.engine.SnapshotEngine snapshotEngine,
+                         boolean uninitialized) {
         this.storage = storage;
         this.raftEngine = raftEngine;
         this.region = region;
@@ -119,12 +174,18 @@ public final class RegionMailbox {
         this.transport = transport;
         this.applyHandler = applyHandler;
         this.cm = cm;
+        this.uninitialized = uninitialized;
         this.raftStorage = new RegionRaftStorage(storage, raftEngine, snapshotEngine);
 
-        // Persist region descriptor.
-        try (var b = storage.newWriteBatch()) {
-            raftEngine.saveRegion(region, b);
-            storage.write(b, false);
+        // Persist region descriptor. Skip for uninitialized peers created from a
+        // bare raft message: they carry only a placeholder (id + self, empty
+        // range, epoch 0) and must learn the real descriptor from the snapshot,
+        // so we must not let recoverPersistedRegions pick up a half-baked region.
+        if (!uninitialized) {
+            try (var b = storage.newWriteBatch()) {
+                raftEngine.saveRegion(region, b);
+                storage.write(b, false);
+            }
         }
 
         // Build RawNode.
@@ -149,7 +210,7 @@ public final class RegionMailbox {
                 && raftEngine.lastSnapshotMeta() == null;
 
         this.rawNode = RawNode.newRawNode(config);
-        if (fresh) {
+        if (fresh && !uninitialized) {
             rawNode.bootstrap(peers);
         }
 
@@ -172,6 +233,11 @@ public final class RegionMailbox {
         return leader.get();
     }
 
+    boolean isMaxTsSynced() { return maxTsSynced; }
+
+    /** Flip max_ts to synced once the leadership PD-TSO bump has completed. */
+    void markMaxTsSynced() { maxTsSynced = true; }
+
     void setPoller(RaftPoller poller) { this.poller = poller; }
 
     void setApplyWorker(ApplyWorker worker) { this.applyWorker = worker; }
@@ -193,6 +259,7 @@ public final class RegionMailbox {
     // ================================================================
 
     void processOnce(RaftPoller poller) {
+        boolean moreReady = false;
         try {
             // 1. Drain inbound events into RawNode.
             drainEvents();
@@ -204,15 +271,59 @@ public final class RegionMailbox {
                 rawNode.acceptReady(ready);
                 rawNode.advance(ready);
             }
+
+            // 3. Refresh the leader's view of lagging peers (poller-thread-only
+            //    access to rawNode.status()).
+            refreshLaggingPeers();
+
+            // 4. Note whether RawNode still has work pending. Raft frequently
+            //    produces a *second-order* Ready with no new inbound event —
+            //    e.g. the readState answering a readIndex, or the commit/apply
+            //    of a freshly-elected leader's no-op. Those must be drained
+            //    promptly, not left until the next tick, otherwise a readIndex
+            //    on a fresh leader can stall up to a tick interval (and much
+            //    longer under heavy load), stranding linearizable reads.
+            moreReady = rawNode.hasReady();
         } catch (Throwable t) {
             if (!running) return;
             log.error("region={} mailbox process failure", regionId, t);
         } finally {
             scheduled.set(false);
-            // Re-schedule if more events arrived during processing.
-            if (!events.isEmpty() && running) {
+            // Re-schedule if more events arrived during processing, or the
+            // RawNode still has a Ready to drain (see step 4).
+            if (running && (!events.isEmpty() || moreReady)) {
                 wakeup();
             }
+        }
+    }
+
+    /**
+     * Recompute which peers are lagging behind the leader. A peer is lagging
+     * if it is still installing a snapshot (ProgressState.SNAPSHOT) or its
+     * match index hasn't reached the leader's last log index. Must be called
+     * on the poller thread — {@code rawNode.status()} is not thread-safe.
+     */
+    private void refreshLaggingPeers() {
+        if (!leader.get()) {
+            if (!laggingPeers.isEmpty()) laggingPeers = java.util.Set.of();
+            return;
+        }
+        try {
+            var status = rawNode.status();
+            long lastIndex = raftEngine.lastIndex();
+            var lagging = new java.util.HashSet<Long>();
+            for (var entry : status.progress().entrySet()) {
+                long peerId = entry.getKey();
+                if (peerId == selfPeerId) continue;
+                var pr = entry.getValue();
+                if (pr.state() == io.github.xinfra.lab.raft.ProgressState.SNAPSHOT
+                        || pr.match() < lastIndex) {
+                    lagging.add(peerId);
+                }
+            }
+            laggingPeers = lagging.isEmpty() ? java.util.Set.of() : lagging;
+        } catch (Throwable t) {
+            log.debug("region={} refreshLaggingPeers failed: {}", regionId, t.getMessage());
         }
     }
 
@@ -237,7 +348,7 @@ public final class RegionMailbox {
     }
 
     // ================================================================
-    // Apply logic (mirrors RegionPeerImpl.applyReady)
+    // Apply logic (mirrors the historical single-thread apply loop)
     // ================================================================
 
     private void applyReady(Ready ready) throws Exception {
@@ -246,9 +357,31 @@ public final class RegionMailbox {
             var ss = ready.softState();
             boolean isLeader = ss.lead() == selfPeerId
                     && ss.raftState() == RaftStateType.StateLeader;
+            // Before PUBLISHING newly-acquired leadership, mark max_ts un-synced
+            // so any prewrite that races in right after sees a not-yet-synced
+            // leader and falls back off async-commit/1PC. Ordering the volatile
+            // write before leader.getAndSet gives readers that observe
+            // isLeader()==true visibility of maxTsSynced==false. Only when a
+            // PD-backed bump is wired (onLeaderAcquired != null); otherwise
+            // leave it synced so no-PD deployments keep async-commit.
+            if (isLeader && !leader.get() && onLeaderAcquired != null) {
+                maxTsSynced = false;
+            }
             boolean was = leader.getAndSet(isLeader);
             if (was && !isLeader) {
                 abortPending();
+            }
+            if (!was && isLeader) {
+                // Newly acquired leadership: re-establish max_ts from PD so a
+                // prewrite on this leader cannot commit below a read_ts served
+                // by a previous leader (cross-leadership SI lost-update).
+                var hook = onLeaderAcquired;
+                if (hook != null) {
+                    try { hook.run(); }
+                    catch (Throwable t) {
+                        log.warn("region={} onLeaderAcquired hook failed: {}", regionId, t.getMessage());
+                    }
+                }
             }
             if (was != isLeader || ss.lead() != prevLeaderId) {
                 prevLeaderId = ss.lead();
@@ -294,7 +427,24 @@ public final class RegionMailbox {
 
         // Install snapshot KV data (apply phase).
         if (haveSnap) {
-            raftStorage.installPendingSnapshot();
+            Metapb.Region snapRegion = raftStorage.installPendingSnapshot();
+            if (snapRegion != null) {
+                // Adopt the range/epoch/peers the leader shipped in the snapshot.
+                region = snapRegion;
+                for (var p : snapRegion.getPeersList()) {
+                    if (p.getId() == selfPeerId) { self = p; break; }
+                }
+                if (uninitialized) {
+                    uninitialized = false;
+                    var obs = initObserver;
+                    if (obs != null) {
+                        try { obs.onInitialized(snapRegion); }
+                        catch (Throwable t) {
+                            log.warn("region={} init observer failed: {}", regionId, t.getMessage());
+                        }
+                    }
+                }
+            }
             log.info("region={} applied snapshot at index={} term={}",
                     regionId, ready.snapshot().getMetadata().getIndex(),
                     ready.snapshot().getMetadata().getTerm());
@@ -529,6 +679,12 @@ public final class RegionMailbox {
     }
 
     private void applyConfChangeOne(Eraftpb.ConfChangeV2 cc) {
+        // Peers present before this conf-change is applied. Used below to tell a
+        // genuinely new peer apart from a learner→voter promotion of an existing
+        // one — only the former needs a forced snapshot to get initialized.
+        var priorPeerIds = new java.util.HashSet<Long>();
+        for (var p : region.getPeersList()) priorPeerIds.add(p.getId());
+
         Eraftpb.ConfState newCs;
         try { newCs = rawNode.applyConfChange(cc); }
         catch (Exception e) {
@@ -593,8 +749,54 @@ public final class RegionMailbox {
             }
         }
 
+        // A peer just added on another store starts with an empty log and can
+        // only be initialized by a snapshot (its InitObserver fires on snapshot
+        // install, not on plain log replication). As leader, stage a snapshot
+        // and compact our log up to the applied index so raft's append path
+        // hits ErrCompacted and ships the new peer a snapshot instead of trying
+        // to catch it up by append — which would leave it uninitialized and
+        // never registered in its store.
+        if (leader.get()) {
+            boolean addsRemotePeer = false;
+            for (int i = 0; i < cc.getChangesCount() && i < ctxPeers.size(); i++) {
+                var type = cc.getChanges(i).getType();
+                if ((type == Eraftpb.ConfChangeType.ConfChangeAddNode
+                        || type == Eraftpb.ConfChangeType.ConfChangeAddLearnerNode)
+                        && ctxPeers.get(i).getId() != selfPeerId
+                        && !priorPeerIds.contains(ctxPeers.get(i).getId())) {
+                    addsRemotePeer = true;
+                    break;
+                }
+            }
+            if (addsRemotePeer) {
+                forceSnapshotForNewPeers();
+            }
+        }
+
         var fut = pendingConfChanges.poll();
         if (fut != null) fut.complete(RegionPeer.ApplyResult.ok(new byte[0]));
+    }
+
+    /**
+     * Ensure a freshly-added peer can be initialized: stage a snapshot at the
+     * current applied index and compact the log up to it, so raft delivers the
+     * staged snapshot to any peer whose needed index now falls below
+     * first_index. Only the leader ships snapshots, so callers guard on
+     * leadership. Compacting to applied is safe — already-caught-up followers
+     * have those entries, and any that don't will now receive a snapshot too.
+     */
+    private void forceSnapshotForNewPeers() {
+        long applied = raftEngine.appliedIndex();
+        if (applied == 0) return;
+        try {
+            maybeGenerateSnapshot();
+            raftStorage.compact(applied);
+            log.info("region={} staged snapshot + compacted log to {} for newly-added peer(s)",
+                    regionId, applied);
+        } catch (Throwable t) {
+            log.warn("region={} forceSnapshotForNewPeers at applied={} failed: {}",
+                    regionId, applied, t.getMessage());
+        }
     }
 
     private void drainReadIndexWaiters() {

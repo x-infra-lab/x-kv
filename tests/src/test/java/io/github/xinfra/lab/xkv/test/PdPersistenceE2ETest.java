@@ -45,7 +45,7 @@ final class PdPersistenceE2ETest {
             try { s.stop(); } catch (Exception e) { e.printStackTrace(); }
         }
         servers.clear();
-        ClusterHarness.releaseAllPorts();
+        TestCluster.releaseAllPorts();
     }
 
     @Test
@@ -53,8 +53,8 @@ final class PdPersistenceE2ETest {
         int[] clientPorts = new int[3];
         int[] raftPorts = new int[3];
         for (int i = 0; i < 3; i++) {
-            clientPorts[i] = ClusterHarness.freePort();
-            raftPorts[i] = ClusterHarness.freePort();
+            clientPorts[i] = TestCluster.freePort();
+            raftPorts[i] = TestCluster.freePort();
         }
 
         var peers = List.of(
@@ -194,8 +194,8 @@ final class PdPersistenceE2ETest {
                 .dataDir(tempDir.resolve("pd-" + (idx + 1)))
                 .peers(peers)
                 .build();
-        ClusterHarness.releasePort(clientPort);
-        ClusterHarness.releasePort(raftPort);
+        TestCluster.releasePort(clientPort);
+        TestCluster.releasePort(raftPort);
         var srv = new PdServer(cfg);
         srv.start();
         servers.add(srv);
@@ -230,6 +230,6 @@ final class PdPersistenceE2ETest {
     }
 
     private static int freePort() throws Exception {
-        return ClusterHarness.freePort();
+        return TestCluster.freePort();
     }
 }
